@@ -252,8 +252,13 @@ export function scanAndEnhanceDecisions(): void {
   }
 }
 
-export function installDecisionChips(): void {
-  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+let decisionChipsDispose: (() => void) | null = null;
+
+export function installDecisionChips(): () => void {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return () => {};
+  // Same lifecycle contract as installImageEnhancer: a reload replaces the
+  // observer instead of accumulating one per plugin load.
+  decisionChipsDispose?.();
   injectStyles();
 
   const observer = new MutationObserver(() => {
@@ -272,4 +277,12 @@ export function installDecisionChips(): void {
   } else {
     setup();
   }
+
+  const dispose = (): void => {
+    observer.disconnect();
+    window.removeEventListener('DOMContentLoaded', setup);
+    if (decisionChipsDispose === dispose) decisionChipsDispose = null;
+  };
+  decisionChipsDispose = dispose;
+  return dispose;
 }

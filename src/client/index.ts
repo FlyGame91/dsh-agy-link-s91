@@ -1821,16 +1821,8 @@ export function apply(ctx: ClientContext): void {
 	ctx.effect(() => installMermaidRendering());
 
 	// Local image display + fullscreen lightbox (recovered working tree).
-	// The recovered installers predate the ctx.effect contract and expose no
-	// disposer yet, so hand one back explicitly (follow-up: real teardown).
-	ctx.effect(() => {
-		installImageEnhancer();
-		return () => {};
-	});
+	ctx.effect(() => installImageEnhancer());
 
 	// Interactive user decision & choice chips (recovered working tree).
-	ctx.effect(() => {
-		installDecisionChips();
-		return () => {};
-	});
+	ctx.effect(() => installDecisionChips());
 }

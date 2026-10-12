@@ -536,8 +536,13 @@ export function scanAndEnhanceImages(): void {
   }
 }
 
-export function installImageEnhancer(): void {
-  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+let imageEnhancerDispose: (() => void) | null = null;
+
+export function installImageEnhancer(): () => void {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return () => {};
+  // A plugin reload must DISCONNECT the previous observer instead of stacking
+  // one more per reload (the ctx.effect contract main's installers follow).
+  imageEnhancerDispose?.();
   injectStyles();
 
   const observer = new MutationObserver(() => {
@@ -556,4 +561,12 @@ export function installImageEnhancer(): void {
   } else {
     setup();
   }
+
+  const dispose = (): void => {
+    observer.disconnect();
+    window.removeEventListener('DOMContentLoaded', setup);
+    if (imageEnhancerDispose === dispose) imageEnhancerDispose = null;
+  };
+  imageEnhancerDispose = dispose;
+  return dispose;
 }
