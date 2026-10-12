@@ -23,10 +23,14 @@ import { SessionStore } from './host/sessions.ts'
 import { AccountPoolManager } from './host/pool.ts'
 import { PoolAuthFlow } from './host/pool-auth.ts'
 import { QuotaService } from './host/quota.ts'
+import { detectSystemProxy } from './host/wincred.ts'
+import { resolvePrimaryCredential, findDuplicateCredentialIdentities } from './host/credential-slot.ts'
+import { homedir } from 'node:os'
 import { StreamJsonParser } from './host/parser.ts'
 import { defaultMediaDir, sweepDir, type ImageRefLike } from './host/media.ts'
 import { startMcpBridge, writeMcpConfig, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
 import { fileURLToPath } from 'node:url'
+import { handleMediaRequest, handleAssetRequest, type HttpRequestLike, type HttpResponseLike } from './host/media-route.ts'
 
 export const name = 'dsh-agy-link'
 // webServer and tools are optional: the plugin loads headless too.
@@ -42,8 +46,22 @@ type RawReq = {
 };
 type RawRes = StatusWriter;
 type WebServerLike = {
+  port?: number;
   register(route: { kind: string; path: string; handler: (req: unknown, res: unknown) => void }): unknown;
 };
+
+function resolveAssetDir(): string {
+  const currentDir = fileURLToPath(new URL('.', import.meta.url))
+  const candidates = [
+    join(currentDir, 'assets'),
+    join(currentDir, '../assets'),
+    join(currentDir, '../../assets'),
+  ]
+  for (const c of candidates) {
+    if (existsSync(c)) return c
+  }
+  return join(currentDir, 'assets')
+}
 
 /** Cross-session concurrency limiter (ADR-12). */
 class Semaphore {
@@ -90,7 +108,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const version = () => versionCache
   const store = new SessionStore(join(stateDir(), 'sessions.json'))
   const pool = new AccountPoolManager()
-  const quota = new QuotaService(pool, () => getConfig().proxyUrl)
+  const quota = new QuotaService(pool, () => getConfig().proxyUrl || detectSystemProxy() || '')
   const semaphore = new Semaphore(() => getConfig().maxConcurrent)
 
   const getDiscoveryEnv = (account?: ManagedAccount): NodeJS.ProcessEnv => {
@@ -106,7 +124,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           }
         : {}),
       ...(account && account.dir ? isolatedHomeEnv(account.dir) : {}),
-      ...proxyEnvFor(account?.proxyUrl || cfg.proxyUrl || undefined),
+      ...proxyEnvFor(account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined),
     }
   }
 
@@ -162,6 +180,29 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     if (acc.dir && ensureIsolatedKeychain(acc.dir)) kcProvisioned++
   }
   if (kcProvisioned > 0) log('provisioned isolated keychains for ' + kcProvisioned + ' pool account(s)')
+  // Windows shares ONE process-global credential slot across every agy
+  // process. Establish the durable, identity-verified primary credential that
+  // the slot is handed back to, and report pool corruption loudly instead of
+  // silently reporting the wrong account's quota.
+  if (process.platform === 'win32') {
+    void resolvePrimaryCredential(pool, {
+      baseDir: pool.dir,
+      log,
+      proxyUrl: getConfig().proxyUrl || detectSystemProxy(),
+    })
+      .then((cred) => {
+        if (cred) log('primary credential verified' + (cred.email ? ' <' + cred.email + '>' : ''))
+      })
+      .catch(() => undefined)
+    for (const dupe of findDuplicateCredentialIdentities(pool.getAccounts(), homedir())) {
+      log(
+        'WARNING: accounts share one credential identity (their login was overwritten — sign in again): ' +
+          dupe.locations.join(', '),
+      )
+    }
+  }
+
+  const webServerPort: { current?: number } = {}
 
   const adapter = new AgyAdapter({
     getConfig,
@@ -172,6 +213,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     acquire: () => semaphore.acquire(),
     log,
     runs,
+    getMediaBaseUrl: () => (webServerPort.current ? `http://127.0.0.1:${webServerPort.current}/plugins/agy-link/media` : null),
     sessionCwd: (sessionId) => {
       const sessions = ctx.get('sessions') as { get(id: unknown): { header?: { cwd?: string } } | undefined } | undefined
       return sessions?.get(sessionId)?.header?.cwd
@@ -420,7 +462,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         const accountId = typeof body.accountId === 'string' ? body.accountId : undefined
         const proxyUrl = typeof body.proxyUrl === 'string' && body.proxyUrl.trim() !== ''
           ? body.proxyUrl.trim()
-          : (getConfig().proxyUrl.trim() || undefined)
+          : (getConfig().proxyUrl.trim() || detectSystemProxy() || undefined)
         const st = await auth.begin(homeDir, accountId, proxyUrl)
         sendJson(res as RawRes, 200, st)
       })()
@@ -475,7 +517,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         const alias = typeof body.alias === 'string' ? body.alias : undefined
         const proxyUrl = typeof body.proxyUrl === 'string' && body.proxyUrl.trim() !== ''
           ? body.proxyUrl.trim()
-          : (getConfig().proxyUrl.trim() || undefined)
+          : (getConfig().proxyUrl.trim() || detectSystemProxy() || undefined)
         const st = await poolAuth.begin(alias, proxyUrl)
         sendJson(res as RawRes, st.ok ? 200 : 500, st)
       })()
@@ -687,6 +729,18 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         }
       })()
     }})
+
+    // /plugins/agy-link/media?path=...
+    reg({ kind: 'exact', path: '/plugins/agy-link/media', handler: (req, res) => {
+      handleMediaRequest(req as HttpRequestLike, res as HttpResponseLike, { workspaceRoot: getConfig().workspaceRoot })
+    }})
+
+    // /plugins/agy-link/assets/...
+    const assetDir = resolveAssetDir()
+    reg({ kind: 'prefix', path: '/plugins/agy-link/assets', handler: (req, res) => {
+      handleAssetRequest(req as HttpRequestLike, res as HttpResponseLike, assetDir)
+    }})
+
     return () => {
       for (const d of disposers) {
         try {
@@ -701,6 +755,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   ctx.inject(['webServer'], (sub) => {
     const webServer = sub.get('webServer') as WebServerLike | undefined
     if (!webServer) return
+    webServerPort.current = (webServer as { port?: number }).port
     return registerRoutes(webServer)
   })
 

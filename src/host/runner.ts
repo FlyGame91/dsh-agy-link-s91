@@ -341,6 +341,7 @@ function killTree(child: ChildProcess): void {
 export function startAgyProcess(opts: RunOptions): RunningProcess {
   const started = Date.now();
   const viaCmd = IS_WIN && isCmdShim(opts.bin)
+  const isNodeScript = IS_WIN && /\.(m?js|cjs)$/i.test(opts.bin)
   const env = withAgyQuietEnv(opts.env ?? process.env)
   const child = viaCmd
     ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', [opts.bin, ...opts.args].map(windowsQuote).join(' ')], {
@@ -348,6 +349,13 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsVerbatimArguments: true,
+        windowsHide: true,
+      })
+    : isNodeScript
+    ? spawn(process.execPath, [opts.bin, ...opts.args], {
+        cwd: opts.cwd,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
       })
     : spawn(opts.bin, opts.args, {

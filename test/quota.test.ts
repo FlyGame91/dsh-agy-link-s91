@@ -1,12 +1,43 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
 import { QuotaService, detectEmailFromAgyLogs, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
+import { parseCredentialDoc } from '../src/host/credential-slot.ts'
+
+test('persistRefreshedToken keeps the refresh token and writes agy nested shape', () => {
+  // Regression: the writer used to emit a flat `{access_token,expiry}` document
+  // when the file did not exist yet, DROPPING the refresh token. A credential
+  // without a refresh token has no stable identity, so the corruption guards
+  // (which compare grants) could never fire.
+  const dir = mkdtempSync(join(tmpdir(), 'agy-persist-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('persist-test')
+  const quota = new QuotaService(pool)
+  const persist = (
+    quota as unknown as {
+      persistRefreshedToken: (a: unknown, t: Record<string, unknown>) => void
+    }
+  ).persistRefreshedToken.bind(quota)
+
+  const file = join(acc.dir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token')
+
+  persist(acc, { access_token: 'A1', expiryMs: Date.now() + 3600_000, refresh_token: 'R-KEEP' })
+  const first = parseCredentialDoc(readFileSync(file, 'utf8'))
+  assert.equal(first?.refreshToken, 'R-KEEP', 'the refresh token must be written')
+  assert.equal(first?.accessToken, 'A1')
+  assert.ok(first?.expiryMs, 'expiry must survive as a parseable timestamp')
+
+  // A later refresh that does not re-supply the refresh token must not lose it.
+  persist(acc, { access_token: 'A2', expiryMs: Date.now() + 3600_000 })
+  const second = parseCredentialDoc(readFileSync(file, 'utf8'))
+  assert.equal(second?.refreshToken, 'R-KEEP', 'the refresh token must be preserved')
+  assert.equal(second?.accessToken, 'A2')
+})
 
 test('QuotaService parses stored tokens and saves token refresh updates', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-quota-test-'))

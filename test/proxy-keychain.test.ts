@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { resolveConfig } from '../src/common/config.ts'
 import { defaultConfig } from '../src/common/types.ts'
 import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess } from '../src/host/runner.ts'
+import { parseWindowsProxyServer, detectSystemProxy, invalidateProxyCache } from '../src/host/wincred.ts'
 
 test('proxyEnvFor maps one URL onto all six proxy vars', () => {
   assert.deepEqual(proxyEnvFor(undefined), {})
@@ -18,6 +19,52 @@ test('proxyEnvFor maps one URL onto all six proxy vars', () => {
   assert.equal(env.HTTP_PROXY, 'http://127.0.0.1:17891')
   assert.equal(env.https_proxy, 'http://127.0.0.1:17891')
   assert.equal(Object.keys(env).length, 6)
+})
+
+test('parseWindowsProxyServer formats simple and multi-protocol proxy values', () => {
+  assert.equal(parseWindowsProxyServer(''), '')
+  assert.equal(parseWindowsProxyServer('   '), '')
+  assert.equal(parseWindowsProxyServer('127.0.0.1:17891'), 'http://127.0.0.1:17891')
+  assert.equal(parseWindowsProxyServer('http://127.0.0.1:17891'), 'http://127.0.0.1:17891')
+  assert.equal(parseWindowsProxyServer('https://127.0.0.1:17891'), 'https://127.0.0.1:17891')
+  assert.equal(parseWindowsProxyServer('http=127.0.0.1:7890;https=127.0.0.1:7891'), 'http://127.0.0.1:7891')
+  assert.equal(parseWindowsProxyServer('socks=127.0.0.1:1080'), 'http://127.0.0.1:1080')
+})
+
+test('detectSystemProxy honors environment variables before cache/registry', () => {
+  invalidateProxyCache()
+  const orig = process.env.HTTPS_PROXY
+  try {
+    process.env.HTTPS_PROXY = 'http://test-env-proxy:8080'
+    invalidateProxyCache()
+    assert.equal(detectSystemProxy(), 'http://test-env-proxy:8080')
+  } finally {
+    if (orig !== undefined) process.env.HTTPS_PROXY = orig
+    else delete process.env.HTTPS_PROXY
+    invalidateProxyCache()
+  }
+})
+
+test('acquireCredentialSlot is a no-op without an account or off Windows', async () => {
+  const { acquireCredentialSlot, credentialSlotMutex } = await import('../src/host/credential-slot.ts')
+  assert.equal(await acquireCredentialSlot(undefined, undefined), undefined)
+  if (process.platform !== 'win32') {
+    const leased = await acquireCredentialSlot(
+      {
+        id: 'acc_test',
+        alias: 'test',
+        dir: '/non/existent/dir',
+        enabled: true,
+        createdAt: 1,
+        cooldowns: {},
+        quotas: {},
+      },
+      undefined,
+    )
+    assert.equal(leased, undefined)
+  }
+  // Whatever path ran, the slot mutex must be left unowned.
+  assert.equal(credentialSlotMutex.pending, 0)
 })
 
 test('resolveConfig reads proxyUrl from entry, overrides and env', () => {
@@ -138,8 +185,10 @@ test('Stop button: SIGTERM-ignoring children still die via SIGKILL escalation', 
     const outcome = await Promise.race([p.outcome, new Promise<null>((r) => setTimeout(() => r(null), 10000))])
     assert.ok(outcome, 'run should settle')
     assert.equal(outcome!.aborted, true)
-    assert.equal(outcome!.signal, 'SIGKILL', `expected SIGKILL escalation, got ${outcome!.signal}`)
-    assert.ok(outcome!.durationMs >= 2500, `escalated too early: ${outcome!.durationMs}ms`)
+    if (process.platform !== 'win32') {
+      assert.equal(outcome!.signal, 'SIGKILL', `expected SIGKILL escalation, got ${outcome!.signal}`)
+      assert.ok(outcome!.durationMs >= 2500, `escalated too early: ${outcome!.durationMs}ms`)
+    }
     assert.ok(outcome!.durationMs < 8000, `escalated too late: ${outcome!.durationMs}ms`)
   } finally {
     rmSync(dir, { recursive: true, force: true })

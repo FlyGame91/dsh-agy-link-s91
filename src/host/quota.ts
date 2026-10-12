@@ -24,6 +24,8 @@ import { shouldMarkAuthRequired } from '../common/types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { AGY_ENDPOINTS, refreshTokens } from './oauth.ts'
 import { agyFetch } from './net.ts'
+import { readWindowsCredentialRaw, detectSystemProxy } from './wincred.ts'
+import { parseCredentialDoc, credentialFingerprint, readPrimaryCredential, writePrimaryCredential } from './credential-slot.ts'
 
 /**
  * When the quota-summary endpoint transiently fails, per-model fallback
@@ -287,43 +289,7 @@ export function readMacKeychainToken(): StoredToken | null {
 export function readWindowsCredentialToken(): StoredToken | null {
   if (process.platform !== 'win32') return null
   try {
-    const script = [
-      "$sig = @'",
-      'using System;',
-      'using System.Runtime.InteropServices;',
-      'public class AgyCred {',
-      '  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]',
-      '  public static extern bool CredRead(string target, int type, int flags, out IntPtr credential);',
-      '  [DllImport("advapi32.dll", SetLastError=true)]',
-      '  public static extern void CredFree(IntPtr cred);',
-      '  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]',
-      '  public struct CREDENTIAL {',
-      '    public int Flags; public int Type; public IntPtr TargetName;',
-      '    public IntPtr Comment; public long LastWritten; public int CredentialBlobSize;',
-      '    public IntPtr CredentialBlob; public int Persist; public int AttributeCount;',
-      '    public IntPtr Attributes; public IntPtr TargetAlias; public IntPtr UserName;',
-      '  }',
-      '  public static byte[] Read(string target) {',
-      '    IntPtr p;',
-      '    if (!CredRead(target, 1, 0, out p)) return null;',
-      '    CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));',
-      '    byte[] b = new byte[c.CredentialBlobSize];',
-      '    Marshal.Copy(c.CredentialBlob, b, 0, c.CredentialBlobSize);',
-      '    CredFree(p);',
-      '    return b;',
-      '  }',
-      '}',
-      "'@",
-      'Add-Type -TypeDefinition $sig -ErrorAction Stop',
-      "$b = [AgyCred]::Read('gemini:antigravity')",
-      'if ($b -eq $null) { exit 1 }',
-      '[Console]::Out.Write([System.Text.Encoding]::UTF8.GetString($b))',
-    ].join('\n')
-    const raw = execFileSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
-    ).trim()
+    const raw = readWindowsCredentialRaw('gemini:antigravity')
     if (!raw) return null
     return parseGoKeyringPayload(raw)
   } catch {
@@ -343,9 +309,9 @@ export class QuotaService {
     private readonly globalProxy: () => string = () => '',
   ) {}
 
-  /** Dedicated account proxy wins, then the global config proxy. */
+  /** Dedicated account proxy wins, then the global config proxy, then detected system proxy. */
   private proxyFor(account: ManagedAccount): string | undefined {
-    return account.proxyUrl || this.globalProxy() || undefined
+    return account.proxyUrl || this.globalProxy() || detectSystemProxy() || undefined
   }
 
   private getTokenFilePath(account: ManagedAccount): string {
@@ -393,6 +359,21 @@ export class QuotaService {
     })()
 
     if (account.systemHome || !account.dir) {
+      // Windows has no per-account Keychain: the primary rides ONE global
+      // credential slot that is temporarily handed to a secondary during its
+      // run. Reading that slot while it is handed over would report whichever
+      // account currently owns it — the cause of the primary row displaying a
+      // secondary's quota and of manual refresh "replacing" the main account.
+      // The durable store is only ever written from an identity-verified
+      // primary source, so it wins; the slot is the fallback for a pool that
+      // has not been verified yet.
+      if (process.platform === 'win32') {
+        const stored = readPrimaryCredential(this.pool.dir)
+        const storedToken = stored ? parseCredentialDoc(stored.raw) : null
+        if (storedToken && (storedToken.accessToken || storedToken.refreshToken)) {
+          return storedToken
+        }
+      }
       const keychainToken = this.readSystemKeychainToken()
       if (keychainToken && (keychainToken.accessToken || keychainToken.refreshToken)) {
         return keychainToken
@@ -402,31 +383,74 @@ export class QuotaService {
     return disk
   }
 
-  /** Persist refreshed tokens back in the SAME on-disk shape agy wrote. */
-  private persistRefreshedToken(account: ManagedAccount, tokens: { access_token: string; expiryMs?: number }): void {
+  /**
+   * Persist a refreshed access token in agy's own on-disk shape.
+   *
+   * The SHAPE matters: agy >= 1.1.15 writes
+   * `{"token":{access_token,token_type,refresh_token,expiry},"auth_method":"consumer"}`
+   * and every identity guard keys on `refresh_token`. An earlier version wrote
+   * a FLAT `{access_token,expiry}` document when the file did not exist yet,
+   * silently DROPPING the refresh token; the credential then had no stable
+   * identity, so two snapshots of one account compared as different grants and
+   * the corruption guards could not fire.
+   */
+  private persistRefreshedToken(
+    account: ManagedAccount,
+    tokens: { access_token: string; expiryMs?: number; refresh_token?: string },
+  ): void {
     const file = this.getTokenFilePath(account)
     try {
       mkdirSync(dirname(file), { recursive: true })
-      let raw: Record<string, unknown> = {}
+      let existing: Record<string, unknown> = {}
       if (existsSync(file)) {
         try {
-          raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+          existing = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
         } catch {
-          raw = {}
+          existing = {}
         }
       }
+      // Accept either shape on input, always emit agy's nested shape.
+      const source =
+        typeof existing.token === 'object' && existing.token !== null
+          ? (existing.token as Record<string, unknown>)
+          : existing
+      const refreshToken =
+        tokens.refresh_token ??
+        (typeof source.refresh_token === 'string' ? source.refresh_token : undefined) ??
+        (typeof source.refreshToken === 'string' ? source.refreshToken : undefined)
       const expiryIso = tokens.expiryMs ? new Date(tokens.expiryMs).toISOString() : undefined
-      if (raw && typeof raw.token === 'object' && raw.token !== null) {
-        const nested = raw.token as Record<string, unknown>
-        nested.access_token = tokens.access_token
-        if (expiryIso) nested.expiry = expiryIso
-      } else {
-        raw.access_token = tokens.access_token
-        if (tokens.expiryMs) raw.expiry = tokens.expiryMs
+      const doc = {
+        token: {
+          access_token: tokens.access_token,
+          token_type: typeof source.token_type === 'string' ? source.token_type : 'Bearer',
+          ...(refreshToken ? { refresh_token: refreshToken } : {}),
+          ...(expiryIso ? { expiry: expiryIso } : { expiry: source.expiry }),
+        },
+        auth_method: typeof existing.auth_method === 'string' ? existing.auth_method : 'consumer',
       }
-      writeFileSync(file, JSON.stringify(raw), 'utf8')
+      writeFileSync(file, JSON.stringify(doc), 'utf8')
     } catch {
       // Best-effort
+    }
+
+    // On Windows the primary's authoritative copy is the durable slot store:
+    // agy authenticates from Credential Manager, not from this file. Re-adopt
+    // the canonical file we just wrote, but only when it still carries a
+    // refresh token — the store must never be degraded back to an
+    // unidentifiable document.
+    if (process.platform === 'win32' && (account.systemHome || !account.dir)) {
+      try {
+        const fresh = readFileSync(file, 'utf8')
+        if (parseCredentialDoc(fresh)?.refreshToken) {
+          const stored = readPrimaryCredential(this.pool.dir)
+          writePrimaryCredential(
+            { raw: fresh, email: stored?.email, savedAt: Date.now() },
+            this.pool.dir,
+          )
+        }
+      } catch {
+        // best-effort
+      }
     }
   }
 
@@ -452,6 +476,9 @@ export class QuotaService {
           this.persistRefreshedToken(account, {
             access_token: refreshed.access_token,
             expiryMs: refreshed.expiryMs,
+            // Carry the grant identity forward — losing it made the credential
+            // unidentifiable and disabled every corruption guard.
+            refresh_token: refreshed.refresh_token ?? tok.refreshToken,
           })
           if (account.authRequired) {
             this.pool.clearAuthRequired(account.id)
@@ -580,6 +607,30 @@ export class QuotaService {
       }
     }
     const home = account.systemHome || !account.dir ? homedir() : account.dir
+
+    // An isolated pool account must never carry the SAME OAuth grant as the
+    // primary. When it does, its login was overwritten by the shared Windows
+    // credential slot, and every number fetched under this row would actually
+    // belong to the primary. Quarantine the slot instead of displaying — and
+    // failing over onto — someone else's quota. Deterministic and offline.
+    if (account.dir && process.platform === 'win32') {
+      const stored = readPrimaryCredential(this.pool.dir)
+      const file = this.getTokenFilePath(account)
+      const own = existsSync(file) ? readFileSync(file, 'utf8') : null
+      const ownFingerprint = own ? credentialFingerprint(own) : null
+      if (
+        stored &&
+        ownFingerprint !== null &&
+        ownFingerprint === credentialFingerprint(stored.raw)
+      ) {
+        this.pool.markAuthRequired(
+          account.id,
+          "stored credential is the primary account's — this login was overwritten, sign in again",
+        )
+        return null
+      }
+    }
+
     let email = account.email
     // For primary/systemHome account or when email is missing, always detect
     // the latest email from logs to immediately catch account switching outside DSH.
@@ -611,6 +662,28 @@ export class QuotaService {
     // the new account inherits the old one's restrictions (and poll gating
     // would keep the slot quarantined forever after an invalid_grant).
     if (email && email !== account.email) {
+      // An ISOLATED pool account's identity is fixed by the credential the user
+      // signed in with. If the resolved email matches ANOTHER slot's email,
+      // this account's token file was overwritten by that account (the
+      // documented Windows slot-corruption failure) — quarantine it instead of
+      // relabeling, which is how one corrupted token made every row report the
+      // same identity and spend the same quota.
+      const collisionsWithSibling =
+        Boolean(account.dir) &&
+        this.pool.getAccounts().some(
+          (other) =>
+            other.id !== account.id &&
+            other.email !== undefined &&
+            other.email === email &&
+            other.dir !== account.dir,
+        )
+      if (collisionsWithSibling) {
+        this.pool.markAuthRequired(
+          account.id,
+          `stored credential belongs to ${email} (another account's login) — sign in again`,
+        )
+        return null
+      }
       this.pool.resetAccountIdentity(account.id, email)
     }
 

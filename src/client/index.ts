@@ -6,6 +6,9 @@ import { BRAND_COLORS, BRAND_PATHS, UI_PATHS } from './brand-icons.ts';
 import { installAgyToolView } from './toolview.ts';
 import { en, es, NS, ptBR, zh, type AgyLocaleKey } from './locales.ts';
 import { installAutoExpandReasoning } from './reasoning.ts';
+import { installMermaid } from './mermaid.ts';
+import { installImageEnhancer } from './images.ts';
+import { installDecisionChips } from './decisions.ts';
 
 
 type ReactApi = {
@@ -1662,4 +1665,13 @@ export function apply(ctx: ClientContext): void {
 
 	// Auto-expand reasoning blocks containing full model thought prose
 	installAutoExpandReasoning();
+
+	// Interactive Mermaid diagram rendering
+	installMermaid();
+
+	// Local image display and fullscreen lightbox
+	installImageEnhancer();
+
+	// Interactive user decision & choice chips
+	installDecisionChips();
 }

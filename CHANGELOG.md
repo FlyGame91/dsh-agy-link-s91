@@ -1,14 +1,78 @@
 # Changelog
 
-## Unreleased
+## 0.4.44 (2026-10-03)
 
 ### English
 
+- **Fix (critical): multi-account pools no longer cross-contaminate credentials on Windows, and quota failover works again.** On Windows, `agy.exe` resolves its Google credential from ONE process-global store (Credential Manager target `gemini:antigravity`); `HOME`/`USERPROFILE` are ignored, so a per-account directory does not isolate credentials the way a per-account Keychain does on macOS. The previous handoff logic corrupted a real pool: all four accounts ended up holding the primary's refresh token, every quota row reported the same identity, and clicking "refresh/sync" appeared to replace the main account. Three defects were fixed:
+  - The handoff snapshotted "whatever is currently in the slot" as the primary backup. A secondary run could therefore overwrite the backup with a secondary credential, and the next restore installed that secondary as the system-wide login. The primary credential is now resolved from a durable, identity-VERIFIED store (`agy-accounts/.primary-credential.json`) and is never inferred from the live slot.
+  - The restore step wrote the slot's content back into the account's token file whenever it differed. While another account owned the slot this copied a FOREIGN credential into the account file. Write-back now requires that the slot still carries THAT account's refresh token; otherwise nothing is written and a warning is logged.
+  - Nothing serialized slot ownership, so interactive runs, background quota polls and manual refreshes raced. A process-wide FIFO mutex (`AsyncMutex`) now spans the entire run.
+- **Add: a run is refused instead of silently using the wrong account.** `acquireCredentialSlot` throws `SlotUnavailableError` (surfaced as `AGY_ERROR`) when the slot cannot be handed back safely: the primary credential cannot be verified, the secondary has no credential, or the secondary holds the SAME grant as the primary. This stops a corrupted slot from quietly spending the primary's quota.
+- **Fix: quota refresh can no longer relabel or overwrite an account.** An isolated account resolved to another slot's email is now quarantined (`authRequired`) instead of being relabeled; an isolated account whose stored credential equals the primary's is quarantined offline before any network call. The durable store is consulted before the volatile slot for the primary, so a mid-handoff slot can no longer make the primary row display a secondary's numbers.
+- **Fix: refreshed tokens keep their refresh token and agy's nested on-disk shape.** The writer used to emit a flat `{access_token,expiry}` document when the file did not exist yet, silently DROPPING `refresh_token`. A credential without a refresh token has no stable identity across access-token rotations, which disabled every identity guard. The writer now always emits `{"token":{…},"auth_method":"consumer"}` and preserves the refresh token.
+- **Add: identity comparison anchored on the OAuth grant.** `sameCredentialGrant()` requires a refresh token on both sides ("cannot prove it" means "not the same"); adoption of a primary credential now skips candidates without a refresh token so the durable store can never be degraded.
+- **Add: corruption diagnostics and repair tooling.** `findDuplicateCredentialIdentities()` reports accounts sharing one login, and the boot log now warns loudly. `scripts/repair-pool.mts` (dry-run by default, `--apply` to write) restores the primary slot and quarantines overwritten accounts; `scripts/verify-credential-store.mts` verifies the store's live identity. Running `pnpm test` no longer touches the real pool directory — credential handling is anchored on `AccountPoolManager.dir` instead of a process-global path.
+- **Fix: a malformed `mermaid` block no longer paints Mermaid's own "Syntax error in text" bomb into the page.** Mermaid's standalone renderer appends a temporary `<div id="d<id>">` to `document.body` and, when a diagram fails to parse, draws its built-in error diagram into that div *instead of throwing* — so the failure never reached our `catch`, and the bomb escaped the message card and floated detached at the end of the page. The runtime is now initialized with `suppressErrorRendering: true`, every block is pre-validated with `mermaid.parse(text, { suppressErrors: true })` before `render()` runs, and a sweep removes body-level error diagrams left behind by older client builds. Invalid or still-streaming diagrams simply keep their original code block, and an unchanged failing block is no longer re-parsed on every DOM mutation.
+
+### 中文
+
+- **修复（严重）：Windows 下多账号池不再串号，额度耗尽切换恢复正常。** Windows 上 `agy.exe` 只从**一个全局凭据槽**（凭据管理器 `gemini:antigravity`）读取 Google 凭据，`HOME`/`USERPROFILE` 被忽略，因此「每账号独立目录」并不像 macOS 的独立钥匙串那样隔离凭据。旧的手递逻辑破坏了一个真实账号池：四个账号全部持有主账号的 refresh token、每一行额度都显示同一个身份、点击「刷新/同步」看起来会把主账号替换掉。本次修复三个缺陷：
+  - 旧逻辑把「当前槽里的内容」当作主账号备份快照，于是副账号运行会用自己的凭据覆盖备份，下次恢复就把副账号装成了系统级登录。现在主账号凭据来自**经过身份校验的持久化存储**（`agy-accounts/.primary-credential.json`），绝不从活动槽推断。
+  - 恢复阶段只要发现槽内容与账号文件不同就写回账号文件；当槽被别的账号占用时，这会把**别人的凭据**写进该账号文件。现在写回前必须确认槽仍持有**该账号自己的 refresh token**，否则不写并记录警告。
+  - 槽的归属完全没有串行化，交互运行、后台额度轮询、手动刷新互相竞争。现在由一个进程级 FIFO 互斥锁（`AsyncMutex`）覆盖整个运行周期。
+- **新增：无法安全交接时直接拒绝运行，而不是悄悄用错账号。** `acquireCredentialSlot` 在以下情况抛出 `SlotUnavailableError`（表现为 `AGY_ERROR`）：无法验证主账号凭据、副账号没有凭据、或副账号持有与主账号**相同的授权**。这阻止了被污染的槽偷偷消耗主账号额度。
+- **修复：额度刷新不再改名或覆盖账号。** 独立账号解析出的邮箱若属于另一个槽，改为**隔离**（`authRequired`）而不是改名；独立账号的凭据与主账号相同的，在任何网络请求之前就离线隔离。主账号优先读取持久化存储而非易变的槽，中途被交接的槽再也无法让主账号行显示副账号的数字。
+- **修复：刷新后的 token 保留 refresh token 与 agy 的嵌套磁盘格式。** 旧写入器在文件不存在时会写成扁平 `{access_token,expiry}`，**静默丢弃 `refresh_token`**。没有 refresh token 的凭据在 access token 轮换后就没有稳定身份，导致所有身份守卫失效。现在固定写入 `{"token":{…},"auth_method":"consumer"}` 并保留 refresh token。
+- **新增：以 OAuth 授权为锚的身份比较。** `sameCredentialGrant()` 要求双方都有 refresh token（「无法证明」即视为「不同」）；主账号凭据的采纳会跳过没有 refresh token 的候选，持久化存储因此不会再被降级。
+- **新增：串号诊断与修复工具。** `findDuplicateCredentialIdentities()` 报告共享同一登录的账号，启动日志会明确告警。`scripts/repair-pool.mts`（默认 dry-run，加 `--apply` 才写入）恢复主账号槽并隔离被覆盖的账号；`scripts/verify-credential-store.mts` 校验存储的真实身份。`pnpm test` 不再触碰真实账号池——凭据处理改为锚定 `AccountPoolManager.dir` 而非进程级全局路径。
+- **修复：语法错误的 `mermaid` 代码块不再把 Mermaid 自带的「Syntax error in text」炸弹图渲染到页面上。** Mermaid 独立版渲染器会向 `document.body` 追加一个临时 `<div id="d<id>">`，图表解析失败时它把内置错误图**画进这个容器而不是抛异常**——失败因此永远到不了我们的 `catch`，炸弹图逃出消息卡片、孤立地漂在页面末尾。现在运行时以 `suppressErrorRendering: true` 初始化，每个代码块在 `render()` 之前先用 `mermaid.parse(text, { suppressErrors: true })` 预校验，并会清理旧客户端版本遗留在 body 层的错误图。语法错误或仍在流式输出的图表只保留原始代码块，同一份失败代码也不再因每次 DOM 变更而反复解析。
+
+## 0.4.43 (2026-10-03)
+
+### English
+
+- **Add: native Mermaid diagram rendering in DSH Desktop and Web.** Antigravity models (especially Gemini / Claude) frequently emit ````mermaid```` code blocks to visualize workflows, timelines, and architectures. Because DSH renders code blocks as plain text, diagrams previously showed as raw source text. `dsh-agy-link` now bundles an offline standalone Mermaid.js runtime (served from `/plugins/agy-link/assets/mermaid.min.js`) and mounts an interactive diagram viewer over `.md-code-block` elements:
+  - Non-destructive DOM rendering preserving React's original `<pre>` structure to avoid re-render conflicts.
+  - Tab switching between "Diagram" and "Code".
+  - Interactive SVG zoom controls (Zoom In, Zoom Out, Reset, Fit).
+  - Copy SVG source button with visual feedback.
+  - Automatic dark/light theme synchronization with DSH's CSS color variables.
+- **Add: local image & media display (`file:///`, absolute Windows & WSL paths) with fullscreen Lightbox.** Models generating or referencing local visual assets (e.g. concept art, mockups, artifacts) emit `file:///` URLs or local filesystem paths. Because DSH's markdown renderer rejects non-HTTP URLs (`remoteImageUrl`), images previously rendered as inert text (`<span class="imageAlt">`).
+  - Added host endpoint `/plugins/agy-link/media` with security validation, MIME type sniffing, stream piping, and client cache headers, supporting Windows drive paths (`D:/...`), UNC paths, and WSL paths (`/mnt/...`, `/home/...`).
+  - Integrated live streaming markdown image rewrite (`![alt](file:///...)` -> `![alt](http://127.0.0.1:${port}/plugins/agy-link/media?path=...)`).
+  - Retrospective DOM enhancer inspecting React Fiber props on `<span class="imageAlt">` in historical session turns to recover original file paths and restore image previews retroactively.
+  - Enhanced local file links (`a[href^="file://"]`) to image files with thumbnail previews.
+  - Fullscreen interactive Lightbox modal with zoom, pan, and "Copy Path" button.
+- **Add: interactive user decision & choice adaptation (`ask_question` and Markdown Choices).** Antigravity models actively solicit user decisions and guidance through the `ask_question` tool or structured markdown decision templates (`### 💬 请您拍板` / `请选择`).
+  - Extended tool card mirroring for `ask_question` with structured question text, selectable answer badges, and a "Fill into Chat" action button.
+  - Extended tool card mirroring for image tools (`generate_image`, `view_file` on images) with inline visual thumbnails and Lightbox triggers.
+  - Added markdown choice scanner detecting decision headers and list options, mounting interactive quick-action selection chips that directly fill the selected option text into DSH's chat composer (`[data-composer-input]`).
 - **Fix: code cards referenced a non-existent font token, so the code font silently fell back to the hardcoded stack.** `ROW_CSS` spelled the DSH code-font token as `--dsw-font-family-code`, but the real token is `--ds-font-family-code` (no `w`). The mistyped name has zero definitions anywhere in DSH, so every `var(--dsw-font-family-code, <fallback>)` resolved to its hardcoded fallback (`ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`), which carries no CJK coverage — Chinese text inside agy tool cards rendered in the OS default (SimSun / Microsoft YaHei) instead of the host's configured code font. The three affected selectors are `.agy-tv-card` (whose `font-family` is inherited by the header, copy button and body), `.agy-tv-preview` and `.agy-tv-diff-stat`.
+- **Fix (Windows): auto-detect system proxy from Windows Internet Settings (WinINet) to fix quota refresh and sync timeouts.** On Windows GUI hosts (DSH Desktop / Electron), `process.env` does not inherit terminal `HTTP_PROXY`/`HTTPS_PROXY` variables. Direct requests to Google endpoints (`daily-cloudcode-pa.googleapis.com` / `googleapis.com`) timed out behind GFW, silently dropping quota updates while the frontend showed "额度已刷新". The host now automatically detects system proxy settings from the Windows Registry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` `ProxyServer`) and routes all undici fetch calls and child process environments through the proxy.
+- **Fix (Windows): Windows Credential Manager multi-account collision / quota draining across pool accounts.** On macOS, each account has an isolated Keychain file (`login.keychain-db`) via `$HOME`. On Windows, `agy.exe` reads credentials via `zalando/go-keyring` (`advapi32!CredRead("gemini:antigravity")`), which accesses Windows Credential Manager globally per logon session and ignores `HOME` / `USERPROFILE`. When secondary pool accounts were spawned, `agy.exe` read the primary account's token from Credential Manager, running secondary turns under the primary account and draining its quota (e.g. `g98` dropping to ~17% while secondary accounts appeared unused). The host now actively synchronizes Windows Credential Manager before each turn with the target account's token, persists any refreshed tokens back to that account's directory upon completion, and restores the primary account upon release.
 
 ### 中文 (Chinese)
 
+- **新增：DSH 客户端 / Web 端原生 Mermaid 流程图与图表渲染。** Antigravity 上的 Gemini 与 Claude 模型在梳理架构与方案时经常输出 ````mermaid```` 代码块。DSH 原本仅将其作为普通文本代码块展示，导致图表无法直观查看。`dsh-agy-link` 现内置离线 Mermaid.js 运行时（通过 `/plugins/agy-link/assets/mermaid.min.js` 托管），为所有包含 `mermaid` 代码块的区域挂载交互式图表卡片：
+  - 无破坏性 DOM 操作，安全保留 React `<pre>` 节点结构以防重渲染崩溃。
+  - "图表" 与 "代码" 标签页一键无缝切换。
+  - 交互式缩放控制（放大、缩小、重置比例）。
+  - 一键复制 SVG 源码到剪贴板。
+  - 自动跟随 DSH 主题色（暗色 / 亮色）切换渲染配色。
+- **新增：本地图片与媒体展示（支持 `file:///`、Windows 绝对路径与 WSL 路径）及全屏灯箱。** 模型在生成或引用本地视觉资源（如设计图、原画预览、制品图）时，通常会输出 `file:///` 协议或本地文件系统路径。DSH 内置的 Markdown 渲染器出于安全只接收 HTTP(S) 地址，导致图片回退为静态文本 `<span class="imageAlt">`。
+  - 插件后端新增 `/plugins/agy-link/media` 路由，具备安全边界校验、MIME 类型自动推断、流式传输与客户端缓存支持，全面兼容 Windows 盘符路径（`D:/...`）、UNC 路径以及 WSL 环境路径（`/mnt/...`、`/home/...`）。
+  - 流式响应实时重写：在模型输出流中即时将 `![alt](file:///...)` 转换为通过本地服务代理的安全可访问 URL。
+  - 历史会话无损追溯：前端增强器通过 React Fiber 属性提取历史消息中已失效 `<span class="imageAlt">` 的原始路径，自动补全渲染出真实缩略图，重开历史对话亦可完整查看图片。
+  - 本地超链接图片识别：自动识别指向图片的 `file://` 链接并在下方挂载缩略图。
+  - 全屏交互式灯箱（Lightbox）：支持双击/按钮放大缩小、拖拽平移以及「复制路径」到剪贴板。
+- **新增：用户选择与拍板决策交互适配（`ask_question` 工具卡片与 Markdown 决策选项快捷填入）。** Antigravity 体系下的模型经常调用 `ask_question` 或输出结构化的拍板询问（如 `### 💬 请您拍板：1. 路线 A... 2. 路线 B...`）。
+  - 深度适配 `ask_question` 工具卡片：以结构化卡片渲染问题与候选选项，提供候选气泡及「填入输入框」一键操作。
+  - 扩展图片类工具卡片预览：`generate_image` 以及针对图片路径调用的 `view_file` 均以大图卡片配合直接查看与灯箱展示。
+  - 自动扫描 Markdown 拍板决策区：自动识别「请您拍板 / 请您指示 / 请选择」等段落选项，挂载交互式快捷选项芯片（Chips），点击即可自动填入 DSH 底部聊天输入框，极大提升人机协作效率。
 - **修复：代码卡片引用了一个不存在的字体 token，导致代码字体静默回落到硬编码兜底栈。** `ROW_CSS` 里把 DSH 的代码字体 token 写成了 `--dsw-font-family-code`，而真实 token 是 `--ds-font-family-code`（无 `w`）。这个拼错的名称在整个 DSH 代码库里零定义，因此每一处 `var(--dsw-font-family-code, <兜底>)` 都取到硬编码兜底值 `ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`——该栈不含中文字形，导致 agy 工具卡片里的中文以系统默认字体（宋体 / 微软雅黑）渲染，而非宿主配置的代码字体。受影响的三个选择器是 `.agy-tv-card`（其 `font-family` 会向下继承到标题栏、复制按钮与正文）、`.agy-tv-preview` 与 `.agy-tv-diff-stat`。
+- **修复 (Windows)：自动识别 Windows 系统代理（WinINet），修复点击「刷新/同步」额度静默超时失效。** Windows 桌面版客户端（Electron GUI）启动时，`process.env` 默认不包含终端环境下的 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。当未在设置里显式填入代理时，直连 Google 额度接口（`daily-cloudcode-pa.googleapis.com` 及 `googleapis.com`）会触发连接超时，后端异常捕获后静默退出，前端虽提示「额度已刷新」但数值永远保持原样。插件现增加自动注册表探针（读取 `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`），自适应识别系统代理（如 `127.0.0.1:17891`），并自动注入到 undici 请求与子进程环境变量中。
+- **修复 (Windows)：Windows 凭据管理器跨账号撞车，导致池中副账号偷偷消耗主账号（g98）额度。** macOS 下每个账号拥有独立的钥匙串文件（`login.keychain-db`），通过重定向 `$HOME` 即可实现天然隔离；而 Windows 下 `agy.exe` 使用 `zalando/go-keyring`，直接调用 Win32 API `advapi32!CredRead("gemini:antigravity")`。Windows 凭据管理器是全局绑定到当前登录会话的，完全忽略 `HOME` 与 `USERPROFILE`！这导致无论池中调度哪个副账号，`agy.exe` 启动时始终读取系统凭据管理器中残留的主账号 token 执行，造成「用着副账号，消耗的全是主账号额度」（导致用户发现 g98 额度无故跌至十几个点而副账号几乎不动）。插件现针对 Windows 实现动态凭据同步：每次调用前将目标账号 token 瞬时写入 `gemini:antigravity`，调用结束后将最新刷新后的 token 存回该账号目录，并自动恢复主账号原始凭据。
 
 ## 0.4.42 (2026-09-30)
 

@@ -32,6 +32,15 @@ export class AccountPoolManager {
     this.normalizeLegacyPrimary()
   }
 
+  /**
+   * Directory holding `pool.json` and the durable primary credential. Exposed
+   * so credential handling is anchored on the pool actually in use instead of
+   * a hidden process-global path (which made tests write to the real pool).
+   */
+  get dir(): string {
+    return this.baseDir
+  }
+
   private load(): AccountPoolData {
     try {
       if (existsSync(this.file)) {
@@ -365,6 +374,18 @@ export class AccountPoolManager {
     delete acc.authRequired
     delete acc.authError
     delete acc.authMarkedAt
+    this.persist()
+  }
+
+  /**
+   * Drop an email label that is provably wrong — e.g. an isolated account
+   * whose token file was overwritten by another account's credential. The row
+   * then shows its user-chosen alias instead of a foreign address.
+   */
+  clearAccountEmail(id: string): void {
+    const acc = this.getAccount(id)
+    if (!acc) return
+    delete acc.email
     this.persist()
   }
 
