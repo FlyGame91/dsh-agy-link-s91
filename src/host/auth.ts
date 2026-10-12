@@ -6,6 +6,7 @@
 import { extractAuthUrl, looksLikeAuthFailure } from '../common/types.ts'
 import { openBrowser } from './oauth.ts'
 import { ensureIsolatedKeychain, isolatedHomeEnv, probeProcess, proxyEnvFor, startAgyProcess, type RunningProcess } from './runner.ts'
+import { detectSystemProxy } from './wincred.ts'
 
 export type AuthPhase = 'idle' | 'pending' | 'submitting' | 'ok' | 'failed' | 'signed-out'
 
@@ -101,7 +102,7 @@ export class AuthHelper {
     const env = {
       ...process.env,
       ...(homeDir ? isolatedHomeEnv(homeDir) : {}),
-      ...proxyEnvFor(proxyUrl),
+      ...proxyEnvFor(proxyUrl || detectSystemProxy()),
     }
     const proc = startAgyProcess({
       bin,

@@ -7,6 +7,8 @@ import { installAgyToolView } from './toolview.ts';
 import { installMermaidRendering } from './mermaid.ts';
 import { en, es, NS, ptBR, zh, type AgyLocaleKey } from './locales.ts';
 import { installAutoExpandReasoning } from './reasoning.ts';
+import { installImageEnhancer } from './images.ts';
+import { installDecisionChips } from './decisions.ts';
 
 
 type ReactApi = {
@@ -61,8 +63,6 @@ interface StatusPayload {
 	dormantReason?: string | null;
 	enabled?: boolean;
 	permissionMode?: string;
-	/** Windows Credential Manager is one shared keyring slot — pool rotation is cosmetic there (issue #45). */
-	credentialIsolationLimited?: boolean;
 	workspaceRoot?: string;
 	defaultModel?: string;
 	defaultEffort?: string;
@@ -1549,12 +1549,6 @@ export function apply(ctx: ClientContext): void {
 				),
 			),
 			renderToastBanner(),
-			status?.credentialIsolationLimited === true
-				? h('div', { key: 'win-isolation', style: { display: 'flex', alignItems: 'flex-start', gap: '6px', padding: '8px 10px', marginBottom: '8px', background: 'var(--agy-amber-soft, rgba(245, 158, 11, 0.12))', border: '1px solid rgba(245, 158, 11, 0.45)', borderRadius: '7px', fontSize: '11.5px', color: 'var(--agy-text-primary)' } },
-					h('span', { style: { flexShrink: 0 } }, '⚠️'),
-					h('span', null, t('pool.winIsolationWarn')),
-				)
-				: null,
 			addAccountSection,
 			renderedAccountCards,
 			h('div', { style: { marginTop: '16px', paddingTop: '12px', borderTop: '1px solid var(--agy-border-divider)' } },
@@ -1825,4 +1819,18 @@ export function apply(ctx: ClientContext): void {
 	// Draw ```mermaid fences (DSH's shiki pass has no mermaid grammar and
 	// leaves them as plain code blocks). Same lifecycle contract as above.
 	ctx.effect(() => installMermaidRendering());
+
+	// Local image display + fullscreen lightbox (recovered working tree).
+	// The recovered installers predate the ctx.effect contract and expose no
+	// disposer yet, so hand one back explicitly (follow-up: real teardown).
+	ctx.effect(() => {
+		installImageEnhancer();
+		return () => {};
+	});
+
+	// Interactive user decision & choice chips (recovered working tree).
+	ctx.effect(() => {
+		installDecisionChips();
+		return () => {};
+	});
 }

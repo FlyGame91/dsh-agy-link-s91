@@ -21,6 +21,11 @@ export default defineConfig([
     clean: true,
     fixedExtension: false,
     external: hostExternals,
+    onSuccess: () => {
+      const src = join(import.meta.dirname, "assets");
+      const dst = join(import.meta.dirname, "dist/assets");
+      cpSync(src, dst, { recursive: true });
+    },
   },
   {
     // Standalone zero-dep stdio MCP server shipped as a plain asset; agy

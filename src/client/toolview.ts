@@ -9,6 +9,8 @@
 //   and scrollable content (max-height with custom scrollbars) for long outputs.
 
 import { NS } from './locales.ts';
+import { insertTextIntoChatComposer } from './decisions.ts';
+import { openLightbox, isImageFile, buildMediaUrl } from './images.ts';
 
 type ReactApi = {
 	createElement: (type: unknown, props?: Record<string, unknown> | null, ...children: unknown[]) => unknown;
@@ -199,6 +201,36 @@ export function IconCheckOutline14(size = 12, className = ''): unknown {
 	}));
 }
 
+export function IconQuestionOutline16(size = 14, className = ''): unknown {
+	return hx('svg', {
+		width: size,
+		height: size,
+		className: className || undefined,
+		viewBox: '0 0 16 16',
+		fill: 'none',
+		style: { display: 'block', flexShrink: 0 },
+		'aria-hidden': true,
+	}, hx('path', {
+		d: 'M8 1C4.134 1 1 3.91 1 7.5c0 1.547.575 2.973 1.559 4.093L1.13 14.54a.5.5 0 00.627.63l3.238-1.079C5.875 14.316 6.91 14.5 8 14.5c3.866 0 7-2.91 7-6.5S11.866 1 8 1zm0 10.5a.75.75 0 110-1.5.75.75 0 010 1.5zm1.09-3.41c-.42.34-.59.54-.59.91H7.5v-.5c0-.66.36-1.12.82-1.48.44-.35.68-.61.68-1.02 0-.55-.45-1-1-1s-1 .45-1 1H6c0-1.1.9-2 2-2s2 .9 2 2c0 .73-.39 1.25-.91 1.67z',
+		fill: 'currentColor',
+	}));
+}
+
+export function IconImageOutline16(size = 14, className = ''): unknown {
+	return hx('svg', {
+		width: size,
+		height: size,
+		className: className || undefined,
+		viewBox: '0 0 16 16',
+		fill: 'none',
+		style: { display: 'block', flexShrink: 0 },
+		'aria-hidden': true,
+	}, hx('path', {
+		d: 'M14 3H2a1 1 0 00-1 1v8a1 1 0 001 1h12a1 1 0 001-1V4a1 1 0 00-1-1zm-1 8H3l2.5-3.2 1.8 2.3 2.7-3.5L13 11zM5.5 6a1.5 1.5 0 110-3 1.5 1.5 0 010 3z',
+		fill: 'currentColor',
+	}));
+}
+
 function toolIconFor(kind: CardKind, size = 14): unknown {
 	switch (kind) {
 		case 'terminal':
@@ -211,6 +243,10 @@ function toolIconFor(kind: CardKind, size = 14): unknown {
 		case 'search':
 		case 'list':
 			return IconSearchOutline16(size);
+		case 'question':
+			return IconQuestionOutline16(size);
+		case 'image':
+			return IconImageOutline16(size);
 		default:
 			return IconCodeOutline16(size);
 	}
@@ -338,8 +374,10 @@ const READ_TOOLS = new Set(['read_file', 'view_file', 'read', 'open_file']);
 const SEARCH_TOOLS = new Set(['find_by_name', 'glob', 'search_files', 'grep_search', 'search', 'search_file_content', 'grep', 'search_web', 'web_search']);
 const LIST_TOOLS = new Set(['list_dir', 'ls']);
 const DELETE_TOOLS = new Set(['delete_file', 'remove_file', 'rm']);
+const QUESTION_TOOLS = new Set(['ask_question', 'ask', 'question']);
+const IMAGE_TOOLS = new Set(['generate_image', 'create_image', 'render_image']);
 
-export type CardKind = 'terminal' | 'diff' | 'read' | 'search' | 'list' | 'delete' | 'generic';
+export type CardKind = 'terminal' | 'diff' | 'read' | 'search' | 'list' | 'delete' | 'question' | 'image' | 'generic';
 
 export interface MirrorCardModel {
 	kind: CardKind;
@@ -353,6 +391,12 @@ export interface MirrorCardModel {
 	newText?: string;
 	location?: { path: string; line?: number };
 	raw?: string;
+	questions?: Array<{ question?: string; options?: string[]; is_multi_select?: boolean }>;
+	prompt?: string;
+	imageName?: string;
+	aspectRatio?: string;
+	isImage?: boolean;
+	imagePath?: string;
 }
 
 export function mirrorCardModel(block: ToolBlock, cwd?: string, home?: string): MirrorCardModel {
@@ -364,6 +408,35 @@ export function mirrorCardModel(block: ToolBlock, cwd?: string, home?: string): 
 	const { tool, input } = info;
 	const desc = pick(input, 'Description', 'description', 'toolAction', 'toolSummary', 'Instruction', 'instruction');
 
+	if (QUESTION_TOOLS.has(tool)) {
+		const questionsRaw = (input as Record<string, unknown>).questions ?? (input as Record<string, unknown>).Questions;
+		const questions = Array.isArray(questionsRaw) ? (questionsRaw as Array<{ question?: string; options?: string[]; is_multi_select?: boolean }>) : [];
+		const firstQ = questions[0];
+		const qTitle = firstQ?.question ?? desc ?? 'Ask Question';
+		return {
+			kind: 'question',
+			tool,
+			title: qTitle,
+			output: out,
+			questions,
+			raw: parsedArgsRaw(block),
+		};
+	}
+	if (IMAGE_TOOLS.has(tool)) {
+		const prompt = pick(input, 'Prompt', 'prompt') ?? '';
+		const name = pick(input, 'ImageName', 'image_name', 'name') ?? 'image';
+		const ratio = pick(input, 'AspectRatio', 'aspect_ratio') ?? '1:1';
+		return {
+			kind: 'image',
+			tool,
+			title: desc ?? `Generate Image · ${name}`,
+			prompt,
+			imageName: name,
+			aspectRatio: ratio,
+			output: out,
+			raw: parsedArgsRaw(block),
+		};
+	}
 	if (TERMINAL_TOOLS.has(tool)) {
 		const command = pick(input, 'CommandLine', 'command_line', 'command', 'cmd', 'Cmd') ?? JSON.stringify(input);
 		const cwdVal = pick(input, 'Cwd', 'cwd', 'WorkingDirectory', 'working_directory') ?? cwd;
@@ -392,12 +465,17 @@ export function mirrorCardModel(block: ToolBlock, cwd?: string, home?: string): 
 		const path = pick(input, 'AbsolutePath', 'absolute_path', 'TargetFile', 'target_file', 'path', 'file_path', 'filename', 'Path', 'FilePath', 'FileName', 'targetFile') ?? '';
 		const offset = num(input, 'offset', 'Offset') ?? num(input, 'StartLine', 'start_line');
 		const line = offset !== undefined ? (offset > 0 && (tool === 'view_file' || tool === 'read_file') ? offset : offset + 1) : undefined;
+		const isImg = isImageFile(path);
 		return {
-			kind: 'read',
+			kind: isImg ? 'image' : 'read',
 			tool,
 			title: desc ? `${desc} · ${path}` : path !== '' ? 'Read ' + path : 'Read',
 			path,
 			output: out,
+			isImage: isImg,
+			imagePath: isImg ? path : undefined,
+			prompt: desc,
+			imageName: path.split(/[/\\]/).pop() || 'image',
 			...(path !== '' ? { location: { path, ...(line !== undefined ? { line } : {}) } } : {}),
 		};
 	}
@@ -493,6 +571,10 @@ function displayTitle(model: MirrorCardModel, t?: Translate): string {
 			return tr(t, 'tv.list', 'List');
 		case 'delete':
 			return tr(t, 'tv.delete', 'Delete');
+		case 'question':
+			return tr(t, 'tv.question', 'Question');
+		case 'image':
+			return tr(t, 'tv.image', 'Image');
 		default:
 			return model.tool ? model.tool.replace(/_/g, ' ') : tr(t, 'tv.tool', 'Tool');
 	}
@@ -515,6 +597,12 @@ function displaySummary(model: MirrorCardModel, cwd?: string, home?: string): st
 	}
 	if (model.kind === 'list') {
 		return model.title.replace(/^List\s*(directory\s*)?/i, '') || model.title;
+	}
+	if (model.kind === 'question') {
+		return model.title;
+	}
+	if (model.kind === 'image') {
+		return model.prompt || model.title;
 	}
 	return model.title;
 }
@@ -602,6 +690,133 @@ function DiffBody({ model, t }: { model: MirrorCardModel; openFile?: (p: string,
 		rows.push(h('div', { key: 'empty', className: 'agy-tv-diff-line', style: { color: 'var(--dsw-alias-label-tertiary)' } }, tr(t, 'tv.noChanges', '(no textual changes)')));
 	}
 	return h('div', { className: 'agy-tv-diff-list' }, ...rows);
+}
+
+// ---- Question card renderer -----------------------------------------------
+
+function QuestionCardBody({ model }: { model: MirrorCardModel }): unknown {
+	const h = hx;
+	const questions = model.questions ?? [];
+	const [selectedMap, setSelectedMap] = react().useState<Record<number, Set<string>>>({});
+	const [inserted, setInserted] = react().useState(false);
+
+	const toggleOption = (qIdx: number, opt: string, isMulti?: boolean) => {
+		setSelectedMap((prev) => {
+			const next = { ...prev };
+			const current = new Set(next[qIdx] ?? []);
+			if (isMulti) {
+				if (current.has(opt)) current.delete(opt);
+				else current.add(opt);
+			} else {
+				current.clear();
+				current.add(opt);
+			}
+			next[qIdx] = current;
+			return next;
+		});
+	};
+
+	const onInsert = () => {
+		const parts: string[] = [];
+		for (let i = 0; i < questions.length; i++) {
+			const sel = Array.from(selectedMap[i] ?? []);
+			if (sel.length > 0) {
+				parts.push(sel.join('; '));
+			}
+		}
+		if (parts.length > 0) {
+			const text = parts.join('\n');
+			insertTextIntoChatComposer(text);
+			setInserted(true);
+			setTimeout(() => setInserted(false), 1500);
+		}
+	};
+
+	const qNodes: unknown[] = [];
+	for (let i = 0; i < questions.length; i++) {
+		const q = questions[i];
+		if (!q) continue;
+		const options = q.options ?? [];
+		const isMulti = q.is_multi_select === true;
+		const sel = selectedMap[i] ?? new Set();
+
+		const optNodes = options.map((opt, oIdx) => {
+			const isChecked = sel.has(opt);
+			return h('button', {
+				key: 'opt-' + oIdx,
+				type: 'button',
+				className: cls('agy-tv-q-opt', isChecked && 'selected'),
+				onClick: (e: { stopPropagation: () => void }) => {
+					e.stopPropagation();
+					toggleOption(i, opt, isMulti);
+				},
+			},
+				h('span', { className: cls('agy-tv-q-check', isMulti ? 'checkbox' : 'radio', isChecked && 'checked') }),
+				h('span', { className: 'agy-tv-q-opt-text' }, opt)
+			);
+		});
+
+		qNodes.push(h('div', { key: 'q-' + i, className: 'agy-tv-q-item' },
+			h('div', { className: 'agy-tv-q-prompt' }, q.question || 'Please select:'),
+			h('div', { className: 'agy-tv-q-opts' }, ...optNodes)
+		));
+	}
+
+	const hasSelection = Object.values(selectedMap).some((s) => s.size > 0);
+
+	return h('div', { className: 'agy-tv-question-wrap' },
+		...qNodes,
+		h('div', { className: 'agy-tv-q-footer' },
+			h('button', {
+				type: 'button',
+				className: cls('agy-tv-q-insert-btn', hasSelection && 'active'),
+				disabled: !hasSelection,
+				onClick: (e: { stopPropagation: () => void }) => {
+					e.stopPropagation();
+					onInsert();
+				},
+			},
+				inserted ? '✓ 已填入对话框' : '💬 填入对话框 / Insert into Chat'
+			),
+			model.output ? h('div', { className: 'agy-tv-q-answered' }, `已记录: ${model.output}`) : null
+		)
+	);
+}
+
+// ---- Image card renderer --------------------------------------------------
+
+function ImageCardBody({ model }: { model: MirrorCardModel }): unknown {
+	const h = hx;
+	const prompt = model.prompt || '';
+	const name = model.imageName || 'image';
+	const ratio = model.aspectRatio || '1:1';
+	const path = model.imagePath || model.path || '';
+	const mediaUrl = path ? buildMediaUrl(path) : null;
+
+	return h('div', { className: 'agy-tv-img-wrap' },
+		h('div', { className: 'agy-tv-img-meta' },
+			h('div', { className: 'agy-tv-img-prompt', title: prompt || name }, prompt ? `"${prompt}"` : name),
+			h('div', { className: 'agy-tv-img-badges' },
+				h('span', { className: 'agy-tv-img-badge' }, ratio),
+				...(path ? [h('span', { key: 'path', className: 'agy-tv-img-badge', title: path }, path.split(/[/\\]/).pop())] : [])
+			)
+		),
+		mediaUrl ? h('div', {
+			className: 'agy-tv-img-preview-box',
+			onClick: (e: { stopPropagation: () => void }) => {
+				e.stopPropagation();
+				openLightbox(mediaUrl, prompt || name, path);
+			},
+			title: '点击放大预览 / Click to open lightbox'
+		},
+			h('img', {
+				className: 'agy-tv-img-thumb',
+				src: mediaUrl,
+				alt: prompt || name,
+				loading: 'lazy',
+			})
+		) : null
+	);
 }
 
 // ---- Card body renderer ---------------------------------------------------
@@ -701,6 +916,32 @@ function CardBody({ model, openFile, cwd, home, inspect, t }: {
 					h(CopyButton, { text: model.output ?? '', t })
 				),
 				h('pre', { className: 'agy-tv-card-content' }, clip(rawBody, 16000)),
+				inspectNode
+			);
+		}
+		case 'question': {
+			return h('div', { className: 'agy-tv-card' },
+				h('div', { className: 'agy-tv-card-header' },
+					h('div', { className: 'agy-tv-card-header-left' },
+						IconQuestionOutline16(13),
+						h('span', { className: 'agy-tv-card-path' }, model.title)
+					),
+					h(CopyButton, { text: model.output ?? (model.raw ?? '') })
+				),
+				h(QuestionCardBody, { model }),
+				inspectNode
+			);
+		}
+		case 'image': {
+			return h('div', { className: 'agy-tv-card' },
+				h('div', { className: 'agy-tv-card-header' },
+					h('div', { className: 'agy-tv-card-header-left' },
+						IconImageOutline16(13),
+						h('span', { className: 'agy-tv-card-path' }, model.imageName || 'Image')
+					),
+					h(CopyButton, { text: model.prompt || (model.raw ?? '') })
+				),
+				h(ImageCardBody, { model }),
 				inspectNode
 			);
 		}
@@ -1342,6 +1583,156 @@ const ROW_CSS = `
 .agy-tv-inspect-btn:hover {
 	background: var(--dsw-alias-interactive-bg-hover-solid, #f1f5f9);
 	color: var(--dsw-alias-label-primary, #0f172a);
+}
+
+/* Question Card Styles */
+.agy-tv-question-wrap {
+	padding: 10px 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	font-family: inherit;
+}
+.agy-tv-q-item {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.agy-tv-q-prompt {
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--dsw-alias-label-primary, #0f172a);
+}
+.agy-tv-q-opts {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.agy-tv-q-opt {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px;
+	border-radius: 6px;
+	background: var(--dsw-alias-bg-l2, rgba(127, 127, 127, 0.08));
+	border: 1px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.2));
+	color: var(--dsw-alias-label-primary, #334155);
+	cursor: pointer;
+	text-align: left;
+	font-size: 12.5px;
+	transition: all 0.15s ease;
+}
+.agy-tv-q-opt:hover {
+	background: var(--dsw-alias-bg-hover, rgba(127, 127, 127, 0.15));
+	border-color: var(--dsw-alias-border-l3, rgba(127, 127, 127, 0.35));
+}
+.agy-tv-q-opt.selected {
+	background: rgba(16, 185, 129, 0.12);
+	border-color: #10b981;
+	color: #10b981;
+}
+.agy-tv-q-check {
+	width: 14px;
+	height: 14px;
+	border: 1.5px solid currentColor;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+}
+.agy-tv-q-check.radio {
+	border-radius: 50%;
+}
+.agy-tv-q-check.checkbox {
+	border-radius: 3px;
+}
+.agy-tv-q-check.checked:after {
+	content: "";
+	width: 6px;
+	height: 6px;
+	background: currentColor;
+	border-radius: inherit;
+}
+.agy-tv-q-footer {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding-top: 6px;
+	border-top: 1px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.15));
+}
+.agy-tv-q-insert-btn {
+	padding: 5px 12px;
+	border-radius: 6px;
+	font-size: 12px;
+	font-weight: 600;
+	background: rgba(16, 185, 129, 0.15);
+	border: 1px solid #10b981;
+	color: #10b981;
+	cursor: pointer;
+	transition: all 0.15s ease;
+}
+.agy-tv-q-insert-btn:disabled {
+	opacity: 0.4;
+	cursor: not-allowed;
+}
+.agy-tv-q-insert-btn:not(:disabled):hover {
+	background: #10b981;
+	color: #fff;
+}
+.agy-tv-q-answered {
+	font-size: 11px;
+	color: var(--dsw-alias-label-tertiary, #888);
+}
+
+/* Image Card Styles */
+.agy-tv-img-wrap {
+	padding: 10px 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.agy-tv-img-meta {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+.agy-tv-img-prompt {
+	font-size: 12.5px;
+	color: var(--dsw-alias-label-primary, #334155);
+	font-style: italic;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.agy-tv-img-badges {
+	display: flex;
+	gap: 4px;
+	flex-shrink: 0;
+}
+.agy-tv-img-badge {
+	font-size: 11px;
+	padding: 1px 6px;
+	border-radius: 4px;
+	background: var(--dsw-alias-bg-l2, rgba(127, 127, 127, 0.1));
+	border: 1px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.2));
+	color: var(--dsw-alias-label-secondary, #888);
+}
+.agy-tv-img-preview-box {
+	max-height: 320px;
+	overflow: hidden;
+	border-radius: 6px;
+	border: 1px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.2));
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: repeating-conic-gradient(rgba(127,127,127,0.08) 0% 25%, transparent 0% 50%) 50% / 16px 16px;
+	cursor: zoom-in;
+}
+.agy-tv-img-thumb {
+	max-width: 100%;
+	max-height: 320px;
+	object-fit: contain;
 }
 `;
 

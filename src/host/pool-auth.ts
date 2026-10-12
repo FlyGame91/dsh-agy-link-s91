@@ -11,6 +11,7 @@
 // via fetchAvailableModels/userinfo -> commit into the pool. Manual code
 // (or redirect URL) paste is the fallback when the listener cannot bind.
 import { randomBytes } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import {
   buildAuthorizeUrl,
   exchangeCode,
@@ -24,6 +25,8 @@ import {
 } from './oauth.ts'
 import type { AccountPoolManager } from './pool.ts'
 import type { QuotaService } from './quota.ts'
+import { detectSystemProxy, writeWindowsCredentialRaw } from './wincred.ts'
+import { writePrimaryCredential } from './credential-slot.ts'
 
 export type PoolAuthPhase = 'idle' | 'waiting' | 'exchanging' | 'done' | 'failed'
 export type PoolAuthStatusCode =
@@ -166,16 +169,16 @@ export class PoolAuthFlow {
   /** Begin adding a pool account (isolated staging HOME). */
   async begin(alias?: string, proxyUrl?: string): Promise<PoolAuthStatus & { ok: boolean; dir?: string }> {
     const staging = this.pool.createStagingSlot()
-    return this.startFlow({ stagingId: staging.id, dir: staging.dir, alias, proxyUrl })
+    return this.startFlow({ stagingId: staging.id, dir: staging.dir, alias, proxyUrl: proxyUrl || detectSystemProxy() })
   }
 
   /**
    * Begin logging in the PRIMARY account (system HOME, no staging slot):
    * same browser flow, tokens land in ~/.gemini so the real agy stays signed in.
    */
-  async beginPrimary(): Promise<PoolAuthStatus & { ok: boolean; dir?: string }> {
+  async beginPrimary(proxyUrl?: string): Promise<PoolAuthStatus & { ok: boolean; dir?: string }> {
     const { homedir } = await import('node:os')
-    return this.startFlow({ stagingId: 'acc_primary', dir: homedir(), primary: true })
+    return this.startFlow({ stagingId: 'acc_primary', dir: homedir(), primary: true, proxyUrl: proxyUrl || detectSystemProxy() })
   }
 
   /** Manual paste fallback: accepts a bare code or the full redirect URL. */
@@ -217,8 +220,26 @@ export class PoolAuthFlow {
     this.setStatus({ phase: 'exchanging' })
     try {
       const tokens = await exchangeCode(code, flow.verifier, flow.proxyUrl)
-      writeAgyTokenFile(flow.dir, tokens)
+      const tokenFile = writeAgyTokenFile(flow.dir, tokens)
+      if (flow.primary && process.platform === 'win32') {
+        try {
+          const raw = readFileSync(tokenFile, 'utf8')
+          writeWindowsCredentialRaw(raw, 'gemini:antigravity')
+        } catch {
+          // best-effort
+        }
+      }
       const email = await fetchUserEmail(tokens.access_token, flow.proxyUrl)
+      if (flow.primary && process.platform === 'win32') {
+        try {
+          // Record the freshly verified primary credential so every later slot
+          // handoff restores THIS login instead of "whatever the slot held".
+          const raw = readFileSync(tokenFile, 'utf8')
+          writePrimaryCredential({ raw, email, savedAt: Date.now() })
+        } catch {
+          // best-effort
+        }
+      }
       if (flow.primary) {
         // System-HOME login: update the primary account in place, never
         // stage/commit and NEVER delete the real home directory.

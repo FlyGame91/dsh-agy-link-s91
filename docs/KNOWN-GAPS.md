@@ -4,19 +4,21 @@ Deliberate v1 boundaries and upstream-behavior notes.
 
 ## Platform limits
 
-- **Windows: pool accounts cannot isolate credentials (issue #45)** — agy on
-  Windows stores its login in the system-wide Credential Manager slot
-  `gemini:antigravity` (go-keyring). `HOME`/`USERPROFILE`/`GEMINI_CLI_HOME`
-  isolation moves files only, so every isolated pool account still
-  authenticates — and bills — as the system login: round-robin rotates
-  workspaces, not credentials. The plugin surfaces
-  `credentialIsolationLimited` in `/plugins/agy-link/status` (rendered as a
-  warning banner in the settings panel) and logs once per isolated account
-  when it is selected. A real fix needs agy to namespace its keyring per
-  HOME or to fall back to the per-HOME token file when the keyring slot is
-  empty; swapping the shared slot via `CredWrite` around each spawn is not
-  implemented because concurrent runs (`maxConcurrent > 1`) would overwrite
-  each other's credential mid-run.
+- **Windows: pool credential isolation is implemented by handing the shared
+  slot over (issue #45)** — agy on Windows resolves its Google credential from
+  ONE process-global Credential Manager slot `gemini:antigravity`
+  (go-keyring); `HOME`/`USERPROFILE`/`GEMINI_CLI_HOME` move files only. Rather
+  than pretending the pool is isolated, the plugin now owns the slot: the
+  primary credential is kept in a durable, identity-verified store
+  (`agy-accounts/.primary-credential.json`), and every run acquires the slot
+  through `acquireCredentialSlot` — a process-wide FIFO mutex that writes the
+  target account's verified credential into the slot, then restores the
+  primary's on release. `SlotUnavailableError` aborts a run instead of letting
+  it silently spend the wrong account when the primary cannot be verified.
+  Remaining boundary: the mutex is **per process**, so two DSH hosts (web +
+  headless) running agy at the same moment can still interleave slot writes;
+  keep `maxConcurrent` at 1 on Windows and avoid driving two hosts at once.
+  A cleaner upstream fix would be per-HOME keyring namespacing in agy.
 
 ## Not forwarded to agy
 

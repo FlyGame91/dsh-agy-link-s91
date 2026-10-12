@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
-import { EventMapper, suffixDelta, usageFromRaw } from '../src/host/mapper.ts'
+import { EventMapper, rewriteImageMarkdown, suffixDelta, usageFromRaw } from '../src/host/mapper.ts'
 import { mirrorCallId, parseMirrorCallId } from '../src/host/recording.ts'
 import { parseMirrorInvocation } from '../src/host/mirror-tool.ts'
 
@@ -527,4 +527,45 @@ test('token-only steps AFTER visible text stay suppressed (no clutter regression
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
   assert.ok(reasoning.includes('[agy thinking turn · 10 thinking tokens]'), 'first banner present')
   assert.ok(!reasoning.includes('99'), 'later token-only steps are not chatty')
+})
+
+test('rewriteImageMarkdown rewrites file://, Windows, and WSL paths to mediaBaseUrl', () => {
+  const baseUrl = 'http://127.0.0.1:4000/plugins/agy-link/media'
+
+  // file:/// URL
+  const input1 = 'Here: ![2D 原画](file:///D:/proj/tribal-era/docs/concept.png)'
+  const out1 = rewriteImageMarkdown(input1, baseUrl)
+  assert.equal(out1, `Here: ![2D 原画](${baseUrl}?path=file%3A%2F%2F%2FD%3A%2Fproj%2Ftribal-era%2Fdocs%2Fconcept.png)`)
+
+  // Windows path
+  const input2 = 'Render: ![3D](D:\\proj\\tribal-era\\mesh.png)'
+  const out2 = rewriteImageMarkdown(input2, baseUrl)
+  assert.equal(out2, `Render: ![3D](${baseUrl}?path=D%3A%5Cproj%5Ctribal-era%5Cmesh.png)`)
+
+  // WSL path
+  const input3 = 'Linux: ![wsl](/home/zand/preview.webp)'
+  const out3 = rewriteImageMarkdown(input3, baseUrl)
+  assert.equal(out3, `Linux: ![wsl](${baseUrl}?path=%2Fhome%2Fzand%2Fpreview.webp)`)
+
+  // Pass-through when no mediaBaseUrl
+  assert.equal(rewriteImageMarkdown(input1, undefined), input1)
+})
+
+test('EventMapper with mediaBaseUrl streams rewritten image markdown in text steps', () => {
+  const baseUrl = 'http://127.0.0.1:5000/plugins/agy-link/media'
+  const m = new EventMapper({
+    runId: 'r_img',
+    cutOnTool: true,
+    mediaBaseUrl: baseUrl,
+  })
+
+  const chunks = mapAll(m, [
+    { kind: 'step', stepKey: '1', stepKind: 'text', text: 'Here is ![concept](file:///D:/test.png)' },
+    { kind: 'result', conversationId: 'c1', ok: true, response: 'done', usage: {} },
+  ])
+
+  const textChunk = chunks.find((c) => c.type === 'text-delta') as { type: 'text-delta'; text: string } | undefined
+  assert.ok(textChunk !== undefined)
+  assert.ok(textChunk.text.includes(baseUrl))
+  assert.ok(textChunk.text.includes('test.png'))
 })

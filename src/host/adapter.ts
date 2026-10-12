@@ -17,6 +17,8 @@ import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug, sanitizeCa
 import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
 import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin } from './runner.ts'
+import { detectSystemProxy } from './wincred.ts'
+import { acquireCredentialSlot, SlotUnavailableError } from './credential-slot.ts'
 import { stateDir } from '../common/config.ts'
 import { SENT_IMAGE_IDS_MAX, type SessionStore } from './sessions.ts'
 import { readFullToolArgs, readStepThoughts, clearAgyDbCache } from './agy-db.ts'
@@ -367,6 +369,8 @@ export interface AgyAdapterDeps {
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
   /** Called with each run's parser so the host can keep the last stdout ring for /agy doctor. */
   onParser?: (parser: StreamJsonParser) => void
+  /** Base URL of the media route, e.g. http://127.0.0.1:PORT/plugins/agy-link/media */
+  getMediaBaseUrl?: () => string | null
 }
 
 // ---- stream() -------------------------------------------------------------
@@ -882,18 +886,6 @@ export class AgyAdapter extends LlmAdapter {
     // families the user is not currently running).
     if (account && !isAux) this.deps.pool?.markAccountActive(account.id)
 
-    // Windows: go-keyring maps to the system-wide Credential Manager slot
-    // `gemini:antigravity` (issue #45). HOME isolation moves FILES, not the
-    // credential, so an isolated pool account still authenticates — and
-    // bills — as the system login. Warn once per account so "round-robin is
-    // cosmetic on Windows" is visible instead of a silent quota mystery.
-    if (process.platform === 'win32' && account && !account.systemHome && !isAux) {
-      this.warnOnce(
-        'win-keyring-slot:' + account.id,
-        'Windows cannot isolate pool credentials: agy authenticates via the system-wide Credential Manager slot (gemini:antigravity), so this isolated account still uses the system login (issue #45 — see KNOWN-GAPS.md)',
-      )
-    }
-
     const sessionAccountKey = account ? `${sessionKey}:${account.id}` : sessionKey
     let binding = sessionAccountKey !== '' ? this.deps.store.get(sessionAccountKey) : undefined
     if (binding === undefined && sessionKey !== '') {
@@ -1332,9 +1324,39 @@ export class AgyAdapter extends LlmAdapter {
     const stdinPayload = promptViaStdin ? buildStreamInputLine(prompt) : undefined
     const release = await this.deps.acquire()
     let released = false
+    let slotLease: Awaited<ReturnType<typeof acquireCredentialSlot>>
+    try {
+      // Windows has ONE process-global credential slot that every agy process
+      // reads. Ownership is serialized for the whole run and only handed over
+      // when it can provably be handed back. This throws instead of signing in
+      // as the wrong account, which would silently spend that account's quota.
+      //
+      // Never engage the real Credential Manager from a test run: node:test
+      // sets NODE_TEST_CONTEXT, and the fake-agy pool tests build accounts that
+      // do not own the machine's system login (handing those over would write
+      // test credentials into the developer's real slot). Their credential-slot
+      // unit tests inject a fake IO and still exercise the handoff directly.
+      slotLease = process.env.NODE_TEST_CONTEXT === undefined
+        ? await acquireCredentialSlot(account ?? undefined, this.deps.pool, {
+            baseDir: this.deps.pool?.dir,
+            proxyUrl: account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined,
+            log: (msg) => this.deps.log?.(msg),
+          })
+        : undefined
+    } catch (e) {
+      release()
+      this.clearInFlightPrompt(sessionKey, prompt)
+      const detail = e instanceof SlotUnavailableError ? e.message : brief(String(e))
+      throw new LlmError(detail, Err.AGY_ERROR)
+    }
     const releaseOnce = (): void => {
       if (released) return
       released = true
+      try {
+        slotLease?.release()
+      } catch {
+        // best-effort
+      }
       release()
     }
     // The acquire→spawn window can be arbitrarily long (all slots busy on
@@ -1358,6 +1380,7 @@ export class AgyAdapter extends LlmAdapter {
     // the macOS Keychain); injecting HOME there signs agy out ("Please
     // sign in") and every turn fails with an auth error.
     if (account && account.dir) ensureIsolatedKeychain(account.dir)
+    const effectiveProxy = account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined
     const env = {
       ...process.env,
       ...(cfg.disableTelemetry
@@ -1369,8 +1392,8 @@ export class AgyAdapter extends LlmAdapter {
           }
         : {}),
       ...(account && account.dir ? isolatedHomeEnv(account.dir) : {}),
-      // Dedicated account proxy wins; otherwise the global config proxy.
-      ...proxyEnvFor(account?.proxyUrl || cfg.proxyUrl || undefined),
+      // Dedicated account proxy wins, then global config proxy, then detected system proxy.
+      ...proxyEnvFor(effectiveProxy),
     }
 
     let proc: ReturnType<typeof startAgyProcess>
@@ -1767,6 +1790,7 @@ export class AgyAdapter extends LlmAdapter {
         usage: rec,
         resolvedFullArgs: resolved,
         resolvedThoughts,
+        mediaBaseUrl: this.deps.getMediaBaseUrl?.() ?? undefined,
       })
       let i = from
       try {

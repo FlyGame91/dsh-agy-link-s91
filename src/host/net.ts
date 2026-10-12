@@ -9,16 +9,18 @@
 // proxyUrl wins over the environment. Everything is per-request — the host
 // process's global dispatcher stays untouched.
 import { EnvHttpProxyAgent, ProxyAgent, fetch as undiciFetch } from 'undici'
+import { detectSystemProxy } from './wincred.ts'
 
 const envAgent = new EnvHttpProxyAgent()
 const perProxyAgents = new Map<string, ProxyAgent>()
 
 function agentFor(proxyUrl?: string): EnvHttpProxyAgent | ProxyAgent {
-  if (proxyUrl) {
-    let agent = perProxyAgents.get(proxyUrl)
+  const effective = proxyUrl || detectSystemProxy()
+  if (effective) {
+    let agent = perProxyAgents.get(effective)
     if (!agent) {
-      agent = new ProxyAgent(proxyUrl)
-      perProxyAgents.set(proxyUrl, agent)
+      agent = new ProxyAgent(effective)
+      perProxyAgents.set(effective, agent)
     }
     return agent
   }

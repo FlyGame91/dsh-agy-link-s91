@@ -88,6 +88,21 @@ export interface EventMapperOptions {
    * real thought text instead of token-count annotations.
    */
   resolvedThoughts?: ReadonlyMap<number, string>
+  /** Base URL for the media route, e.g. http://127.0.0.1:5173/plugins/agy-link/media */
+  mediaBaseUrl?: string
+}
+
+/** Rewrite local image paths and file:// URLs to point to the local media route. */
+export function rewriteImageMarkdown(text: string, mediaBaseUrl?: string): string {
+  if (!mediaBaseUrl || !text) return text
+  return text.replace(
+    /!\[(.*?)\]\((file:\/\/\/[^\s)]+|file:\/\/[^\s)]+|[A-Za-z]:[\\/][^\s)]+|\/home\/[^\s)]+|\/mnt\/[a-zA-Z]\/[^\s)]+|\\\\wsl\.localhost\\[^\s)]+)\)/g,
+    (_match, alt, target) => {
+      const cleanTarget = target.trim()
+      const mediaUrl = `${mediaBaseUrl}?path=${encodeURIComponent(cleanTarget)}`
+      return `![${alt}](${mediaUrl})`
+    },
+  )
 }
 
 export class EventMapper {
@@ -236,16 +251,17 @@ export class EventMapper {
         this.sawTextStep = true
         yield* this.ensureBlock('text')
         let d: StreamChunk | null
+        const processedText = this.opts.mediaBaseUrl ? rewriteImageMarkdown(ev.text, this.opts.mediaBaseUrl) : ev.text
         if (ev.fragment === true) {
           // Sequential fragment (text_delta): append in arrival order.
-          const acc = (this.emittedByKey.get(ev.stepKey) ?? '') + ev.text
+          const acc = (this.emittedByKey.get(ev.stepKey) ?? '') + processedText
           this.emittedByKey.set(ev.stepKey, acc)
-          d = this.appendDelta(ev.text)
+          d = this.appendDelta(processedText)
         } else {
           // Cumulative snapshot: emit only the grown suffix.
           const prev = this.emittedByKey.get(ev.stepKey) ?? ''
-          const delta = suffixDelta(prev, ev.text)
-          this.emittedByKey.set(ev.stepKey, ev.text)
+          const delta = suffixDelta(prev, processedText)
+          this.emittedByKey.set(ev.stepKey, processedText)
           d = this.appendDelta(delta)
         }
         if (d) yield d
