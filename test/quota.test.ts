@@ -28,7 +28,7 @@ test('QuotaService parses stored tokens and saves token refresh updates', async 
   )
 
   const quota = new QuotaService(pool)
-  const stored = quota.getStoredToken(acc)
+  const stored = await quota.getStoredToken(acc)
   assert.equal(stored?.accessToken, 'fake_access_token_123')
   assert.equal(stored?.refreshToken, 'fake_refresh_token_456')
 
@@ -99,7 +99,7 @@ test('writeAgyTokenFile emits the agy on-disk format and round-trips', async () 
   // Point the account at the HOME we just wrote.
   acc.dir = home
   const quota = new QuotaService(pool)
-  const stored = quota.getStoredToken(acc)
+  const stored = await quota.getStoredToken(acc)
   assert.equal(stored?.accessToken, 'ya29.fresh')
   assert.equal(stored?.refreshToken, '1//fresh-refresh')
   assert.equal(stored?.expiryMs, Date.parse('2026-08-21T00:00:00Z'))
@@ -283,20 +283,20 @@ test('getStoredToken prefers the macOS Keychain credential over a stale disk tok
   }
   let keychainReads = 0
   class KeychainFirstService extends QuotaService {
-    override readSystemKeychainToken() {
+    override async readSystemKeychainToken() {
       keychainReads++
       return keychainToken
     }
   }
 
   const svc = new KeychainFirstService(pool)
-  const stored = svc.getStoredToken(primary)
+  const stored = await svc.getStoredToken(primary)
   assert.ok(keychainReads >= 1, 'primary token resolution consults the Keychain')
   assert.equal(stored?.accessToken, 'ya29.keychain_current_login', 'Keychain credential wins over any disk file')
   assert.equal(stored?.refreshToken, '1//keychain_refresh')
 })
 
-test('getStoredToken never reads the shared Keychain for isolated pool accounts', () => {
+test('getStoredToken never reads the shared Keychain for isolated pool accounts', async () => {
   // The Keychain is ONE shared slot owned by the system-HOME login; isolated
   // account slots must only ever see their own directory's token file.
   const dir = mkdtempSync(join(tmpdir(), 'agy-quota-iso-'))
@@ -311,13 +311,13 @@ test('getStoredToken never reads the shared Keychain for isolated pool accounts'
   )
   let keychainReads = 0
   class IsoService extends QuotaService {
-    override readSystemKeychainToken() {
+    override async readSystemKeychainToken() {
       keychainReads++
       return null
     }
   }
   const svc = new IsoService(pool)
-  assert.equal(svc.getStoredToken(acc)?.accessToken, 'ya29.isolated_own')
+  assert.equal((await svc.getStoredToken(acc))?.accessToken, 'ya29.isolated_own')
   assert.equal(keychainReads, 0, 'isolated accounts must not touch the shared Keychain')
 })
 
@@ -422,13 +422,13 @@ test('UI_PATHS contains all expected clean SVG paths', async () => {
 test('readSystemKeychainToken dispatches per platform (GH #8 / GH #30)', async () => {
   const { readLinuxSecretToken, readMacKeychainToken, readWindowsCredentialToken } = await import('../src/host/quota.ts')
   // Both readers are hard platform gates - safe to call anywhere.
-  if (process.platform !== 'darwin') assert.equal(readMacKeychainToken(), null, 'mac reader no-ops off darwin')
-  if (process.platform !== 'linux') assert.equal(readLinuxSecretToken(), null, 'linux reader no-ops off linux')
-  if (process.platform !== 'win32') assert.equal(readWindowsCredentialToken(), null, 'windows reader no-ops off win32')
+  if (process.platform !== 'darwin') assert.equal(await readMacKeychainToken(), null, 'mac reader no-ops off darwin')
+  if (process.platform !== 'linux') assert.equal(await readLinuxSecretToken(), null, 'linux reader no-ops off linux')
+  if (process.platform !== 'win32') assert.equal(await readWindowsCredentialToken(), null, 'windows reader no-ops off win32')
   // A subclass mirroring the production dispatch resolves without throwing.
   // (Result is environment-dependent: a real keyring entry may exist.)
   class DispatchProbe extends QuotaService {
-    override readSystemKeychainToken() {
+    override async readSystemKeychainToken() {
       if (process.platform === 'linux') return readLinuxSecretToken()
       if (process.platform === 'darwin') return readMacKeychainToken()
       if (process.platform === 'win32') return readWindowsCredentialToken()
@@ -440,6 +440,6 @@ test('readSystemKeychainToken dispatches per platform (GH #8 / GH #30)', async (
   const primary = pool.createAccountSlot('primary')
   primary.systemHome = true
   const svc = new DispatchProbe(pool)
-  const tok = svc.getStoredToken(primary)
+  const tok = await svc.getStoredToken(primary)
   assert.ok(tok === null || typeof tok.accessToken === 'string', 'dispatch resolves without throwing')
 })

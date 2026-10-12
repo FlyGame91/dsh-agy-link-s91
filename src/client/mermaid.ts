@@ -39,16 +39,14 @@ div[data-agy-mermaid-svg][data-agy-mermaid-error] {
 	white-space: pre-wrap;
 	padding: 10px 12px;
 }
-/* Prevent Mermaid's internal error DOM or leaked temporary nodes from escaping into document.body */
-body > [id^="dagy-mmd"],
-body > [id^="iagy-mmd"],
-body > [id^="d_agy-mmd"],
-body > [id^="i_agy-mmd"],
-body > [id^="agy-mmd-"],
-body > div[id^="d"][class*="mermaid"],
-svg.error-icon,
-.error-icon,
-.error-text {
+/* Prevent Mermaid's internal error DOM or leaked temporary nodes from escaping into document.body.
+   The generic .error-icon/.error-text classes are scoped to OUR mounts and the
+   leaked-body id shapes only — unqualified, they hid host UI using the same
+   class names. */
+div[data-agy-mermaid-svg] .error-icon,
+div[data-agy-mermaid-svg] .error-text,
+body > [id^="dagy-mmd"] .error-icon,
+body > [id^="iagy-mmd"] .error-icon {
 	display: none !important;
 }
 `
@@ -65,10 +63,15 @@ declare global {
 	}
 }
 
+/**
+ * The bundle ships mermaid.min.js and serves it from the plugin route. There
+ * is deliberately NO public-CDN fallback: a floating-version, unsigned
+ * script executing inside the DSH web origin (with reach into every local
+ * HTTP API) is a supply-chain hazard that outweighs offline convenience.
+ * When the local asset is missing the source block simply stays visible.
+ */
 const CDN_URLS = [
 	'/plugins/agy-link/mermaid.min.js',
-	'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js',
-	'https://unpkg.com/mermaid@11/dist/mermaid.min.js',
 ]
 
 let loadPromise: Promise<MermaidApi | null> | null = null
@@ -90,9 +93,15 @@ function loadScript(src: string): Promise<boolean> {
 		const s = document.createElement('script')
 		s.src = src
 		s.async = true
+		let settled = false
 		const done = (ok: boolean): void => {
+			if (settled) return
+			settled = true
 			s.removeEventListener('load', onLoad)
 			s.removeEventListener('error', onError)
+			// A timed-out script tag used to stay in the DOM: a slow response
+			// would still execute later and race the fallback load.
+			if (!ok) s.remove()
 			resolve(ok)
 		}
 		const onLoad = (): void => done(true)
@@ -272,13 +281,24 @@ function scan(): void {
 	}
 }
 
-export function installMermaidRendering(): void {
-	if (typeof window === 'undefined' || typeof document === 'undefined') return
+let activeObserver: MutationObserver | null = null
+let domContentLoadedHandler: (() => void) | null = null
+
+/**
+ * Install the mermaid overlay. Returns a disposer that disconnects the
+ * MutationObserver and cancels pending setup — wrap it in ctx.effect so a
+ * plugin reload cannot stack observers over the same document.
+ */
+export function installMermaidRendering(): () => void {
+	if (typeof window === 'undefined' || typeof document === 'undefined') return () => {}
+	// A previous install (plugin reload) must not keep observing forever.
+	disposeMermaidRendering()
 	injectStyles()
 	cleanupTempElements()
 	const observer = new MutationObserver(() => {
 		scheduleScan()
 	})
+	activeObserver = observer
 	const setup = (): void => {
 		if (document.body) {
 			cleanupTempElements()
@@ -287,9 +307,27 @@ export function installMermaidRendering(): void {
 		}
 	}
 	if (document.readyState === 'loading') {
+		domContentLoadedHandler = setup
 		window.addEventListener('DOMContentLoaded', setup, { once: true })
 	} else {
 		setup()
+	}
+	return disposeMermaidRendering
+}
+
+/** Disconnect the observer and cancel pending setup work. */
+export function disposeMermaidRendering(): void {
+	if (activeObserver !== null) {
+		activeObserver.disconnect()
+		activeObserver = null
+	}
+	if (domContentLoadedHandler !== null) {
+		window.removeEventListener('DOMContentLoaded', domContentLoadedHandler)
+		domContentLoadedHandler = null
+	}
+	if (scanTimer !== null) {
+		clearTimeout(scanTimer)
+		scanTimer = null
 	}
 }
 

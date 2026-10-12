@@ -100,7 +100,7 @@ export function shouldPollAccount(account: ManagedAccount): boolean {
   if (!account.enabled) return false
   if (account.authRequired) return false
   const now = Date.now()
-  for (const cd of Object.values(account.cooldowns)) {
+  for (const cd of Object.values(account.cooldowns ?? {})) {
     if (cd && cd.cooldownUntil > now) return false
   }
   return true
@@ -129,7 +129,7 @@ export function needsAuthReverify(account: ManagedAccount, now = Date.now()): bo
 export function getAccountHealth(account: ManagedAccount, family: ModelFamily = 'google'): AccountHealthInfo {
   if (!account.enabled) return { status: 'disabled', message: 'Account disabled' }
   if (account.authRequired) return { status: 'auth_required', message: account.authError || 'Authentication required' }
-  const cd = account.cooldowns[family]
+  const cd = account.cooldowns?.[family]
   if (cd && cd.cooldownUntil > Date.now()) {
     return {
       status: 'cooldown',

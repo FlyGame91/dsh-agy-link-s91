@@ -69,9 +69,17 @@ function injectStyles(): void {
  * Try to expand a thinking row once when its body contains real prose
  * (not a bare [agy thinking turn · N tokens] chip). Uses the host's own
  * disclosure control when present — never mutates thinkBody children.
+ *
+ * A row the user manually COLLAPSED is recorded in a WeakSet keyed by the
+ * row element; React keeps the same element identity across its own
+ * re-renders, so the scanner stops re-expanding it (the old data attribute
+ * survived only until React rebuilt the node).
  */
+const userCollapsed = typeof WeakSet !== 'undefined' ? new WeakSet<HTMLElement>() : null
+
 function tryExpandThinkRow(root: HTMLElement): void {
 	if (root.dataset.agyExpanded === 'true') return
+	if (userCollapsed?.has(root) === true) return
 	const body = root.querySelector<HTMLElement>('[class*="thinkBody"]')
 	if (!body) return
 	const text = (body.textContent ?? '').trim()
@@ -89,10 +97,15 @@ function tryExpandThinkRow(root: HTMLElement): void {
 		root.querySelector<HTMLElement>('[class*="disclosure"]') ??
 		root.querySelector<HTMLElement>('button')
 	if (toggle) {
+		// Record collapse intent BEFORE clicking: the click itself mutates the
+		// DOM (feeding this observer again), and the "already expanded" probe
+		// above is read from a state the click has not settled yet.
+		userCollapsed?.add(root)
 		try {
 			toggle.click()
 			root.dataset.agyExpanded = 'true'
 		} catch {
+			userCollapsed?.delete(root)
 			// host control missing — leave collapsed
 		}
 	}
@@ -107,12 +120,33 @@ function scanThinkingRows(): void {
 	}
 }
 
-export function installAutoExpandReasoning(): void {
-	if (typeof window === 'undefined' || typeof document === 'undefined') return
+// Streaming conversations mutate the DOM at high frequency: coalesce
+// mutation bursts into one scan pass (mirrors the mermaid scanner's debounce).
+let scanTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleScan(): void {
+	if (scanTimer !== null) return
+	scanTimer = setTimeout(() => {
+		scanTimer = null
+		scanThinkingRows()
+	}, 200)
+}
+
+let activeObserver: MutationObserver | null = null
+let domContentLoadedHandler: (() => void) | null = null
+
+/**
+ * Install the auto-expand reasoning overlay. Returns a disposer that
+ * disconnects the MutationObserver — wrap it in ctx.effect so a plugin
+ * reload cannot stack observers.
+ */
+export function installAutoExpandReasoning(): () => void {
+	if (typeof window === 'undefined' || typeof document === 'undefined') return () => {}
+	disposeAutoExpandReasoning()
 	injectStyles()
 	const observer = new MutationObserver(() => {
-		scanThinkingRows()
+		scheduleScan()
 	})
+	activeObserver = observer
 	const setupObserver = () => {
 		if (document.body) {
 			observer.observe(document.body, { childList: true, subtree: true })
@@ -120,8 +154,26 @@ export function installAutoExpandReasoning(): void {
 		}
 	}
 	if (document.readyState === 'loading') {
+		domContentLoadedHandler = setupObserver
 		window.addEventListener('DOMContentLoaded', setupObserver, { once: true })
 	} else {
 		setupObserver()
+	}
+	return disposeAutoExpandReasoning
+}
+
+/** Disconnect the observer and cancel pending work. */
+export function disposeAutoExpandReasoning(): void {
+	if (activeObserver !== null) {
+		activeObserver.disconnect()
+		activeObserver = null
+	}
+	if (domContentLoadedHandler !== null) {
+		window.removeEventListener('DOMContentLoaded', domContentLoadedHandler)
+		domContentLoadedHandler = null
+	}
+	if (scanTimer !== null) {
+		clearTimeout(scanTimer)
+		scanTimer = null
 	}
 }

@@ -26,6 +26,15 @@ export interface PluginConfig {
   defaultEffort: string
   /** Watchdog for one full agy -p run. */
   timeoutMs: number
+  /**
+   * Idle budget while an agy tool step is still open (ACTIVE without
+   * DONE/ERROR). A long build/compile is legitimately silent on stdout, so
+   * the watchdog gets this larger budget instead of `timeoutMs`. Default 240
+   * minutes (the print-mode ceiling). Set 0 to disable the raise: a tool step
+   * that never completes then dies after `timeoutMs` and fails the turn
+   * loudly instead of holding the session for hours.
+   */
+  longToolIdleMinutes: number
   maxConcurrent: number
   contextWindowDefault: number
   maxTokensDefault: number
@@ -108,6 +117,7 @@ export function defaultConfig(): PluginConfig {
     defaultModel: '',
     defaultEffort: '',
     timeoutMs: 600_000,
+    longToolIdleMinutes: 240,
     maxConcurrent: 3,
     contextWindowDefault: 1_048_576,
     maxTokensDefault: 65_536,
@@ -147,9 +157,21 @@ export function isAuthoritativeAuthError(message: string): boolean {
   return /invalid_grant|invalid_client|revoked|disabled|unauthorized_client/i.test(message)
 }
 
-/** Transient transport failures — never proof that a login is dead. */
+/**
+ * Transient transport failures — never proof that a login is dead.
+ *
+ * Deliberately broader than the classic dial/DNS set: agy reports "not signed
+ * in" whenever it cannot VALIDATE the stored token, so a flaky proxy produces
+ * `Post https://oauth2.googleapis.com/token: EOF`, `TLS handshake timeout` or
+ * `token validation failed due to network error (token may still be valid)`
+ * next to an auth-shaped banner. Treating that as a sign-out ends the turn on
+ * a HEALTHY account and DSH renders the AUTH code as "API key is invalid"
+ * (observed live: 2026-10-10 14:17, session-c65a826e turn 22).
+ */
 export function looksLikeNetworkError(message: string): boolean {
-  return /dial tcp|fetch failed|econn(?:refused|reset|aborted)|enotfound|ehostunreach|enetunreach|socket hang up|getaddrinfo|bad gateway|service unavailable/i.test(message)
+  return /dial tcp|fetch failed|econn(?:refused|reset|aborted)|enotfound|ehostunreach|enetunreach|socket hang up|getaddrinfo|bad gateway|service unavailable|unexpected eof|\beof\b|tls handshake timeout|i\/o timeout|network (?:error|is unreachable)|no route to host|connection reset|context deadline exceeded|temporary failure in name resolution|proxyconnect|token validation failed|validate (?:the )?token|silent auth failed/i.test(
+    message,
+  )
 }
 
 /**
@@ -186,6 +208,21 @@ export const Err = {
   TIMEOUT: 'TIMEOUT',
   PROCESS_EXIT: 'PROCESS_EXIT',
   INVALID_OUTPUT: 'INVALID_OUTPUT',
+  /**
+   * Transport failure wrapped around an auth-looking refusal. agy cannot tell
+   * "the token is gone" from "I could not validate the token because the
+   * network died", and it reports both as "not logged into Antigravity".
+   * Kept separate from AUTH so the turn is retried on ANOTHER account instead
+   * of ending on a healthy one (and so no account is flagged for re-login).
+   */
+  NETWORK: 'NETWORK',
+  /**
+   * Soft Google-side capacity refusal ("model overloaded" / "experiencing high
+   * traffic"). Account-scoped for retry purposes — the sticky pointer moves to
+   * the next account — but it is NEVER a cooldown reason: nothing was spent, so
+   * a 15-minute penalty would only shrink the pool.
+   */
+  OVERLOADED: 'OVERLOADED',
   UNKNOWN_MODEL: 'UNKNOWN_MODEL',
   UNSUPPORTED_REASONING_EFFORT: 'UNSUPPORTED_REASONING_EFFORT',
   AUX_DISABLED: 'AUX_DISABLED',
@@ -288,19 +325,34 @@ export function extractAuthUrl(text: string): string | undefined {
  */
 export function looksLikeHardRateLimit(text?: string): boolean {
   if (!text) return false
-  return /RESOURCE_EXHAUSTED|code[ :]?429\b|status[ :]?429\b|HTTP[ :]?429\b|too many requests|individual quota reached|quota (?:exceeded|reached|exhausted)|rate[ -]?limit(?:ed)? (?:exceeded|reached|hit)|exceeded (?:your |the )?quota/i.test(
+  return /RESOURCE_EXHAUSTED|code[ :]?429\b|status[ :]?429\b|HTTP[ :]?429\b|too many requests|individual quota reached|quota (?:exceeded|reached|exhausted)|rate[ -]?limit(?:ed)? (?:exceeded|reached|hit)|exceeded (?:your |the )?quota|has been exhausted|exhausted your quota|out of quota|check quota|insufficient quota/i.test(
     text,
   )
 }
 
 /**
+ * Failures that belong to the ACCOUNT (spent quota, refused region, broken
+ * transport, capacity refusal, signed-out login) rather than to the request.
+ * The retry policy retries these and the adapter rotates the sticky pointer,
+ * so the retry is served by a different account instead of interrupting the
+ * user's turn. Deterministic request-level failures (AGY_ERROR, a bare
+ * PROCESS_EXIT from a crash) are deliberately excluded: re-running those
+ * merely repeats the same work on another account.
+ */
+export function isAccountScopedFailure(code: string | undefined): boolean {
+  return code === 'RATE_LIMIT' || code === 'ELIGIBILITY' || code === 'NETWORK' || code === 'OVERLOADED' || code === 'AUTH'
+}
+
+/**
  * Soft heuristic adds capacity signals (model overloaded / high traffic).
  * Shapes the user-facing error message only — NEVER cools an account down.
+ * The adapter still ROTATES on these: nothing was spent locally, and ending a
+ * turn while an idle account could serve it is the interruption users report.
  */
 export function looksLikeRateLimit(text?: string): boolean {
   if (!text) return false
   return (
-    looksLikeHardRateLimit(text) || /model overloaded|experiencing high traffic/i.test(text)
+    looksLikeHardRateLimit(text) || /model overloaded|experiencing high traffic|is overloaded|capacity (?:exhausted|unavailable)|temporarily overloaded/i.test(text)
   )
 }
 

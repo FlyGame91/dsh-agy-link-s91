@@ -110,23 +110,52 @@ export function toolStepBrief(toolName: string, args: unknown): string {
     return ''
   }
   if (toolName === 'run_command' || toolName === 'execute_command') {
-    const cmd = pickStr('Command', 'command', 'Cmd', 'cmd')
+    const cmd = pickStr('CommandLine', 'command_line', 'Command', 'command', 'Cmd', 'cmd')
     return cmd !== '' ? '$ ' + cmd.slice(0, 80) : 'run command'
   }
   if (toolName === 'view_file' || toolName === 'read_file') {
-    return 'read ' + (pickStr('Path', 'path', 'TargetFile', 'File') || 'file')
+    return 'read ' + (pickStr('AbsolutePath', 'absolute_path', 'Path', 'path', 'TargetFile', 'File') || 'file')
   }
   if (toolName === 'write_to_file' || toolName === 'create_file') {
-    return 'write ' + (pickStr('Path', 'path', 'TargetFile', 'File') || 'file')
+    return 'write ' + (pickStr('TargetFile', 'target_file', 'Path', 'path', 'AbsolutePath', 'File') || 'file')
   }
   if (toolName === 'replace_file_content' || toolName === 'edit_file') {
-    return 'edit ' + (pickStr('Path', 'path', 'TargetFile', 'File') || 'file')
+    return 'edit ' + (pickStr('TargetFile', 'target_file', 'Path', 'path', 'AbsolutePath', 'File') || 'file')
   }
   if (toolName === 'grep_search' || toolName === 'search') {
     return 'search ' + (pickStr('Query', 'query', 'SearchPattern') || '')
   }
+  if (toolName === 'search_web' || toolName === 'web_search') {
+    return 'search web ' + (pickStr('query', 'Query', 'search_query', 'q') || '')
+  }
+  if (toolName === 'read_url_content' || toolName === 'web_fetch' || toolName === 'fetch_web_page') {
+    return 'fetch ' + (pickStr('Url', 'url', 'target_url', 'targetUrl') || 'url')
+  }
   if (toolName === 'list_dir' || toolName === 'list_directory') {
-    return 'ls ' + (pickStr('Path', 'path', 'DirectoryPath') || '.')
+    return 'ls ' + (pickStr('DirectoryPath', 'directory_path', 'Path', 'path', 'AbsolutePath') || '.')
+  }
+  if (toolName === 'manage_task') {
+    const action = pickStr('Action', 'action') || 'manage'
+    const id = pickStr('TaskId', 'taskId', 'task_id')
+    return id !== '' ? 'task ' + action + ' ' + id : 'task ' + action
+  }
+  if (toolName === 'schedule') {
+    const prompt = pickStr('Prompt', 'prompt')
+    const cron = pickStr('CronExpression', 'cron_expression')
+    const dur = pickStr('DurationSeconds', 'duration_seconds')
+    const timing = cron ? 'cron ' + cron : dur ? dur + 's' : ''
+    return timing ? 'schedule ' + timing : (prompt ? 'schedule ' + prompt.slice(0, 40) : 'schedule')
+  }
+  if (toolName === 'invoke_subagent') {
+    const subs = a.Subagents ?? a.subagents
+    const firstRole = Array.isArray(subs) && subs.length > 0 && typeof (subs[0] as { Role?: unknown }).Role === 'string'
+      ? (subs[0] as { Role: string }).Role
+      : ''
+    return firstRole ? 'subagent: ' + firstRole : 'invoke subagent'
+  }
+  if (toolName === 'send_message') {
+    const recipient = pickStr('Recipient', 'recipient', 'to')
+    return recipient ? 'msg ' + recipient : 'send message'
   }
   return toolName
 }
@@ -170,6 +199,7 @@ function pick(input: Record<string, unknown>, ...keys: string[]): string | undef
   for (const k of keys) {
     const v = input[k]
     if (typeof v === 'string') return v
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v)
   }
   return undefined
 }
@@ -384,10 +414,54 @@ export function presentMirrorCall(args: unknown): ToolCallView | undefined {
       const title = firstQ ? `Ask Question: ${firstQ}` : 'Ask Question'
       return { card: 'generic', title, rawInput: input }
     }
-    case 'read_url_content': {
-      const url = pick(input, 'Url', 'url') ?? ''
+    case 'search_web':
+    case 'web_search': {
+      const q = pick(input, 'query', 'Query', 'search_query', 'q') ?? ''
       const desc = pick(input, 'Description', 'description', 'toolAction', 'toolSummary')
-      return { card: 'generic', title: desc ?? (url ? `Fetch ${url}` : 'Fetch URL'), kind: 'fetch' }
+      const title = desc ?? (q !== '' ? 'Web search ' + q : 'Web search')
+      const view: GenericCallView = { card: 'generic', title, kind: 'search', rawInput: input }
+      return view
+    }
+    case 'read_url_content':
+    case 'web_fetch':
+    case 'fetch_web_page':
+    case 'fetch_url': {
+      const url = pick(input, 'Url', 'url', 'target_url', 'targetUrl') ?? ''
+      const desc = pick(input, 'Description', 'description', 'toolAction', 'toolSummary')
+      return { card: 'generic', title: desc ?? (url ? `Fetch ${url}` : 'Fetch URL'), kind: 'fetch', rawInput: input }
+    }
+    case 'manage_task': {
+      const action = pick(input, 'Action', 'action') ?? 'manage'
+      const taskId = pick(input, 'TaskId', 'taskId', 'task_id')
+      const desc = pick(input, 'Description', 'description', 'toolAction', 'toolSummary')
+      const title = desc ?? (taskId ? `Task ${action} (${taskId})` : `Task ${action}`)
+      return { card: 'generic', title, kind: 'execute', rawInput: input }
+    }
+    case 'schedule': {
+      const prompt = pick(input, 'Prompt', 'prompt')
+      const cron = pick(input, 'CronExpression', 'cron_expression')
+      const duration = pick(input, 'DurationSeconds', 'duration_seconds')
+      const desc = pick(input, 'Description', 'description', 'toolAction', 'toolSummary')
+      const timing = cron ? `cron ${cron}` : duration ? `${duration}s timer` : ''
+      const title = desc ?? (timing ? `Schedule ${timing}` : (prompt ? `Schedule: ${prompt}` : 'Schedule'))
+      return { card: 'generic', title, kind: 'other', rawInput: input }
+    }
+    case 'invoke_subagent': {
+      const subs = input.Subagents ?? input.subagents
+      const firstRole = Array.isArray(subs) && subs.length > 0 && typeof (subs[0] as { Role?: unknown; role?: unknown }).Role === 'string'
+        ? ((subs[0] as { Role: string }).Role)
+        : Array.isArray(subs) && subs.length > 0 && typeof (subs[0] as { TypeName?: unknown; typeName?: unknown }).TypeName === 'string'
+          ? ((subs[0] as { TypeName: string }).TypeName)
+          : undefined
+      const desc = pick(input, 'Description', 'description', 'toolAction', 'toolSummary')
+      const title = desc ?? (firstRole ? `Subagent: ${firstRole}` : 'Invoke subagent')
+      return { card: 'generic', title, kind: 'execute', rawInput: input }
+    }
+    case 'send_message': {
+      const recipient = pick(input, 'Recipient', 'recipient', 'to')
+      const desc = pick(input, 'Description', 'description', 'toolAction', 'toolSummary')
+      const title = desc ?? (recipient ? `Message subagent ${recipient}` : 'Send message')
+      return { card: 'generic', title, kind: 'other', rawInput: input }
     }
     case 'generate_image': {
       const prompt = pick(input, 'Prompt', 'prompt', 'ImageName', 'image_name') ?? ''
@@ -410,7 +484,14 @@ export function presentMirrorResult(args: unknown, result: { content: unknown[];
     case 'run_command':
     case 'bash':
     case 'execute_command': {
-      const view: TerminalResultView = { card: 'terminal', output: text }
+      let exitCode: number | undefined
+      const m = /The command exited with code (\d+)/i.exec(text)
+      if (m && m[1]) {
+        exitCode = parseInt(m[1], 10)
+      } else if (result.isError) {
+        exitCode = 1
+      }
+      const view: TerminalResultView = { card: 'terminal', output: text, ...(exitCode !== undefined ? { exitCode } : {}) }
       return view
     }
     case 'replace_file_content':
@@ -443,6 +524,35 @@ function resultText(content: unknown): string {
 
 function clip(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + '… (+' + (s.length - max) + ' chars)' : s
+}
+
+/** Short preview of the recorded step for the degraded-result message. */
+function stepLabel(toolName: string, input: unknown): string {
+  if (toolName === '') return ''
+  return toolStepBrief(toolName, input)
+}
+
+/**
+ * Degraded result for a mirrored step whose recording is gone (bridge
+ * restarted, or the run was recycled while a wedged tool step held the span
+ * for hours). It must NOT read like a harness error: the model used to
+ * receive `no recorded agy run` and spent the whole turn reverse-engineering
+ * this plugin instead of finishing the user's task (flash-blast incident,
+ * 2026-10-10). The step really did run — only its replay is unavailable.
+ */
+export function recordingUnavailable(step: number, toolName: string, input?: unknown, reason?: string): string {
+  const label = stepLabel(toolName, input)
+  const why = reason !== undefined && reason !== ''
+    ? reason
+    : 'the step ran for a long time and the in-memory recording was recycled'
+  return (
+    '⚠ [agy bridge] This agy tool step executed, but its recorded output is no longer resident ' +
+    'in the bridge (' + why + '). ' +
+    'Nothing is wrong with the tool or the workspace, and there is nothing to debug here — ' +
+    'do NOT investigate the bridge, its logs or this message; continue the user\'s task. ' +
+    'If the output is needed, re-run the same operation as a new step. ' +
+    'Step #' + step + (label !== '' ? ': ' + label : '')
+  )
 }
 
 export function defineAgyMirrorTool(deps: { runs: RunRegistry }) {
@@ -482,14 +592,28 @@ export function defineAgyMirrorTool(deps: { runs: RunRegistry }) {
       void exec.signal
       const runId = typeof args.run === 'string' ? args.run : ''
       const step = typeof args.step === 'number' ? args.step : -1
-      const toolName = typeof args.tool === 'string' ? args.tool : 'unknown'
+      const toolName = typeof args.tool === 'string' ? args.tool : ''
+      const input = toolInput(args as { input?: unknown })
       const rec = deps.runs.get(runId)
       if (rec === undefined) {
-        throw new Error('agy_tool: no recorded agy run "' + runId + '" — this tool only replays bridge-recorded activity')
+        // The recording was recycled (or the bridge restarted) while this
+        // step's replay was still queued. Degrade to an explicit, task-facing
+        // notice instead of throwing a harness-internal error at the model.
+        return recordingUnavailable(step, toolName, input)
       }
       const t = rec.toolEventAt(step)
       if (t === null) {
-        throw new Error('agy_tool: event ' + step + ' of run ' + runId + ' is not a completed tool step')
+        // Distinguish WHY the step cannot be replayed: an out-of-range or
+        // non-tool event index is a cursor problem (the step may not even have
+        // happened yet), not "the output was recycled" — blaming recycling
+        // there would send the model hunting for lost output that never was
+        // recorded. `rec.length` bounds the recording; toolEventAt only
+        // resolves completed tool steps.
+        const ev = step >= 0 && step < rec.length ? rec.eventAt(step) : undefined
+        const reason = ev === undefined
+          ? 'the step index is outside this recording — the step has not been recorded (yet), or the bridge restarted'
+          : 'event #' + step + ' in this recording is not a completed tool step'
+        return recordingUnavailable(step, toolName !== '' ? toolName : 'unknown', input, reason)
       }
       if (t.error !== undefined) {
         throw new Error('agy tool ' + t.name + ' failed: ' + t.error)

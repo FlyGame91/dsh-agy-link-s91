@@ -96,7 +96,17 @@ export class EventMapper {
   private openAcc = ''
   private readonly emittedByKey = new Map<string, string>()
   private readonly announcedTools = new Set<string>()
+  private readonly pendingAnnounced = new Set<string>()
   private readonly thinkingAnnounced = new Set<string>()
+  /**
+   * Steps whose banner already streamed WITHOUT prose (issue #43: desktop
+   * hosts with no sqlite reader). Separate from `thinkingAnnounced` on
+   * purpose: DB prose can resolve AFTER the banner streamed, and marking the
+   * step announced there would drop the real text (the exact regression
+   * issue #43 fixed). When prose arrives later it is appended WITHOUT the
+   * banner and the entry is consumed.
+   */
+  private readonly bannerOnlyShown = new Set<string>()
   private bannerOnlyThinkingEmitted = false
   private sawTextStep: boolean
   private finished = false
@@ -145,20 +155,34 @@ export class EventMapper {
    * banner. When real thought prose is present, place the banner and thought
    * text on the same initial line so DSH's collapsed summary renders:
    *   [agy thinking turn · *** thinking tokens] [Chain-of-Thought body]
+   *
+   * With `allowBannerOnly` the bare banner is emitted when the DB prose never
+   * arrived (desktop hosts without any sqlite reader, issue #43): the user
+   * then at least SEES that a thinking turn happened and how large it was —
+   * previously high-effort turns rendered nothing at all.
    */
-  private *emitThinking(absIndex: number, thoughtTokens: number): Generator<StreamChunk> {
+  private *emitThinking(stepKey: string, absIndex: number, thoughtTokens: number, allowBannerOnly = false): Generator<StreamChunk> {
     const text = this.opts.resolvedThoughts?.get(absIndex)
     const hasText = text !== undefined && text.trim() !== ''
-    // Only surface a reasoning row when we actually have thought/intent prose.
-    // Banner-only token chips clutter tool-heavy turns and teach nothing.
-    if (!hasText) return
+    if (!hasText && !allowBannerOnly) return
+
+    // A banner-only chip already streamed for this step: continue with the
+    // prose alone instead of printing the banner twice.
+    const bannerAlreadyShown = this.bannerOnlyShown.has(stepKey)
+    // Consume the flag only when prose is present — the banner-only emission
+    // itself must keep it set for the later prose append.
+    if (hasText) this.bannerOnlyShown.delete(stepKey)
 
     yield* this.ensureBlock('reasoning')
     const banner =
       thoughtTokens > 0
         ? '[agy thinking turn · ' + thoughtTokens + ' thinking tokens]'
         : '[agy thinking turn]'
-    const combined = `${banner} ${text!.trim()}\n`
+    const combined = !hasText
+      ? `${banner}\n`
+      : bannerAlreadyShown
+        ? `${text!.trim()}\n`
+        : `${banner} ${text!.trim()}\n`
     const d = this.appendDelta(combined)
     if (d) yield d
   }
@@ -185,7 +209,7 @@ export class EventMapper {
         // mark thinkingAnnounced when DB thoughts have not arrived yet (issue #43).
         if (hasRealThought && !stepTextEmitted && !this.thinkingAnnounced.has(ev.stepKey)) {
           this.thinkingAnnounced.add(ev.stepKey)
-          yield* this.emitThinking(absIndex, thoughtTokens)
+          yield* this.emitThinking(ev.stepKey, absIndex, thoughtTokens)
         }
         const deferred = hasRealThought && stepTextEmitted && !this.thinkingAnnounced.has(ev.stepKey)
         if (ev.text === '' && !ev.fragment) {
@@ -193,9 +217,21 @@ export class EventMapper {
           // complete — flush the deferred annotation now.
           if (deferred) {
             this.thinkingAnnounced.add(ev.stepKey)
-            yield* this.emitThinking(absIndex, thoughtTokens)
+            yield* this.emitThinking(ev.stepKey, absIndex, thoughtTokens)
+          } else if (!this.sawTextStep && thoughtTokens > 0 && !this.thinkingAnnounced.has(ev.stepKey)) {
+            // Thinking-only turn with no DB prose available (issue #43):
+            // surface the banner so high-effort turns are not invisible.
+            this.bannerOnlyShown.add(ev.stepKey)
+            yield* this.emitThinking(ev.stepKey, absIndex, thoughtTokens, true)
           }
           return
+        }
+        // First visible text of the run with no DB prose: emit the banner-only
+        // chip before the answer so thinking stays visible (issue #43). Gated
+        // on `!sawTextStep` so later tool-heavy steps are not cluttered.
+        if (!hasRealThought && !this.sawTextStep && thoughtTokens > 0 && !this.thinkingAnnounced.has(ev.stepKey)) {
+          this.bannerOnlyShown.add(ev.stepKey)
+          yield* this.emitThinking(ev.stepKey, absIndex, thoughtTokens, true)
         }
         this.sawTextStep = true
         yield* this.ensureBlock('text')
@@ -217,7 +253,7 @@ export class EventMapper {
           // This DONE closed the step's text: the chip lands after the
           // complete sentence, never between two of its fragments.
           this.thinkingAnnounced.add(ev.stepKey)
-          yield* this.emitThinking(absIndex, thoughtTokens)
+          yield* this.emitThinking(ev.stepKey, absIndex, thoughtTokens)
         }
         return
       }
@@ -239,7 +275,16 @@ export class EventMapper {
             if (d) yield d
           }
         } else {
-          const d = this.appendDelta('[agy subagent] ' + ev.text + '\n')
+          // agy re-delivers subagent progress as cumulative snapshots of the
+          // same step; emitting the banner + full text on every update used to
+          // duplicate the whole transcript. Track the step's accumulated text
+          // and emit only the grown suffix (same contract as the thinking
+          // branch), with the banner on the first emission only.
+          const prev = this.emittedByKey.get(ev.stepKey) ?? ''
+          const deltaText = suffixDelta(prev, ev.text)
+          this.emittedByKey.set(ev.stepKey, ev.text)
+          const banner = prev === '' ? '[agy subagent] ' : ''
+          const d = this.appendDelta(banner + deltaText)
           if (d) yield d
         }
         return
@@ -257,7 +302,27 @@ export class EventMapper {
           ev.state === 'DONE' ||
           ev.state === 'ERROR' ||
           (ev.state === undefined && (ev.tool.output !== undefined || ev.tool.error !== undefined))
-        if (!isCompleted) return
+        if (!isCompleted) {
+          // Live progress for long-running agy tools: while a step is ACTIVE
+          // (a maven build can hold the turn for many minutes) nothing else
+          // streams, so the turn looked frozen. Emit the pending note once per
+          // step into the reasoning block; the completed step still cuts the
+          // span with the real tool card below.
+          if (
+            this.opts.cutOnTool &&
+            !this.finished &&
+            ev.state === 'ACTIVE' &&
+            !this.pendingAnnounced.has(ev.stepKey)
+          ) {
+            this.pendingAnnounced.add(ev.stepKey)
+            yield* this.ensureBlock('reasoning')
+            const d = this.appendDelta(
+              '[agy tool running: ' + ev.tool.name + ' — the result card streams when it finishes]\n',
+            )
+            if (d) yield d
+          }
+          return
+        }
         if (this.announcedTools.has(ev.stepKey)) return
         this.announcedTools.add(ev.stepKey)
         if (!this.opts.cutOnTool) return // auxiliary calls show no tool detail
@@ -298,7 +363,17 @@ export class EventMapper {
           },
         }
         this.blockIdx++
-        yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }
+        // Forward the last per-call context sample instead of a hard 0/0: DSH's
+        // token meter treats the last reported sample as current context
+        // occupancy, so a zero here reset the meter on every tool hop of an
+        // agentic turn (the same bug emitFailure already fixed for failures).
+        const trackedCut = this.opts.usage?.finalUsage({})
+        yield {
+          type: 'usage',
+          usage: trackedCut !== undefined && Object.keys(trackedCut).length > 0
+            ? usageFromRaw(trackedCut)
+            : { inputTokens: 0, outputTokens: 0 },
+        }
         yield { type: 'finish', reason: { kind: 'tool-calls' } }
         this.finished = true
         return
@@ -352,12 +427,25 @@ export class EventMapper {
     this.finished = true
   }
 
-  /** Terminal error/abort: close what is open, zero usage, failure finish. */
+  /**
+   * Terminal error/abort: close what is open and finish with the failure.
+   *
+   * The usage sample is the last per-call context size when agy reported one,
+   * NOT a hard-coded 0/0: DSH's token meter treats the last sample as current
+   * context occupancy, so a failed turn used to reset the meter and could fire
+   * a bogus compaction a step later.
+   */
   *emitFailure(kind: 'error' | 'aborted', code: string, message: string): Generator<StreamChunk> {
     if (this.finished) return
     const close = this.closeOpen()
     if (close) yield close
-    yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }
+    const tracked = this.opts.usage?.finalUsage({})
+    yield {
+      type: 'usage',
+      usage: tracked !== undefined && Object.keys(tracked).length > 0
+        ? usageFromRaw(tracked)
+        : { inputTokens: 0, outputTokens: 0 },
+    }
     yield {
       type: 'finish',
       reason:

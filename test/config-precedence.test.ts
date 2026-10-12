@@ -16,6 +16,14 @@ test('runtime configurable fields override entries; entries supply missing field
   assert.equal(cfg.askTool, false)
 })
 
+test('longToolIdleMinutes is configurable, accepts 0 (disable) and reads the env override', () => {
+  assert.equal(resolveConfig({}, {}, {}).longToolIdleMinutes, 240)
+  assert.equal(resolveConfig({ longToolIdleMinutes: 30 }, {}, {}).longToolIdleMinutes, 30)
+  assert.equal(resolveConfig({}, {}, { longToolIdleMinutes: 0 }).longToolIdleMinutes, 0)
+  assert.equal(resolveConfig({}, { DSH_AGY_LONG_TOOL_IDLE_MINUTES: '45' }, {}).longToolIdleMinutes, 45)
+  assert.equal(resolveConfig({}, { DSH_AGY_LONG_TOOL_IDLE_MINUTES: '0' }, {}).longToolIdleMinutes, 0)
+})
+
 test('hiddenModels accepts string arrays, drops junk, and env wins as a comma list', () => {
   // Overrides layer: array of ids; blank, duplicate and non-string entries are dropped.
   const fromOverrides = resolveConfig({}, {}, { hiddenModels: ['gemini-3.7-flash', '  ', 'gemini-3.7-flash', 42, 'claude-sonnet-4-6'] })

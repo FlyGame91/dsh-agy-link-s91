@@ -8,7 +8,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { AgyAdapter, buildDigest, collectUnsentImageRefs, detectContinuation, mergeSentImageIds, type AgyAdapterDeps } from '../src/host/adapter.ts'
+import { AgyAdapter, buildDigest, collectUnsentImageRefs, detectContinuation, isRealUserMessage, isSyntheticHarnessMessage, latestUserTaskText, mergeSentImageIds, type AgyAdapterDeps } from '../src/host/adapter.ts'
 import { ModelCatalog } from '../src/host/models.ts'
 import { AccountPoolManager } from '../src/host/pool.ts'
 import { SessionStore } from '../src/host/sessions.ts'
@@ -22,7 +22,7 @@ const fakeBin = join(import.meta.dirname, 'fake-agy.mjs')
 const workDir = mkdtempSync(join(tmpdir(), 'agy-adapter-'))
 process.env.DSH_AGY_CONVERSATIONS_DIR = join(workDir, 'convs')
 
-function msg(role: 'user' | 'assistant', text: string): Message {
+function msg(role: 'user' | 'assistant' | 'system', text: string): Message {
   return { role, content: [{ type: 'text', text }] } as unknown as Message
 }
 
@@ -190,6 +190,43 @@ test('ok run mirrors tools natively, streams text, and persists the binding', as
   assert.equal(b.lastMessageCount, 1)
 })
 
+test('registry pressure during a long span never breaks the pending mirror replay', async () => {
+  // Regression for the flash-blast incident (2026-10-10): a wedged tool step
+  // held a span for hours while other DSH sessions kept creating runs; the
+  // global FIFO registry evicted the run and the mirror call the span had
+  // already queued failed with "no recorded agy run".
+  const { adapter, runs } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'real'
+  process.env.FAKE_AGY_DELAY_MS = '700'
+  try {
+    const pending = collect(adapter.stream(opts([msg('user', 'count the files')], { sessionId: 'sess-pressure' as never })))
+    // The span owns the run and has pinned it; agy has not emitted anything yet.
+    await waitFor(() => (runs.pinnedCount > 0 ? true : undefined))
+    assert.equal(runs.size, 1)
+    const runId = runs.runIds[0] as string
+    for (let i = 0; i < 12; i++) {
+      const other = runs.create()
+      other.settle(null)
+    }
+    assert.notEqual(runs.get(runId), undefined, 'pinned run survives registry pressure')
+    const chunks = await pending
+    const end = chunks.find(
+      (c) => c.type === 'block-end' && (c as { block?: { type?: string } }).block?.type === 'tool-call',
+    ) as unknown as { block: { name: string; arguments: string } } | undefined
+    assert.ok(end !== undefined, 'span cut on a tool-call')
+    const parsed = JSON.parse(end.block.arguments) as { run: string; step: number; tool: string }
+    assert.equal(parsed.run, runId)
+    assert.notEqual(runs.get(runId), undefined, 'recording re-registered before the mirror dispatch')
+    const replayed = await defineAgyMirrorTool({ runs }).execute(
+      { run: parsed.run, step: parsed.step, tool: parsed.tool } as never,
+      { signal: new AbortController().signal } as never,
+    )
+    assert.equal(replayed, 'note1.txt\nnote2.txt\n')
+  } finally {
+    delete process.env.FAKE_AGY_DELAY_MS
+  }
+})
+
 test('detectContinuation permits only trailing plugin snapshots after our mirror result', () => {
   const toolResult = (callId: string): Message =>
     ({ role: 'user', content: [{ type: 'tool-result', toolCallId: callId, content: [] }], source: { kind: 'tool', callId } }) as never
@@ -321,6 +358,97 @@ test('unbound follow-up turn gets a history digest prefix', async () => {
   assert.ok(prompt.includes('follow up'))
 })
 
+test('a bound conversation does not re-send tool output it already owns', async () => {
+  const { adapter, store } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'ok'
+  const argsFile = join(workDir, 'args-redundancy.json')
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  await runTurn(adapter, [msg('user', 'one')], { sessionId: 'sess-redundant' as never })
+  await waitFor(() => store.get('sess-redundant'))
+  // DSH hands back our mirrored tool result followed by the user's new
+  // question — the shape that used to pipe kilobytes of stale tool output INTO
+  // the prompt, ahead of the actual question.
+  const bigToolOutput = 'GODOT-SIM-DUMP ' + 'x'.repeat(6000)
+  const toolMsg = {
+    role: 'user',
+    source: { kind: 'tool', callId: 'agytc-old-3' },
+    content: [{ type: 'tool-result', toolCallId: 'agytc-old-3', content: [{ type: 'text', text: bigToolOutput }] }],
+  } as unknown as Message
+  await runTurn(adapter, [msg('assistant', 'one'), toolMsg, msg('user', 'what changed?')], { sessionId: 'sess-redundant' as never })
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const prompt = argv[argv.indexOf('-p') + 1] ?? ''
+  assert.ok(prompt.includes('what changed?'), prompt.slice(0, 200))
+  assert.ok(!prompt.includes('GODOT-SIM-DUMP'), 'tool output the live conversation already owns must not be re-sent')
+  assert.ok(prompt.length < 500, `prompt should stay small, got ${prompt.length}`)
+})
+
+test('an image-only follow-up never re-sends an older question as the task', async () => {
+  const readImage = async (): Promise<Uint8Array> => new Uint8Array([1, 2, 3, 4])
+  const { adapter, store } = makeAdapter({}, { readImage })
+  process.env.FAKE_AGY_MODE = 'ok'
+  const argsFile = join(workDir, 'args-imgonly.json')
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  await runTurn(adapter, [msg('user', 'FIRST-QUESTION')], { sessionId: 'sess-imgonly' as never })
+  await waitFor(() => store.get('sess-imgonly'))
+  const imgOnly = {
+    role: 'user',
+    content: [
+      { type: 'text', text: '' },
+      { type: 'image', attachment: { attachmentId: 'img-only-1', mediaType: 'image/png', byteLength: 4 } },
+    ],
+  } as unknown as Message
+  await collect(adapter.stream(opts([msg('user', 'FIRST-QUESTION'), msg('assistant', 'partial'), imgOnly], { sessionId: 'sess-imgonly' as never })))
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const prompt = argv[argv.indexOf('-p') + 1] ?? ''
+  // The newest message carries no text: falling back to the PREVIOUS question
+  // made agy answer the wrong message outright (S2).
+  assert.ok(!prompt.includes('FIRST-QUESTION'), `stale task leaked into the prompt: ${prompt.slice(0, 200)}`)
+  assert.ok(prompt.includes('view_file'), 'the attached image must still be pointed at')
+})
+
+test('a Stop mid-flight marks the binding interrupted and the next prompt carries the boundary', async () => {
+  const prevMode = process.env.FAKE_AGY_MODE
+  const prevDelay = process.env.FAKE_AGY_DELAY_MS
+  process.env.FAKE_AGY_MODE = 'slow-init'
+  process.env.FAKE_AGY_DELAY_MS = '5000'
+  const { adapter, store } = makeAdapter()
+  const ctrl = new AbortController()
+  const iter = adapter.stream(opts([msg('user', 'FIRST-QUESTION')], { sessionId: 'sess-abort' as never, signal: ctrl.signal }))[Symbol.asyncIterator]()
+  try {
+    const first = await iter.next()
+    assert.equal(first.done, false, 'the run must stream something before the abort')
+    ctrl.abort()
+  } finally {
+    try { while (!(await iter.next()).done) { /* drain the aborted stream */ } } catch { /* aborted streams may reject */ }
+  }
+  const binding = await waitFor(() => store.get('sess-abort'))
+  assert.equal(binding.interrupted, true, 'an interrupted turn must be flagged so the next prompt can say so')
+
+  // Next turn: the boundary must precede the newest request, otherwise agy's
+  // conversation still ends with the unanswered interrupted turn and the model
+  // answers THAT (the "latest message ignored" bug, session-c65a826e 17→19).
+  const argsFile = join(workDir, 'args-interrupted.json')
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  process.env.FAKE_AGY_MODE = 'ok'
+  process.env.FAKE_AGY_DELAY_MS = '0'
+  await runTurn(
+    adapter,
+    [msg('user', 'FIRST-QUESTION'), msg('assistant', 'partial answer'), msg('user', 'NEW-QUESTION')],
+    { sessionId: 'sess-abort' as never },
+  )
+  await waitFor(() => store.get('sess-abort'))
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const prompt = argv[argv.indexOf('-p') + 1] ?? ''
+  assert.ok(prompt.startsWith('[the previous turn was interrupted'), prompt.slice(0, 160))
+  assert.ok(prompt.includes('NEW-QUESTION'))
+  await waitFor(() => (store.get('sess-abort')?.interrupted === undefined ? true : undefined))
+  assert.equal(store.get('sess-abort')?.interrupted, undefined, 'a successful turn clears the interrupted flag')
+
+  process.env.FAKE_AGY_MODE = prevMode
+  if (prevDelay === undefined) delete process.env.FAKE_AGY_DELAY_MS
+  else process.env.FAKE_AGY_DELAY_MS = prevDelay
+})
+
 test('agy 1.1.15 stream mirrors tools as native cards across spans', async () => {
   const { adapter, runs } = makeAdapter()
   process.env.FAKE_AGY_MODE = 'real'
@@ -363,12 +491,12 @@ test('agy 1.1.15 result ERROR with response still finishes stop', async () => {
 
 test('agy 1.1.15 bare result error maps to AGY_ERROR after the tool spans', async () => {
   const { adapter } = makeAdapter()
-  process.env.FAKE_AGY_MODE = 'real-fail'
+  process.env.FAKE_AGY_MODE = 'real-bare'
   const { chunks } = await runTurn(adapter, [msg('user', 'hi')])
   const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string; message: string } } }
   assert.equal(finish.reason.kind, 'error')
   assert.equal(finish.reason.failure?.code, Err.AGY_ERROR)
-  assert.ok(finish.reason.failure?.message.includes('model overloaded'))
+  assert.ok(finish.reason.failure?.message.includes('upstream request failed'))
 })
 
 test('auth failure maps to an AUTH error finish', async () => {
@@ -768,9 +896,9 @@ test('live location refusal rotates the refused account away (retry can serve an
   }
 })
 
-function msgSrc(role: 'user' | 'assistant', text: string, provider?: string): Message {
+function msgSrc(role: 'user' | 'assistant', text: string, provider?: string, replayState?: unknown): Message {
   const m: Record<string, unknown> = { role, content: [{ type: 'text', text }] }
-  if (provider !== undefined) m.source = { provider }
+  if (provider !== undefined) m.source = { provider, ...(replayState !== undefined ? { replayState } : {}) }
   return m as unknown as Message
 }
 
@@ -817,6 +945,47 @@ test('returning session digests only foreign turns since the watermark', async (
   const prompt2 = argv2[argv2.indexOf('-p') + 1] ?? ''
   assert.ok(!prompt2.includes('[conversation so far]'), 'clean follow-up carries no digest')
   assert.equal(prompt2, 'third', 'no keyword-driven recovery suffix is injected into the prompt')
+})
+
+test('returning session digests replies from another agy conversation id (cross-conversation / cross-account)', async () => {
+  const { adapter, store } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'ok'
+  const argsFile = join(workDir, 'args-cross-conv.json')
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  // Turn 1 binds the session to conv-fresh-1
+  await runTurn(adapter, [msg('user', 'first message')], { sessionId: 'sess-cross' as never })
+  await waitFor(() => store.get('sess-cross'))
+
+  // Turn 2: User asked second, but it was answered on another conversation (conv-other-2)
+  await runTurn(adapter, [
+    msgSrc('assistant', 'first reply', 'antigravity', { response: { conversationId: 'conv-fresh-1' } }),
+    msg('user', 'second message'),
+    msgSrc('assistant', 'second reply on another account', 'antigravity', { response: { conversationId: 'conv-other-2' } }),
+    msg('user', 'third message'),
+  ], { sessionId: 'sess-cross' as never })
+
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const prompt = argv[argv.indexOf('-p') + 1] ?? ''
+  assert.ok(prompt.includes('third message'))
+  assert.ok(prompt.includes('second reply on another account'), 'reply from another conversation must be digested')
+  assert.ok(prompt.includes('second message'), 'user question from intervening turn must be digested')
+})
+
+test('forwardSystemPrompt falls back to role: system message when options.system is omitted', async () => {
+  const { adapter } = makeAdapter({ forwardSystemPrompt: true })
+  process.env.FAKE_AGY_MODE = 'ok'
+  const argsFile = join(workDir, 'args-sys-msg.json')
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+
+  await runTurn(adapter, [
+    msg('system', 'You are a meticulous TypeScript expert.'),
+    msg('user', 'Please write a test.'),
+  ], { sessionId: 'sess-sys' as never })
+
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const prompt = argv[argv.indexOf('-p') + 1] ?? ''
+  assert.ok(prompt.includes('System instructions:\nYou are a meticulous TypeScript expert.'), 'system message forwarded')
+  assert.ok(prompt.includes('Please write a test.'))
 })
 
 test('unspawnable binary maps to PROCESS_EXIT without hanging', async () => {
@@ -1193,20 +1362,87 @@ test('a NEW (steered) prompt preempts a live run instead of debouncing', async (
   }
 })
 
-test('soft rate limit signal (model overloaded) stays a deterministic AGY_ERROR', async () => {
+test('soft rate limit signal (model overloaded) becomes a retryable OVERLOADED and rotates', async () => {
   const prevMode = process.env.FAKE_AGY_MODE
+  const invocationFile = join(workDir, `invocations-overload-${Date.now()}.txt`)
   process.env.FAKE_AGY_MODE = 'real-fail'
+  process.env.FAKE_AGY_INVOCATION_FILE = invocationFile
+  const pool = new AccountPoolManager(join(workDir, `pool-soft-overload-${Date.now()}`))
+  pool.createAccountSlot('Second')
   try {
-    const { adapter } = makeAdapter()
-    const userMsg = msg('user', 'Say hello')
-    const res = await runTurn(adapter, [userMsg], { sessionId: 'sess-ratelimit' as never })
+    const { adapter } = makeAdapter({}, { pool })
+    const res = await runTurn(adapter, [msg('user', 'Say hello')], { sessionId: 'sess-ratelimit' as never })
     const finish = res.chunks[res.chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string; message: string } } }
     assert.equal(finish.type, 'finish')
     assert.equal(finish.reason.kind, 'error')
-    assert.equal(finish.reason.failure?.code, Err.AGY_ERROR)
+    // Soft capacity refusals used to be a deterministic AGY_ERROR, so the turn
+    // died while another account was idle. They are now account-scoped for the
+    // retry: retryable, pointer rotated, and NO cooldown (nothing was spent).
+    assert.equal(finish.reason.failure?.code, Err.OVERLOADED)
     assert.ok(finish.reason.failure?.message.includes('rate limit'))
+    assert.ok(adapter.providerRetryPolicy('agy').retryableCodes.includes(Err.OVERLOADED), 'overload must be retryable')
+    // The refusal is repeated for every account by the fake, so the useful
+    // assertion is that the retry did NOT stay on the same account.
+    const spawns = readFileSync(invocationFile, 'utf8').split('\n').filter(Boolean).length
+    assert.ok(spawns >= 2, `expected a failover spawn, got ${spawns}`)
+    for (const acc of pool.getAccounts()) {
+      assert.equal(acc.cooldowns.google, undefined, 'a capacity signal must never cool an account down')
+    }
   } finally {
     process.env.FAKE_AGY_MODE = prevMode
+    delete process.env.FAKE_AGY_INVOCATION_FILE
+  }
+})
+
+test('transport-shaped auth failure is NETWORK (retryable, rotates) instead of AUTH', async () => {
+  const prevMode = process.env.FAKE_AGY_MODE
+  process.env.FAKE_AGY_MODE = 'auth-network'
+  const pool = new AccountPoolManager(join(workDir, 'pool-auth-network'))
+  const second = pool.createAccountSlot('Second')
+  try {
+    const { adapter } = makeAdapter({}, { pool })
+    const chunks = await collect(adapter.stream(opts([msg('user', 'hi')], { sessionId: 'sess-auth-network' as never })))
+    const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string; message: string } } }
+    assert.equal(finish.type, 'finish')
+    assert.equal(finish.reason.kind, 'error')
+    // agy says "not logged into Antigravity" whenever it cannot VALIDATE a good
+    // token. Reporting AUTH there ends the turn on a healthy account and DSH
+    // renders that code as "API key is invalid" — the live 2026-10-10 bug.
+    assert.equal(finish.reason.failure?.code, Err.NETWORK)
+    assert.ok(/transport failure/i.test(finish.reason.failure?.message ?? ''), finish.reason.failure?.message)
+    const primary = pool.getAccounts()[0]!
+    assert.equal(primary.authRequired, undefined, 'a transport blip must never flag the account for re-login')
+    assert.equal(pool.getPoolData().lastActiveAccountId, second.id, 'the retry must land on another account')
+  } finally {
+    process.env.FAKE_AGY_MODE = prevMode
+  }
+})
+
+test('a post-tool quota failure fails over inside the same step (no dead replay)', async () => {
+  const prevMode = process.env.FAKE_AGY_MODE
+  const invocationFile = join(workDir, `invocations-${Date.now()}.txt`)
+  process.env.FAKE_AGY_MODE = 'quota-once'
+  process.env.FAKE_AGY_INVOCATION_FILE = invocationFile
+  const pool = new AccountPoolManager(join(workDir, `pool-post-tool-${Date.now()}`))
+  const second = pool.createAccountSlot('Second')
+  try {
+    const { adapter } = makeAdapter({}, { pool })
+    // quota-once spends the FIRST account after a tool step, so the failure
+    // surfaces in the tool-continuation span. That span used to be re-driven
+    // from the settled recording and re-emit the identical failure, ending the
+    // turn while a healthy account was idle.
+    const res = await runTurn(adapter, [msg('user', 'count the files')], { sessionId: 'sess-post-tool' as never })
+    const finish = res.chunks[res.chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string } } }
+    assert.equal(finish.type, 'finish')
+    assert.equal(finish.reason.kind, 'stop', 'the surviving account must answer instead of the turn failing')
+    const spawns = readFileSync(invocationFile, 'utf8').split('\n').filter(Boolean).length
+    assert.equal(spawns, 2, 'exactly one failover spawn')
+    const primary = pool.getAccounts()[0]!
+    assert.ok((primary.cooldowns.google?.cooldownUntil ?? 0) > Date.now(), 'the spent account must be cooled')
+    assert.equal(pool.getPoolData().lastActiveAccountId, second.id, 'the failover spawn must use the next account')
+  } finally {
+    process.env.FAKE_AGY_MODE = prevMode
+    delete process.env.FAKE_AGY_INVOCATION_FILE
   }
 })
 
@@ -1217,7 +1453,26 @@ test('quota exhaustion and timeouts are retried so the next account can serve th
   // sticky pointer advanced, but no retry was ever attempted.
   assert.ok(policy.retryableCodes.includes(Err.RATE_LIMIT), 'rate limit must retry onto the next account')
   assert.ok(policy.retryableCodes.includes(Err.TIMEOUT), 'silent timeouts must retry onto the next account')
+  assert.ok(policy.retryableCodes.includes(Err.NETWORK), 'transport failures must retry onto the next account')
   assert.ok(!(policy.retryableCodes as readonly string[]).includes(Err.AGY_ERROR), 'deterministic AGY_ERRORs stay single-shot')
+  // One account: a single retry, and a sign-out is not worth a second request.
+  assert.equal(policy.maxRetries, 1)
+  assert.ok(!(policy.retryableCodes as readonly string[]).includes(Err.AUTH), 'a lone account cannot fail over a sign-out')
+})
+
+test('the retry budget follows the pool so a 3-account pool fails over twice', () => {
+  const pool = new AccountPoolManager(join(workDir, `pool-retry-budget-${Date.now()}`))
+  pool.createAccountSlot('Second')
+  pool.createAccountSlot('Third')
+  const { adapter } = makeAdapter({}, { pool })
+  const policy = adapter.providerRetryPolicy('agy')
+  // With one spare account a stale-token second account turned the single retry
+  // into a dead end (live 2026-10-10: primary ELIGIBILITY → g98 "not signed in"
+  // → turn lost). The budget must cover the pool.
+  assert.equal(policy.maxRetries, 2)
+  assert.ok(policy.retryableCodes.includes(Err.AUTH), 'with a spare account a sign-out can continue on the next one')
+  assert.ok(policy.retryableCodes.includes(Err.ELIGIBILITY))
+  assert.ok(policy.retryableCodes.includes(Err.OVERLOADED))
 })
 
 test('hard quota refusal cools the spent account and hands the retry to the next one', async () => {
@@ -1329,6 +1584,125 @@ test('stale continuation with missing run in memory falls back to fresh turn pro
   const turnResult = await runTurn(adapter, [msg('user', 'original task'), toolResult('agytc-missing-run-4')])
   const turnFinish = turnResult.chunks[turnResult.chunks.length - 1] as { type: string; reason: { kind: string } }
   assert.equal(turnFinish.reason.kind, 'stop')
+})
+
+test('isSyntheticHarnessMessage and latestUserTaskText skip timing and reminder telemetry', () => {
+  const timeMsg: Message = {
+    role: 'user',
+    content: [{ type: 'text', text: 'Time sampled while preparing turn 28, step 22: 2026-10-10T16:15:54+05:00[Indian/Maldives]' }],
+    source: { kind: 'time-context' },
+  } as unknown as Message
+  const reminderMsg: Message = {
+    role: 'user',
+    content: [{ type: 'text', text: '<system-reminder>\nSkill guidelines: ...</system-reminder>' }],
+    source: { kind: 'system-reminder' },
+  } as unknown as Message
+  const runtimeMsg: Message = {
+    role: 'user',
+    content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.' }],
+    source: { kind: 'runtime-context' },
+  } as unknown as Message
+  const realMsg: Message = {
+    role: 'user',
+    content: [{ type: 'text', text: '请帮我实现战斗系统' }],
+    source: { kind: 'user' },
+  } as unknown as Message
+
+  assert.equal(isSyntheticHarnessMessage(timeMsg), true)
+  assert.equal(isSyntheticHarnessMessage(reminderMsg), true)
+  assert.equal(isSyntheticHarnessMessage(runtimeMsg), true)
+  assert.equal(isSyntheticHarnessMessage(realMsg), false)
+
+  assert.equal(isRealUserMessage(timeMsg), false)
+  assert.equal(isRealUserMessage(reminderMsg), false)
+  assert.equal(isRealUserMessage(runtimeMsg), false)
+  assert.equal(isRealUserMessage(realMsg), true)
+
+  // Trailing time-context messages must never overwrite or become the user task
+  const history: Message[] = [realMsg, timeMsg]
+  assert.equal(latestUserTaskText(history), '请帮我实现战斗系统')
+  assert.equal(latestUserTaskText([timeMsg]), '')
+})
+
+test('prompt assembly uses real user task instead of trailing time context', async () => {
+  const { adapter, argsFile } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'ok'
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  const realMsg = msg('user', '换成激昂风格的背景音乐')
+  const timeMsg = {
+    role: 'user',
+    content: [{ type: 'text', text: 'Time sampled while preparing turn 5, step 1: 2026-10-10T18:50:47+05:00' }],
+    source: { kind: 'time-context' },
+  } as unknown as Message
+
+  await collect(adapter.stream(opts([realMsg, timeMsg], { sessionId: 'sess-real-task' as never })))
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const promptArg = argv[argv.length - 1]!
+  assert.ok(promptArg.includes('换成激昂风格的背景音乐'), 'real user task must be present in prompt')
+  assert.ok(!promptArg.includes('Time sampled while preparing'), 'synthetic timing context must not be appended to agy prompt')
+})
+
+test('returning session prompt after an interrupted turn does not duplicate the interrupted prompt', async () => {
+  const { adapter, argsFile, store } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'ok'
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+
+  // Simulate an interrupted turn that had reached agy conversation 'conv-interrupted-1'
+  // and settled with messages.length = 2 and interrupted: true
+  const msg1 = msg('user', 'task 1: create snake game')
+  const msg2 = msg('user', 'task 2: add music (aborted mid-turn)')
+  store.set('sess-interrupted:acc_primary', {
+    conversationId: 'conv-interrupted-1',
+    lastMessageCount: 2,
+    updatedAt: Date.now(),
+    model: 'gemini-3.7-flash',
+    interrupted: true,
+  })
+
+  // Next turn: user asks for task 3
+  const msg3 = msg('user', 'task 3: high score system')
+  const msgs = [msg1, msg2, msg3]
+
+  await collect(adapter.stream(opts(msgs, { sessionId: 'sess-interrupted' as never })))
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const promptArg = argv[argv.length - 1]!
+
+  assert.ok(promptArg.includes('task 3: high score system'), 'new prompt must contain task 3')
+  assert.ok(!promptArg.includes('task 2: add music'), 'new prompt must NOT re-include the interrupted task 2')
+  assert.ok(promptArg.includes('the previous turn was interrupted before it finished'), 'new prompt must carry the interruption boundary notice')
+})
+
+test('steered prompt carries interrupted notice so agy switches tasks immediately', async () => {
+  const { adapter, argsFile } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'ok'
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  process.env.FAKE_AGY_DELAY_MS = '6000'
+
+  const firstMsg = msg('user', 'Initial long calculation')
+  const steeredMsg = msg('user', 'Cancel that and tell me a joke')
+
+  try {
+    const iter1 = adapter.stream(opts([firstMsg], { sessionId: 'sess-steer-notice' as never }))[Symbol.asyncIterator]()
+    const firstChunk = iter1.next()
+    await new Promise((r) => setTimeout(r, 80))
+
+    process.env.FAKE_AGY_DELAY_MS = '0'
+    await collect(adapter.stream(opts([steeredMsg], { sessionId: 'sess-steer-notice' as never })))
+
+    const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+    const promptArg = argv[argv.length - 1]!
+    assert.ok(promptArg.includes('Cancel that and tell me a joke'), 'steered task must be in prompt')
+    assert.ok(promptArg.includes('the previous turn was interrupted before it finished'), 'steered prompt must have interruption boundary')
+
+    try {
+      const f = await firstChunk
+      if (!f.done) {
+        while (!(await iter1.next()).done) {}
+      }
+    } catch {}
+  } finally {
+    delete process.env.FAKE_AGY_DELAY_MS
+  }
 })
 
 test.after(() => {

@@ -508,3 +508,43 @@ test('rotation falls back to pool order when no quota metadata exists yet', () =
   assert.equal(pool.getPoolData().lastActiveAccountId, b.id)
 })
 
+test('getEarliestAvailableCountdown reports quota-window resets, not just cooldowns', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-eta-'))
+  const pool = new AccountPoolManager(dir)
+  const iso = (ms: number): string => new Date(ms).toISOString()
+  const now = Date.now()
+  // A fully quota-drained pool knows exactly when it comes back; the old
+  // cooldown-only countdown reported "no ETA" for it.
+  pool.updateAccountQuotas(pool.getAccounts()[0]!.id, {
+    google: { remainingFraction: 0, resetTime: iso(now + 30 * 60_000), weeklyFraction: 0.5, weeklyResetTime: iso(now + 5 * 86_400_000) },
+  })
+  const eta = pool.getEarliestAvailableCountdown('google')
+  assert.ok(eta !== null && eta > 25 * 60_000 && eta <= 31 * 60_000, `expected ~30m ETA, got ${String(eta)}`)
+  assert.equal(pool.getEarliestResetCountdown('google'), null, 'the cooldown-only view still sees nothing')
+  // A cooling account with a nearer reset wins over a far quota reset.
+  const other = pool.createAccountSlot('Second')
+  pool.recordFailure(other.id, 'google', 'RESOURCE_EXHAUSTED (code 429). Resets in 2m0s.')
+  const eta2 = pool.getEarliestAvailableCountdown('google')
+  assert.ok(eta2 !== null && eta2 <= 3 * 60_000, `expected the cooldown to win, got ${String(eta2)}`)
+})
+
+test('a partial pool.json (missing cooldowns/quotas) is normalized instead of throwing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-partial-'))
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'pool.json'), JSON.stringify({
+    version: 1,
+    accounts: [
+      { id: 'acc_primary', alias: 'Primary', dir: '', systemHome: true, enabled: true, createdAt: Date.now() },
+      { id: 'acc_partial', alias: 'Partial', dir: '/tmp/partial', createdAt: Date.now() },
+    ],
+  }), 'utf8')
+  const pool = new AccountPoolManager(dir)
+  // Before normalization `acc.cooldowns[family]` threw a TypeError inside
+  // selectAccount, so EVERY turn failed with an opaque internal error.
+  const picked = pool.selectAccount('google')
+  assert.ok(picked !== null, 'a partial record must still be selectable')
+  assert.equal(pool.isAccountEligible(pool.getAccount('acc_partial')!, 'google'), true, 'enabled defaults to true')
+  assert.deepEqual(pool.getAccount('acc_partial')?.cooldowns, {})
+  assert.deepEqual(pool.getAccount('acc_partial')?.quotas, {})
+})
+

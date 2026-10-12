@@ -10,6 +10,7 @@ import type { AccountPoolManager } from './pool.ts'
 import type { PoolAuthFlow } from './pool-auth.ts'
 import type { QuotaService } from './quota.ts'
 import { classifyToolError } from './recording.ts'
+import { redactProxyUrl } from './diagnostics.ts'
 
 export interface CommandDeps {
   cfg: () => PluginConfig
@@ -21,7 +22,14 @@ export interface CommandDeps {
   pool?: () => AccountPoolManager
   poolAuth?: () => PoolAuthFlow
   quota?: () => QuotaService
-  lastRun: () => { processOk: boolean; processCode: string; toolErrors: readonly string[]; durationMs: number; model: string } | null
+  lastRun: () => {
+    processOk: boolean
+    processCode: string
+    toolErrors: readonly string[]
+    durationMs: number
+    model: string
+    tokenSpeed?: { lastTps: number | null; avgTps: number | null; outputTokens: number; measuredSteps: number; generatingMs: number }
+  } | null
   setOverride: (key: string, value: unknown) => void
   runDoctor: () => Promise<string>
 }
@@ -86,7 +94,8 @@ async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
         }
         lines.push(
           `${i + 1}. **${a.alias}** (${a.email || a.id})${isPrimary ? ' ⭐ primary' : ''}`,
-          `   - Proxy: ${a.proxyUrl || deps.cfg().proxyUrl || 'system default'}`,
+          // Proxy URLs can embed user:pass — never print them raw into the GUI.
+          `   - Proxy: ${a.proxyUrl ? redactProxyUrl(a.proxyUrl) : deps.cfg().proxyUrl ? redactProxyUrl(deps.cfg().proxyUrl) : 'system default'}`,
           `   - Quota: Gemini ${qG} | Claude ${qC} | GPT-OSS ${qO}`,
           cds.length > 0 ? `   - ⚠️ ${cds.join('; ')}` : '   - Status: 🟢 Ready'
         )
@@ -97,10 +106,16 @@ async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
       const pool = deps.pool?.()
       if (!pool) return err('Account pool not available')
       const acc = pool.createAccountSlot(arg || undefined)
+      // Quarantine until the terminal login completes: without the flag the
+      // scheduler immediately routed real runs to the empty slot — a
+      // guaranteed failure plus cooldown noise. The first successful run or
+      // quota refresh clears it (recordSuccess / clearAuthRequired).
+      pool.markAuthRequired(acc.id, 'not signed in yet — complete the terminal login')
       return ok([
         `**Account slot created: [${acc.alias}]** (id: \`${acc.id}\`)`,
         `- Isolated directory: \`${acc.dir}\``,
         `- Run in terminal: \`HOME="${acc.dir}" agy\` to authenticate this Google account.`,
+        `- The slot stays OUT of rotation (authRequired) until the login completes and a quota refresh verifies it.`,
         `- Once logged in, run: \`/agy pool\` or click 🔄 刷新额度 in WebUI.`,
       ].join('\n'))
     }
@@ -211,11 +226,17 @@ async function renderStatus(deps: CommandDeps): Promise<string> {
   const bin = deps.bin()
   const authHelper = deps.auth()
   // Bound the auth probe so /agy status never hangs the command UI (issue #29).
+  // Keep the timer handle so a fast answer doesn't leave a pending timeout.
+  let probeTimer: NodeJS.Timeout | null = null
   const auth = authHelper
     ? await Promise.race([
         authHelper.resolvedStatus(),
-        new Promise<undefined>((r) => setTimeout(() => r(undefined), 8_000)),
-      ])
+        new Promise<undefined>((r) => {
+          probeTimer = setTimeout(() => r(undefined), 8_000)
+        }),
+      ]).finally(() => {
+        if (probeTimer !== null) clearTimeout(probeTimer)
+      })
     : undefined
   const cat = deps.catalog().get()
   const bindings = Object.keys(deps.store().all()).length
@@ -234,6 +255,13 @@ async function renderStatus(deps: CommandDeps): Promise<string> {
     '- catalog: ' + cat.models.length + ' models — ' + cat.source + (cat.lastError === undefined ? '' : ' — last error: ' + cat.lastError),
     '- conversation bindings: ' + bindings,
     '- last run process: ' + (last ? (last.processOk ? 'ok' : last.processCode) + ' — ' + last.model + ' in ' + Math.round(last.durationMs / 100) / 10 + 's' : 'none yet'),
+    ...(last?.tokenSpeed !== undefined && (last.tokenSpeed.measuredSteps > 0 || last.tokenSpeed.outputTokens > 0)
+      ? [
+          '- last run tokens: ' + last.tokenSpeed.outputTokens + ' output tokens' +
+            (last.tokenSpeed.avgTps !== null ? ' — avg ' + last.tokenSpeed.avgTps.toFixed(1) + ' tok/s' : '') +
+            (last.tokenSpeed.lastTps !== null ? ' (last generation step: ' + last.tokenSpeed.lastTps.toFixed(1) + ' tok/s)' : ''),
+        ]
+      : []),
     ...(last && last.toolErrors.length > 0
       ? [
           '- last run tool errors (' + last.toolErrors.length + '): ' + last.toolErrors.join(' | '),

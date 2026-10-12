@@ -10,6 +10,20 @@ export function defaultConversationsDir(): string {
   return process.env.DSH_AGY_CONVERSATIONS_DIR ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations')
 }
 
+/**
+ * Conversations directory for one run's HOME. Secondary pool accounts run
+ * under an isolated HOME, so the fallback discovery must watch THEIR
+ * conversations dir — snapshotting the system HOME silently never saw those
+ * conversation databases (agy-db.ts fixed the same class of bug for its DB
+ * readers; this aligns discovery with it).
+ */
+export function conversationsDirFor(accountHome?: string): string {
+  if (accountHome !== undefined && accountHome !== '') {
+    return join(accountHome, '.gemini', 'antigravity-cli', 'conversations')
+  }
+  return defaultConversationsDir()
+}
+
 export interface DirSnapshot {
   dir: string;
   /** name -> mtimeMs */

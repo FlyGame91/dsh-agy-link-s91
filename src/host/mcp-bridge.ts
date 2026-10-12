@@ -203,15 +203,44 @@ export function writeMcpConfig(workspaceRoot: string, bridge: McpBridge): () => 
     },
   }
   root.mcpServers = servers
+  let written = false
   try {
     writeFileSync(file, JSON.stringify(root, null, 2) + '\n', 'utf8')
+    written = true
   } catch {
     return () => {}
   }
   return () => {
     try {
+      // Restore only what WE wrote: after a crash + manual edit (or another
+      // process rewriting the file), blindly restoring `previous` clobbered
+      // foreign changes. When the current content no longer contains our
+      // entry, leave the file alone.
+      if (!written) return
+      let current: string | null = null
+      try {
+        if (existsSync(file)) current = readFileSync(file, 'utf8')
+      } catch {
+        current = null
+      }
+      if (current === null) return // file vanished: nothing of ours remains
+      let parsed: Record<string, unknown> = {}
+      try {
+        const v = JSON.parse(current)
+        if (v && typeof v === 'object') parsed = v as Record<string, unknown>
+      } catch {
+        return // unparseable: assume our entry is gone, don't touch the file
+      }
+      const curServers = (parsed.mcpServers && typeof parsed.mcpServers === 'object' ? parsed.mcpServers : {}) as Record<string, unknown>
+      if (!(MCP_SERVER_KEY in curServers)) return
       if (previous === null) {
-        if (existsSync(file)) unlinkSync(file)
+        delete curServers[MCP_SERVER_KEY]
+        if (Object.keys(curServers).length === 0) {
+          // We created the file and no other servers remain: remove it.
+          unlinkSync(file)
+        } else {
+          writeFileSync(file, JSON.stringify({ ...parsed, mcpServers: curServers }, null, 2) + '\n', 'utf8')
+        }
       } else {
         writeFileSync(file, previous, 'utf8')
       }

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { looksLikeRateLimit, looksLikeHardRateLimit, looksLikeEligibilityFailure } from '../src/common/types.ts'
+import { looksLikeRateLimit, looksLikeHardRateLimit, looksLikeEligibilityFailure, looksLikeNetworkError, shouldMarkAuthRequired } from '../src/common/types.ts'
 
 // Captured verbatim from a real incident: a cortex tool / permission error
 // that the old loose classifier (bare `429` / bare `rate limit`) sometimes saw
@@ -57,4 +57,32 @@ test('soft looksLikeRateLimit keeps capacity signals out of the hard set', () =>
   assert.equal(looksLikeRateLimit('RESOURCE_EXHAUSTED (code 429)'), true)
   // And stays silent on the incident text.
   assert.equal(looksLikeRateLimit(REAL_TOOL_ERROR), false)
+})
+
+test('real quota phrasings outside the old narrow regex are recognised', () => {
+  // These reached users as a bare "agy exited with code 1" (no cooldown, no
+  // rotation), so the retry hammered the same spent account.
+  assert.equal(looksLikeHardRateLimit('Resource has been exhausted (e.g. check quota).'), true)
+  assert.equal(looksLikeHardRateLimit('You have exhausted your quota for this model.'), true)
+  assert.equal(looksLikeRateLimit('The model is overloaded.'), true)
+  assert.equal(looksLikeHardRateLimit('The model is overloaded.'), false)
+  assert.equal(looksLikeRateLimit('temporarily overloaded, please retry'), true)
+  assert.equal(looksLikeHardRateLimit('capacity unavailable'), false)
+})
+
+test('looksLikeNetworkError recognises transport-shaped auth failures', () => {
+  // Verbatim from the live incident: agy reports "not logged into Antigravity"
+  // for a HEALTHY login whose token could not be validated over the network.
+  assert.equal(
+    looksLikeNetworkError('keyringAuth: token validation failed due to network error (token may still be valid): Post "https://oauth2.googleapis.com/token": EOF'),
+    true,
+  )
+  assert.equal(looksLikeNetworkError('Post "https://play.googleapis.com/log": net/http: TLS handshake timeout'), true)
+  assert.equal(looksLikeNetworkError('oauth2.googleapis.com: i/o timeout'), true)
+  assert.equal(looksLikeNetworkError('google: could not find default credentials: unexpected EOF'), true)
+  assert.equal(looksLikeNetworkError('dial tcp 142.250.0.1:443: connect: connection refused'), true)
+  // A genuine sign-out carries no transport evidence and must stay AUTH-shaped.
+  assert.equal(looksLikeNetworkError('authentication required: run /agy auth'), false)
+  assert.equal(shouldMarkAuthRequired('AUTH', 'keyringAuth: token validation failed due to network error: EOF'), false)
+  assert.equal(shouldMarkAuthRequired('AUTH', 'invalid_grant: the token has been revoked'), true)
 })

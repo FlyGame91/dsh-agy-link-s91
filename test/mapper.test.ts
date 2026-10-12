@@ -260,11 +260,14 @@ test('agy 1.1.15 stream maps onto spans: thinking turn, tool cuts, fragments, re
     { kind: 'step', stepKey: '5', stepKind: 'text', text: '2 files.', fragment: true },
     { kind: 'result', conversationId: 'c15', ok: true, response: 'There are 2 files.', usage: { input_tokens: 9, output_tokens: 8, thinking_tokens: 95 } },
   ]
-  // Span 1: no empty thinking chip (no DB prose) + first tool cut
+  // Span 1: thinking visibility (issue #43) + first tool cut. The
+  // thinking-only DONE tail emits the bare banner (no prose available), and
+  // the ACTIVE envelope emits exactly one pending-progress note.
   const s1 = newSpan('run15')
   const c1 = mapAll(s1, events, 0)
   const reasoning1 = c1.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning1, '', 'no prose → no reasoning row')
+  assert.equal(reasoning1, '[agy thinking turn · 80 thinking tokens]\n[agy tool running: run_command — the result card streams when it finishes]\n')
+  assert.ok(!reasoning1.includes('Chain-of-Thought') && !/thinking turn\].+thinking turn/s.test(reasoning1), 'no invented prose, no duplicate banner')
   assert.equal(toolCallEnd(c1).block.id, mirrorCallId('run15', 3))
   assert.equal(asFinish(lastChunk(c1)).reason.kind, 'tool-calls')
   // Span 2: second tool cut (the errored one)
@@ -280,14 +283,15 @@ test('agy 1.1.15 stream maps onto spans: thinking turn, tool cuts, fragments, re
   assert.equal(asFinish(lastChunk(c3)).reason.kind, 'stop')
 })
 
-test('one-shot answer step without DB prose does not invent a thinking row', () => {
+test('one-shot answer step without DB prose shows the banner-only chip, never invented prose', () => {
   const m = newSpan('r-oneshot')
   const chunks = mapAll(m, [
     { kind: 'step', stepKey: '2', stepKind: 'text', text: '1 + 1 等于 2。', usage: { input_tokens: 100, output_tokens: 50, thinking_tokens: 154 } },
     { kind: 'result', conversationId: 'c9', ok: true, response: '1 + 1 等于 2。', usage: {} },
   ])
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning, '')
+  assert.equal(reasoning, '[agy thinking turn · 154 thinking tokens]\n', 'issue #43: thinking stays visible without a sqlite reader')
+  assert.ok(!reasoning.includes('等于'), 'no invented thought prose')
   const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
   assert.equal(text, '1 + 1 等于 2。')
 })
@@ -406,7 +410,9 @@ test('DB thought arriving on DONE tail is not dropped due to premature thinkingA
   const c2 = [...m.map({ kind: 'step', stepKey: '1', stepKind: 'text', text: '', fragment: false, usage: { thinking_tokens: 438 }, raw: {} }, 1)]
   const allChunks = [...c1, ...c2]
   const reasoning = allChunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning, '[agy thinking turn · 438 thinking tokens] Critical analysis of constraints.\n')
+  // The banner-only chip streamed first (no prose yet); when the DB prose
+  // resolves it is APPENDED without a second banner, and never dropped.
+  assert.equal(reasoning, '[agy thinking turn · 438 thinking tokens]\nCritical analysis of constraints.\n')
 })
 
 test('stepKind === thinking uses resolvedThoughts when available', () => {
@@ -486,4 +492,39 @@ test('usageFromRaw maps snake_case fields', () => {
   assert.equal(u.reasoningTokens, 3)
   assert.equal(u.cacheReadTokens, 4)
   assert.equal(u.cacheWriteTokens, 5)
+})
+
+test('thinking-only turn without DB prose still surfaces the banner (issue #43)', () => {
+  // Desktop host, no sqlite reader: high-effort thinking used to render
+  // NOTHING at all. The DONE tail with usage must emit the bare banner.
+  const m = newSpan('r-banner')
+  const chunks = mapAll(m, [
+    { kind: 'step', stepKey: '2', stepKind: 'text', text: '', usage: { input_tokens: 100, output_tokens: 0, thinking_tokens: 320 } },
+    { kind: 'result', conversationId: 'c43', ok: true, response: 'Answer.', usage: {} },
+  ])
+  const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
+  assert.ok(reasoning.includes('[agy thinking turn · 320 thinking tokens]'), 'banner-only chip emitted for thinking-only turns')
+})
+
+test('banner-only chip precedes the first visible text and never repeats (issue #43)', () => {
+  const m = newSpan('r-banner2')
+  const chunks = mapAll(m, [
+    { kind: 'step', stepKey: '3', stepKind: 'text', text: 'Hello', fragment: true, usage: { thinking_tokens: 45 } },
+    { kind: 'step', stepKey: '3', stepKind: 'text', text: ' world', fragment: true, usage: { thinking_tokens: 60 } },
+  ])
+  const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
+  assert.equal(reasoning, '[agy thinking turn · 45 thinking tokens]\n', 'exactly one banner before the answer')
+  const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
+  assert.equal(text, 'Hello world')
+})
+
+test('token-only steps AFTER visible text stay suppressed (no clutter regression)', () => {
+  const m = newSpan('r-banner3')
+  const chunks = mapAll(m, [
+    { kind: 'step', stepKey: '1', stepKind: 'text', text: 'answer text', fragment: true, usage: { thinking_tokens: 10 } },
+    { kind: 'step', stepKey: '2', stepKind: 'text', text: 'more', fragment: true, usage: { thinking_tokens: 99 } },
+  ])
+  const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
+  assert.ok(reasoning.includes('[agy thinking turn · 10 thinking tokens]'), 'first banner present')
+  assert.ok(!reasoning.includes('99'), 'later token-only steps are not chatty')
 })

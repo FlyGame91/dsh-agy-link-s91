@@ -37,12 +37,16 @@ Spawning agy for Account $X$ simply injects `HOME=/path/to/~/.dsh/agy-accounts/a
 ### 2. Sticky Sequential Drain Strategy (按模型家族顺次耗尽)
 - **Family-Scoped Cooldown**: Quota is tracked per model family (`google`, `anthropic`, `openai`). If Account A hits 429 on Claude 4.6, only Account A's `anthropic` family is marked in cooldown. Account A can still serve Gemini 3.7 Flash requests.
 - **Sticky Affinity**: Requests stick to the first healthy account (e.g., Account A) to maximize conversation continuity and token caching.
-- **Transparent Fallback**: When an in-flight request on Account A receives 429 / quota exceeded, the adapter records cooldown on Account A for that family and immediately transparently retries on Account B in the same streaming span. The user experiences zero interruption.
+- **Transparent Fallback**: When a request on Account A is refused for an account-scoped reason (429 / quota, region eligibility, transport-flavoured auth, soft capacity), the adapter records the cooldown or rotates the sticky pointer, and the SAME step continues on Account B — either through DSH's automatic retry (the first-span case) or by discarding the dead recording and re-assembling on the next account (the post-tool case). The user experiences no interruption and never resends.
+  - Account failover is bounded by the pool: DSH's retry budget is `min(enabled accounts - 1, 2)` retries, and the post-tool failover allows at most `enabled accounts - 1` re-spawns per session inside a 2-minute window. A deterministic (request-level) failure is never failed over, so a broken request cannot loop through the pool re-running its tools.
+  - A genuine sign-out (`AUTH`) is retryable only when the pool has another account that may still be signed in; the failed account is flagged `authRequired` and leaves rotation.
 
 ### 3. Cooldown & Reset Handling
 - If the error contains a server reset time (or `Retry-After`), cooldown is set to `Date.now() + resetMs`.
-- Default cooldown window is 10 minutes (tiered up to 60 minutes on consecutive 429s).
+- Default cooldown window is 15 minutes (`defaultCooldownMs`, tiered up to 60 minutes on consecutive 429s).
 - Cooldown expires automatically; when Account A recovers, it resumes primary position.
+- Soft capacity refusals ("model overloaded" / high traffic) NEVER set a cooldown: nothing was spent. They rotate the pointer and are retryable anyway, so an idle account can still serve the turn.
+- "All accounts unavailable" reports the real state (N in cooldown, N signed out) with the earliest availability, which includes quota-window resets and not just cooldowns; a reset that is ≤ 20s away is waited out instead of failing the turn.
 
 ### 4. Optional Per-Account Proxy (防关联支持)
 Each account can optionally specify a dedicated proxy URL (`socks5://...` or `http://...`). When set, `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` are scoped exclusively to that account's child process. If unconfigured, it inherits the global host environment proxy.

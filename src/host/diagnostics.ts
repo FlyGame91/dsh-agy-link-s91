@@ -18,6 +18,25 @@ export interface DoctorDeps {
   recentLines: () => readonly string[];
 }
 
+/**
+ * Redact user:pass credentials from a proxy URL for display in command output
+ * and reports. The full URL (with embedded credentials) stays in config only.
+ */
+export function redactProxyUrl(url: string): string {
+  if (url === '') return url
+  try {
+    const u = new URL(url)
+    if (u.username !== '' || u.password !== '') {
+      u.username = u.username !== '' ? '***' : ''
+      u.password = u.password !== '' ? '***' : ''
+      return u.toString()
+    }
+    return url
+  } catch {
+    return '<proxy-url-redacted>'
+  }
+}
+
 /** Redact auth URLs, long tokens, and authorization codes. */
 export function redactLine(line: string): string {
   let out = line
@@ -25,6 +44,11 @@ export function redactLine(line: string): string {
   out = out.replace(/\b[0-9]{4,}\//g, '4/<code-redacted>')
   out = out.replace(/ya29\.[A-Za-z0-9._-]+/g, '<oauth-token-redacted>')
   out = out.replace(/Bearer\s+\S+/gi, 'Bearer <redacted>')
+  // Google OAuth refresh tokens ("1//0…") and AIza API keys did not match any
+  // rule above and landed in the doctor report verbatim when agy echoed them.
+  out = out.replace(/\b1\/\/0[A-Za-z0-9._-]{10,}/g, '<oauth-refresh-token-redacted>')
+  out = out.replace(/\bAIza[0-9A-Za-z_-]{30,}\b/g, '<api-key-redacted>')
+  out = out.replace(/\b(?:https?|socks[45]):\/\/[^\s/]*:[^\s/@]*@[^\s]+/gi, '<proxy-url-redacted>')
   return out
 }
 
@@ -38,7 +62,13 @@ export function writeDoctorReport(deps: DoctorDeps): string {
   lines.push('- generated: ' + new Date().toISOString())
   lines.push('- agy binary: ' + (deps.bin() ?? 'NOT FOUND'))
   lines.push('- agy version: ' + (deps.version() ?? 'unknown'))
-  lines.push('- plugin config: ' + JSON.stringify({ ...cfg, extraArgs: cfg.extraArgs.length }))
+  // The full config is dumped for support: scrub values that can carry
+  // credentials (proxyUrl) instead of emitting them into a 0644 file.
+  const cfgDump: Record<string, unknown> = { ...cfg, extraArgs: cfg.extraArgs.length }
+  if (typeof cfgDump.proxyUrl === 'string' && cfgDump.proxyUrl !== '') {
+    cfgDump.proxyUrl = redactProxyUrl(cfgDump.proxyUrl as string)
+  }
+  lines.push('- plugin config: ' + JSON.stringify(cfgDump))
   lines.push('- catalog: ' + cat.source + ' — ' + cat.models.length + ' models' + (cat.lastError === undefined ? '' : ' — error: ' + cat.lastError))
   for (const m of cat.models) {
     lines.push('  - ' + m.id + (m.efforts ? ' [' + m.efforts.join('/') + ']' : ''))

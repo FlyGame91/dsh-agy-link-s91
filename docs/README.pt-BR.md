@@ -52,6 +52,7 @@ No DSH, clique no selo `AGY (n)` e selecione **Add Account** para concluir o log
 | `defaultModel` | `DSH_AGY_DEFAULT_MODEL` | padrão do agy | Slug do modelo padrão |
 | `defaultEffort` | `DSH_AGY_DEFAULT_EFFORT` | padrão do modelo | `low`, `medium` ou `high` |
 | `timeoutMs` | `DSH_AGY_TIMEOUT_MS` | `600000` | Timeout do watchdog, em ms |
+| `longToolIdleMinutes` | `DSH_AGY_LONG_TOOL_IDLE_MINUTES` | `240` | Orçamento de inatividade (minutos) enquanto um passo de ferramenta está aberto; `0` = manter `timeoutMs` |
 | `workspaceRoot` | `DSH_AGY_WORKSPACE_ROOT` | cwd da sessão | Raiz do workspace |
 
 ## Comandos `/agy`

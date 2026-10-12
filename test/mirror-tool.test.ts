@@ -40,6 +40,55 @@ test('registry retains bounded LRU and serves runs by id', () => {
   assert.equal(reg.get(a.runId), undefined)
 })
 
+test('registry eviction never drops live, pinned or most-recent runs', () => {
+  const reg = new RunRegistry()
+  const pinned = reg.create() // a span is driving this run for hours
+  reg.pin(pinned.runId)
+  const live = reg.create() // alive process, not settled
+  const settled: RunRecording[] = []
+  for (let i = 0; i < 12; i++) {
+    const r = reg.create()
+    r.settle(null)
+    settled.push(r)
+  }
+  assert.equal(reg.get(pinned.runId), pinned, 'pinned run survives registry pressure')
+  assert.equal(reg.get(live.runId), live, 'unsettled run survives registry pressure')
+  assert.equal(reg.get(settled[11]!.runId), settled[11], 'most recent run is never the victim')
+  assert.equal(reg.get(settled[0]!.runId), undefined, 'oldest settled run is evicted')
+  assert.equal(reg.size, 8, 'settled runs are trimmed back to the cap')
+  // Unpinning makes it evictable once it settles, but never while it is live.
+  reg.unpin(pinned.runId)
+  for (let i = 0; i < 12; i++) {
+    const r = reg.create()
+    r.settle(null)
+  }
+  assert.equal(reg.get(pinned.runId), pinned, 'still live, so still exempt')
+  pinned.settle(null)
+  for (let i = 0; i < 12; i++) {
+    const r = reg.create()
+    r.settle(null)
+  }
+  assert.equal(reg.get(pinned.runId), undefined, 'settled + unpinned run is reclaimable')
+})
+
+test('remember() refreshes recency so a re-registered run is not the victim', () => {
+  const reg = new RunRegistry()
+  const first = reg.create()
+  first.settle(null)
+  for (let i = 0; i < 7; i++) {
+    const r = reg.create()
+    r.settle(null)
+  }
+  // A continuation span re-registers the run it is about to consume: that must
+  // move it to the most-recent position (Map.set alone keeps the old slot).
+  reg.remember(first)
+  assert.deepEqual(reg.runIds[reg.runIds.length - 1], first.runId)
+  const fresh = reg.create()
+  fresh.settle(null)
+  assert.equal(reg.get(first.runId), first, 'the refreshed run survives the next eviction')
+  assert.equal(reg.size, 8)
+})
+
 test('mirror execute replays recorded output and errors honestly', async () => {
   const reg = new RunRegistry()
   const rec = reg.create()
@@ -51,10 +100,41 @@ test('mirror execute replays recorded output and errors honestly', async () => {
     () => mirror.execute({ run: rec.runId, step: 1, tool: 'find_by_name' } as never, { signal: fakeSignal() } as never),
     (e: unknown) => String(e).includes('boom'),
   )
-  await assert.rejects(
-    () => mirror.execute({ run: 'missing', step: 0, tool: 'x' } as never, { signal: fakeSignal() } as never),
-    (e: unknown) => String(e).includes('no recorded agy run'),
+})
+
+test('a lost recording degrades to a task-facing notice, never a harness error', async () => {
+  const mirror = defineAgyMirrorTool({ runs: new RunRegistry() })
+  // Missing run (evicted / bridge restarted while the step was queued).
+  const gone = String(
+    await mirror.execute(
+      { run: 'missing', step: 56, tool: 'run_command', input: { CommandLine: './test.sh' } } as never,
+      { signal: fakeSignal() } as never,
+    ),
   )
+  assert.ok(gone.includes('no longer resident'), gone)
+  assert.ok(gone.includes('do NOT investigate the bridge'), gone)
+  assert.ok(gone.includes('./test.sh'), gone)
+  assert.ok(!/no recorded agy run/i.test(gone), 'must not leak the old internal error text')
+  // Recording present, but the cursor is not a completed tool step.
+  const reg = new RunRegistry()
+  const rec = reg.create()
+  rec.append({ kind: 'step', stepKey: 't1', stepKind: 'text', text: 'hi' } as never)
+  const cursorOnly = String(
+    await defineAgyMirrorTool({ runs: reg }).execute({ run: rec.runId, step: 0 } as never, { signal: fakeSignal() } as never),
+  )
+  assert.ok(cursorOnly.includes('no longer resident'), cursorOnly)
+  assert.ok(cursorOnly.includes('not a completed tool step'), cursorOnly)
+})
+
+test('an out-of-range cursor blames the cursor, not a recycled output', async () => {
+  const reg = new RunRegistry()
+  const rec = reg.create()
+  rec.append({ kind: 'step', stepKey: 't1', stepKind: 'tool', text: '', tool: { name: 'run_command', args: { command: 'ls' }, output: 'x' } } as never)
+  const out = String(
+    await defineAgyMirrorTool({ runs: reg }).execute({ run: rec.runId, step: 42 } as never, { signal: fakeSignal() } as never),
+  )
+  assert.ok(out.includes('outside this recording'), out)
+  assert.ok(!out.includes('recycled'), 'must not claim the output was recycled: ' + out)
 })
 
 test('cursor-only invocations: execute + presenters resolve detail from the recording', async () => {
@@ -223,3 +303,58 @@ test('getGitHeadContent safely retrieves HEAD content or returns null', () => {
   })
   return content
 })
+
+test('presentMirrorCall and toolStepBrief support web search, task management, schedule and subagents', () => {
+  const web = presentMirrorCall({ tool: 'search_web', input: { query: 'google antigravity cli' } })
+  assert.equal(web?.card, 'generic')
+  if (web?.card === 'generic') {
+    assert.equal(web.kind, 'search')
+    assert.equal(web.title, 'Web search google antigravity cli')
+  }
+  const task = presentMirrorCall({ tool: 'manage_task', input: { Action: 'status', TaskId: 'task-123' } })
+  assert.equal(task?.card, 'generic')
+  if (task?.card === 'generic') {
+    assert.equal(task.kind, 'execute')
+    assert.equal(task.title, 'Task status (task-123)')
+  }
+  const sched = presentMirrorCall({ tool: 'schedule', input: { DurationSeconds: 300, Prompt: 'Check build' } })
+  assert.equal(sched?.card, 'generic')
+  if (sched?.card === 'generic') {
+    assert.equal(sched.title, 'Schedule 300s timer')
+  }
+  const subagent = presentMirrorCall({ tool: 'invoke_subagent', input: { Subagents: [{ Role: 'Code Reviewer' }] } })
+  assert.equal(subagent?.card, 'generic')
+  if (subagent?.card === 'generic') {
+    assert.equal(subagent.title, 'Subagent: Code Reviewer')
+  }
+  const sendMsg = presentMirrorCall({ tool: 'send_message', input: { Recipient: 'agent-1' } })
+  assert.equal(sendMsg?.card, 'generic')
+  if (sendMsg?.card === 'generic') {
+    assert.equal(sendMsg.title, 'Message subagent agent-1')
+  }
+
+  // toolStepBrief
+  assert.equal(toolStepBrief('view_file', { AbsolutePath: '/foo/bar.ts' }), 'read /foo/bar.ts')
+  assert.equal(toolStepBrief('search_web', { query: 'antigravity docs' }), 'search web antigravity docs')
+  assert.equal(toolStepBrief('read_url_content', { Url: 'https://antigravity.google' }), 'fetch https://antigravity.google')
+  assert.equal(toolStepBrief('manage_task', { Action: 'kill', TaskId: 'task-9' }), 'task kill task-9')
+  assert.equal(toolStepBrief('invoke_subagent', { Subagents: [{ Role: 'Tester' }] }), 'subagent: Tester')
+  assert.equal(toolStepBrief('send_message', { Recipient: 'agent-2' }), 'msg agent-2')
+})
+
+test('presentMirrorResult parses exit code from command output', () => {
+  const term = defineAgyMirrorTool({ runs: new RunRegistry() }).presentResult
+  assert.ok(term !== undefined)
+  const ok = term?.(
+    { run: 'r', step: 0, tool: 'run_command', input: { command: 'npm test' } },
+    { content: [{ type: 'text', text: 'Tests passed\nThe command exited with code 0.\nOutput:\nall ok' }], isError: false },
+  )
+  assert.equal((ok as { exitCode?: number }).exitCode, 0)
+
+  const fail = term?.(
+    { run: 'r', step: 1, tool: 'run_command', input: { command: 'false' } },
+    { content: [{ type: 'text', text: 'The command exited with code 1.' }], isError: true },
+  )
+  assert.equal((fail as { exitCode?: number }).exitCode, 1)
+})
+

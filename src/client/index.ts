@@ -61,6 +61,8 @@ interface StatusPayload {
 	dormantReason?: string | null;
 	enabled?: boolean;
 	permissionMode?: string;
+	/** Windows Credential Manager is one shared keyring slot — pool rotation is cosmetic there (issue #45). */
+	credentialIsolationLimited?: boolean;
 	workspaceRoot?: string;
 	defaultModel?: string;
 	defaultEffort?: string;
@@ -103,7 +105,13 @@ let statusCache: StatusPayload | null = null;
 
 async function getStatus(): Promise<StatusPayload | null> {
 	try {
-		const res = await win.fetch?.(base + '/plugins/agy-link/status');
+		// A bounded fetch: the poll loop must never stack behind a hung request
+		// (undici/browser defaults can park far longer than one poll period).
+		const init: Record<string, unknown> = {};
+		if (typeof AbortSignal !== 'undefined' && typeof (AbortSignal as { timeout?: unknown }).timeout === 'function') {
+			init.signal = (AbortSignal as { timeout: (ms: number) => unknown }).timeout(5000);
+		}
+		const res = await win.fetch?.(base + '/plugins/agy-link/status', init);
 		if (!res || !res.ok) return null;
 		const payload = (await res.json()) as StatusPayload;
 		statusCache = payload;
@@ -122,13 +130,78 @@ async function postJson(path: string, body: Record<string, unknown>): Promise<an
 		});
 		if (!res) return null;
 		try {
-			return await res.json();
+			const payload = await res.json();
+			// Surface HTTP failure as ok:false so callers can distinguish
+			// "saved" from "server refused" instead of always toasting success.
+			if (!res.ok && payload !== null && typeof payload === 'object') {
+				return { ok: false, ...(payload as Record<string, unknown>) };
+			}
+			return payload;
 		} catch {
 			return { ok: res.ok };
 		}
 	} catch {
 		return null;
 	}
+}
+
+// ---- shared status polling ----
+// ONE module-level fetch loop serves every mounted consumer (settings panel,
+// header badge, modal). Per-component 3s loops used to stack (three full
+// payload fetches per interval with the modal open), had no overlap guard,
+// and let a slow stale response overwrite a newer one.
+const statusListeners = new Set<(s: StatusPayload) => void>();
+let statusPollTimer: ReturnType<typeof setInterval> | null = null;
+let statusFetchSeq = 0;
+
+function notifyStatus(st: StatusPayload): void {
+	statusCache = st;
+	for (const fn of [...statusListeners]) {
+		try { fn(st); } catch { /* a dead consumer must not kill the loop */ }
+	}
+}
+
+async function statusPollTick(): Promise<void> {
+	const seq = ++statusFetchSeq;
+	const st = await getStatus();
+	// A slow response from an older tick must never overwrite newer data.
+	if (st !== null && seq === statusFetchSeq) notifyStatus(st);
+}
+
+function ensureStatusPolling(): void {
+	if (statusPollTimer !== null) return;
+	void statusPollTick();
+	statusPollTimer = setInterval(() => { void statusPollTick(); }, 3000);
+}
+
+function stopStatusPollingIfIdle(): void {
+	if (statusListeners.size === 0 && statusPollTimer !== null) {
+		clearInterval(statusPollTimer);
+		statusPollTimer = null;
+	}
+}
+
+/**
+ * Subscribe a component to the shared status poll. Returns the latest
+ * snapshot plus a manual refresh that keeps the last good snapshot on a
+ * transient failure (a failed refresh used to flip the whole panel back to
+ * its loading state).
+ */
+function useAgyStatus(): { status: StatusPayload | null; refresh: () => Promise<void> } {
+	const [status, setStatus] = useState<StatusPayload | null>(statusCache);
+	useEffect(() => {
+		statusListeners.add(setStatus);
+		ensureStatusPolling();
+		return () => {
+			statusListeners.delete(setStatus);
+			stopStatusPollingIfIdle();
+		};
+	}, []);
+	const refresh = async (): Promise<void> => {
+		const st = await getStatus();
+		if (st !== null) notifyStatus(st);
+	};
+	return { status, refresh };
 }
 
 /** Global modal state for opening Antigravity console dialog from footer shortcut or header status */
@@ -819,7 +892,7 @@ export function apply(ctx: ClientContext): void {
 	};
 	const AgySettingsSection = (props?: any): unknown => {
 		const t = useAgyTranslation();
-		const [status, setStatus] = useState<StatusPayload | null>(statusCache);
+		const { status, refresh } = useAgyStatus();
 		const [aliasInput, setAliasInput] = useState('');
 		const [proxyInputs, setProxyInputs] = useState<Record<string, string>>({});
 		const [editingProxyId, setEditingProxyId] = useState<string | null>(null);
@@ -829,24 +902,13 @@ export function apply(ctx: ClientContext): void {
 		const [toast, setToast] = useState<ToastNotice | null>(null);
 		const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
 
+		// Cooldown expiry and quota countdowns are Date.now()-derived while the
+		// payload itself does NOT change when they lapse — without a wall-clock
+		// tick the "cooldown" banner and the minutes-left froze forever.
+		const [, setTimeTick] = useState(0);
 		useEffect(() => {
-			let alive = true;
-			let lastJson = '';
-			const tick = async () => {
-				const st = await getStatus();
-				if (!alive || !st) return;
-				const json = JSON.stringify(st);
-				if (json !== lastJson) {
-					lastJson = json;
-					setStatus(st);
-				}
-			};
-			void tick();
-			const timer = setInterval(tick, 3000);
-			return () => {
-				alive = false;
-				clearInterval(timer);
-			};
+			const timer = setInterval(() => setTimeTick((n) => n + 1), 30_000);
+			return () => clearInterval(timer);
 		}, []);
 
 		const flowStartedRef = useRef(false);
@@ -871,15 +933,24 @@ export function apply(ctx: ClientContext): void {
 			// eslint-disable-next-line react-hooks/exhaustive-deps
 		}, [addingAccount, status?.poolAuth?.phase, status?.poolAuth?.code]);
 
+		const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+		useEffect(() => () => {
+			// Unmount must not leave a pending timer writing state into a dead
+			// component; a second same-text toast also used to be cleared early
+			// by the FIRST toast's leftover timer.
+			if (toastTimerRef.current !== null) clearTimeout(toastTimerRef.current);
+		}, []);
 		const showToast = (text: string, type: ToastNotice['type'] = 'info') => {
 			setToast({ text, type, id: Date.now() });
-			setTimeout(() => {
-				setToast((prev) => (prev?.text === text ? null : prev));
+			if (toastTimerRef.current !== null) clearTimeout(toastTimerRef.current);
+			toastTimerRef.current = setTimeout(() => {
+				toastTimerRef.current = null;
+				setToast((prev) => (prev !== null && prev.text === text ? null : prev));
 			}, 6000);
 		};
 
-		const refresh = async (): Promise<void> => {
-			setStatus(await getStatus());
+		const actionFailed = (): void => {
+			showToast(t('api.genericError'), 'error');
 		};
 
 		const handleBeginAddAccount = async (): Promise<void> => {
@@ -928,20 +999,39 @@ export function apply(ctx: ClientContext): void {
 
 		const setCfg = async (key: string, value: unknown): Promise<void> => {
 			setLoadingAction(`config:${key}`);
-			await postJson('/plugins/agy-link/config', { key, value });
+			const res = await postJson('/plugins/agy-link/config', { key, value });
+			if (res === null || res?.ok === false) {
+				setLoadingAction(null);
+				actionFailed();
+				return;
+			}
 			await refresh();
 			setLoadingAction(null);
 		};
 
+		const hiddenPendingRef = useRef<Set<string> | null>(null);
 		const toggleModelHidden = async (id: string, hide: boolean): Promise<void> => {
-			const next = new Set(status?.hiddenModels ?? []);
+			// Merge against the PENDING set, not the last-rendered snapshot:
+			// two rapid clicks used to read the same stale status and the
+			// second silently overwrote the first (lost update).
+			const next = new Set(hiddenPendingRef.current ?? status?.hiddenModels ?? []);
 			if (hide) next.add(id); else next.delete(id);
-			await setCfg('hiddenModels', Array.from(next));
+			hiddenPendingRef.current = next;
+			try {
+				await setCfg('hiddenModels', Array.from(next));
+			} finally {
+				if (hiddenPendingRef.current === next) hiddenPendingRef.current = null;
+			}
 		};
 
 		const setPrimary = async (id: string): Promise<void> => {
 			setLoadingAction(`primary:${id}`);
-			await postJson('/plugins/agy-link/pool/primary', { id });
+			const res = await postJson('/plugins/agy-link/pool/primary', { id });
+			if (res === null || res?.ok === false) {
+				setLoadingAction(null);
+				actionFailed();
+				return;
+			}
 			await refresh();
 			setLoadingAction(null);
 			showToast(t('account.setPrimary'), 'success');
@@ -949,7 +1039,12 @@ export function apply(ctx: ClientContext): void {
 
 		const removeAccount = async (id: string, alias: string): Promise<void> => {
 			setLoadingAction(`remove:${id}`);
-			await postJson('/plugins/agy-link/pool/remove', { id });
+			const res = await postJson('/plugins/agy-link/pool/remove', { id });
+			if (res === null || res?.ok === false) {
+				setLoadingAction(null);
+				actionFailed();
+				return;
+			}
 			await refresh();
 			setLoadingAction(null);
 			showToast(t('account.removed', { alias }), 'info');
@@ -957,7 +1052,12 @@ export function apply(ctx: ClientContext): void {
 
 		const refreshQuota = async (id?: string): Promise<void> => {
 			setLoadingAction(id ? `refresh:${id}` : 'refresh:all');
-			await postJson('/plugins/agy-link/pool/refresh-quota', { id });
+			const res = await postJson('/plugins/agy-link/pool/refresh-quota', { id });
+			if (res === null || res?.ok === false) {
+				setLoadingAction(null);
+				actionFailed();
+				return;
+			}
 			await refresh();
 			setLoadingAction(null);
 			showToast(t('quota.refreshed'), 'success');
@@ -966,7 +1066,12 @@ export function apply(ctx: ClientContext): void {
 		const saveProxy = async (id: string): Promise<void> => {
 			setLoadingAction(`proxy:${id}`);
 			const proxyUrl = proxyInputs[id];
-			await postJson('/plugins/agy-link/pool/proxy', { id, proxyUrl });
+			const res = await postJson('/plugins/agy-link/pool/proxy', { id, proxyUrl });
+			if (res === null || res?.ok === false) {
+				setLoadingAction(null);
+				actionFailed();
+				return;
+			}
 			setEditingProxyId(null);
 			await refresh();
 			setLoadingAction(null);
@@ -975,14 +1080,24 @@ export function apply(ctx: ClientContext): void {
 
 		const setMode = async (mode: string): Promise<void> => {
 			setLoadingAction(`mode:${mode}`);
-			await postJson('/plugins/agy-link/pool/mode', { mode });
+			const res = await postJson('/plugins/agy-link/pool/mode', { mode });
+			if (res === null || res?.ok === false) {
+				setLoadingAction(null);
+				actionFailed();
+				return;
+			}
 			await refresh();
 			setLoadingAction(null);
 		};
 
 		const clearCooldown = async (id?: string): Promise<void> => {
 			setLoadingAction(id ? `clearCooldown:${id}` : 'clearCooldown:all');
-			await postJson('/plugins/agy-link/pool/clear-cooldown', { id });
+			const res = await postJson('/plugins/agy-link/pool/clear-cooldown', { id });
+			if (res === null || res?.ok === false) {
+				setLoadingAction(null);
+				actionFailed();
+				return;
+			}
 			await refresh();
 			setLoadingAction(null);
 			showToast(t('account.clearCooldown'), 'success');
@@ -1434,6 +1549,12 @@ export function apply(ctx: ClientContext): void {
 				),
 			),
 			renderToastBanner(),
+			status?.credentialIsolationLimited === true
+				? h('div', { key: 'win-isolation', style: { display: 'flex', alignItems: 'flex-start', gap: '6px', padding: '8px 10px', marginBottom: '8px', background: 'var(--agy-amber-soft, rgba(245, 158, 11, 0.12))', border: '1px solid rgba(245, 158, 11, 0.45)', borderRadius: '7px', fontSize: '11.5px', color: 'var(--agy-text-primary)' } },
+					h('span', { style: { flexShrink: 0 } }, '⚠️'),
+					h('span', null, t('pool.winIsolationWarn')),
+				)
+				: null,
 			addAccountSection,
 			renderedAccountCards,
 			h('div', { style: { marginTop: '16px', paddingTop: '12px', borderTop: '1px solid var(--agy-border-divider)' } },
@@ -1597,25 +1718,13 @@ export function apply(ctx: ClientContext): void {
 	/** Session Header badge in chat toolbar */
 	const AgySessionStatus = (): unknown => {
 		const t = useAgyTranslation();
-		const [status, setStatus] = useState<StatusPayload | null>(statusCache);
+		const { status } = useAgyStatus();
+		// Wall-clock tick: cooldown dots derive from Date.now() and the payload
+		// does not change when a cooldown lapses.
+		const [, setTimeTick] = useState(0);
 		useEffect(() => {
-			let alive = true;
-			let lastJson = '';
-			const tick = async () => {
-				const st = await getStatus();
-				if (!alive || !st) return;
-				const json = JSON.stringify(st);
-				if (json !== lastJson) {
-					lastJson = json;
-					setStatus(st);
-				}
-			};
-			void tick();
-			const timer = setInterval(tick, 3000);
-			return () => {
-				alive = false;
-				clearInterval(timer);
-			};
+			const timer = setInterval(() => setTimeTick((n) => n + 1), 30_000);
+			return () => clearInterval(timer);
 		}, []);
 
 		const pool = status?.pool;
@@ -1624,8 +1733,8 @@ export function apply(ctx: ClientContext): void {
 		const activeAcc = accounts.find((a) => a.id === rawActiveId && a.enabled && !a.authRequired)
 			?? accounts.find((a) => a.enabled && !a.authRequired)
 			?? accounts[0];
-		const activeHasCooldown = activeAcc ? Object.entries(activeAcc.cooldowns).some(([, cd]) => cd && cd.cooldownUntil > Date.now()) : false;
-		const allInCooldown = accounts.length > 0 && accounts.every((a) => !a.enabled || a.authRequired || Object.entries(a.cooldowns).some(([, cd]) => cd && cd.cooldownUntil > Date.now()));
+		const activeHasCooldown = activeAcc ? Object.entries(activeAcc.cooldowns ?? {}).some(([, cd]) => cd && cd.cooldownUntil > Date.now()) : false;
+		const allInCooldown = accounts.length > 0 && accounts.every((a) => !a.enabled || a.authRequired || Object.entries(a.cooldowns ?? {}).some(([, cd]) => cd && cd.cooldownUntil > Date.now()));
 		const isAuthed = status?.auth?.phase === 'ok' || accounts.length > 0;
 		const color = status === null ? '#64748b' : status.dormantReason ? '#f59e0b' : allInCooldown ? '#f59e0b' : activeHasCooldown ? '#f59e0b' : isAuthed ? '#10b981' : '#f59e0b';
 
@@ -1633,7 +1742,11 @@ export function apply(ctx: ClientContext): void {
 		const displayAlias = activeAcc ? (activeAcc.defaultAlias || legacyDefault
 			? activeAcc.systemHome ? t('account.defaultAlias') : t('account.aliasDefault', { number: accounts.indexOf(activeAcc) + 1 })
 			: activeAcc.alias) : '';
-		const activeDetail = activeAcc ? ` · ${t('status.inUse')}: ${displayAlias}${activeAcc.email ? ` (${activeAcc.email})` : ''}` : '';
+		// Only an ELIGIBLE account may be announced as "in use": the fallback
+		// chain can land on a disabled/quarantined slot, and the badge then
+		// claimed a dead account was serving traffic next to an amber dot.
+		const activeEligible = activeAcc !== undefined && activeAcc.enabled && !activeAcc.authRequired;
+		const activeDetail = activeAcc !== undefined && activeEligible ? ` · ${t('status.inUse')}: ${displayAlias}${activeAcc.email ? ` (${activeAcc.email})` : ''}` : '';
 		const badgeTitle = `${t('header.badgeTitle', { count: accounts.length })}${activeDetail}`;
 		const buttonLabel = displayAlias ? `AGY · ${displayAlias}` : `AGY (${accounts.length})`;
 
@@ -1704,10 +1817,12 @@ export function apply(ctx: ClientContext): void {
 	// as a terminal / diff / read / search card instead of a generic text row.
 	installAgyToolView(ctx);
 
-	// Auto-expand reasoning blocks containing full model thought prose
-	installAutoExpandReasoning();
+	// Auto-expand reasoning blocks containing full model thought prose.
+	// Installed through ctx.effect so a plugin reload DISCONNECTS the old
+	// MutationObserver instead of stacking one observer per reload.
+	ctx.effect(() => installAutoExpandReasoning());
 
 	// Draw ```mermaid fences (DSH's shiki pass has no mermaid grammar and
-	// leaves them as plain code blocks).
-	installMermaidRendering();
+	// leaves them as plain code blocks). Same lifecycle contract as above.
+	ctx.effect(() => installMermaidRendering());
 }

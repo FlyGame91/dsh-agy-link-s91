@@ -52,6 +52,7 @@ En DSH, haga clic en la insignia `AGY (n)` y seleccione **Add Account** para com
 | `defaultModel` | `DSH_AGY_DEFAULT_MODEL` | predeterminado de agy | Slug del modelo predeterminado |
 | `defaultEffort` | `DSH_AGY_DEFAULT_EFFORT` | predeterminado del modelo | `low`, `medium` o `high` |
 | `timeoutMs` | `DSH_AGY_TIMEOUT_MS` | `600000` | Timeout del watchdog en ms |
+| `longToolIdleMinutes` | `DSH_AGY_LONG_TOOL_IDLE_MINUTES` | `240` | Presupuesto de inactividad (minutos) mientras un paso de herramienta sigue abierto; `0` = mantener `timeoutMs` |
 | `workspaceRoot` | `DSH_AGY_WORKSPACE_ROOT` | cwd de la sesión | Raíz del workspace |
 
 ## Comandos `/agy`

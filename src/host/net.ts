@@ -25,10 +25,26 @@ function agentFor(proxyUrl?: string): EnvHttpProxyAgent | ProxyAgent {
   return envAgent
 }
 
+/**
+ * Default timeout for one Google endpoint call. undici's own default
+ * headers timeout is 300s, so a hung refresh-token / quota endpoint used to
+ * park the whole chain (token refresh → two endpoints → userinfo) for many
+ * minutes — enough for `/agy refresh-quota` to look dead. Callers may pass
+ * their own `signal`; it is combined with the timeout.
+ */
+export const AGY_FETCH_TIMEOUT_MS = 10_000
+
 /** fetch() honoring env proxies, or an explicit per-account proxy URL. */
 export function agyFetch(url: string, init: RequestInit = {}, proxyUrl?: string): Promise<Response> {
+  // AbortSignal.any keeps the caller's signal AND applies the default timeout;
+  // falling back to the caller's signal alone would silently drop the timeout.
+  const callerSignal = (init as { signal?: AbortSignal | null }).signal ?? undefined
+  const signal = callerSignal !== undefined
+    ? AbortSignal.any([AbortSignal.timeout(AGY_FETCH_TIMEOUT_MS), callerSignal])
+    : AbortSignal.timeout(AGY_FETCH_TIMEOUT_MS)
   return undiciFetch(url, {
     ...(init as object),
+    signal,
     dispatcher: agentFor(proxyUrl),
   }) as unknown as Promise<Response>
 }

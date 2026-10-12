@@ -18,6 +18,14 @@ export interface SessionBinding {
    * Capped (see `SENT_IMAGE_IDS_MAX`) — order is oldest-first.
    */
   sentImageIds?: string[]
+  /**
+   * The last turn on this conversation was cut mid-flight (Stop button, steer
+   * preemption, idle watchdog). agy's server-side turn has no finalized reply,
+   * so the next prompt carries an explicit "do not continue that unfinished
+   * work" boundary — without it the model answers the interrupted question
+   * instead of the newest user message.
+   */
+  interrupted?: boolean
 }
 
 /** Keep the binding file small; the oldest ids are dropped first. */
@@ -25,6 +33,10 @@ export const SENT_IMAGE_IDS_MAX = 64
 
 export class SessionStore {
   private data: Record<string, SessionBinding> = {};
+  /** Keys written by THIS process since the last persist. */
+  private readonly dirty = new Set<string>();
+  /** Keys deleted by THIS process since the last persist. */
+  private readonly removed = new Set<string>();
 
   constructor(private readonly file: string) {
     this.load();
@@ -46,16 +58,22 @@ export class SessionStore {
 
   set(key: string, b: SessionBinding): void {
     this.data[key] = b;
+    this.dirty.add(key);
+    this.removed.delete(key);
     this.persist();
   }
 
   delete(key: string): void {
     delete this.data[key];
+    this.dirty.delete(key);
+    this.removed.add(key);
     this.persist();
   }
 
   clear(): void {
+    for (const key of Object.keys(this.data)) this.removed.add(key);
     this.data = {};
+    this.dirty.clear();
     this.persist();
   }
 
@@ -63,13 +81,40 @@ export class SessionStore {
     return this.data;
   }
 
-  /** Atomic write: tmp file + rename, then merge on next load. */
+  /**
+   * Atomic write: tmp file + rename, MERGING with whatever another host
+   * process wrote in the meantime (web + headless share this file). Only the
+   * keys this process touched are overwritten and only the keys it deleted are
+   * dropped, so a concurrent writer's bindings survive instead of being
+   * clobbered — which used to cost a session its agy conversation (fresh
+   * digest-only prompt, or a binding pointing at the wrong conversation).
+   */
   private persist(): void {
     try {
       mkdirSync(dirname(this.file), { recursive: true });
+      let merged: Record<string, SessionBinding> = {};
+      if (this.dirty.size > 0 || this.removed.size > 0) {
+        try {
+          if (existsSync(this.file)) {
+            const onDisk = JSON.parse(readFileSync(this.file, 'utf8'))
+            if (onDisk && typeof onDisk === 'object') merged = onDisk as Record<string, SessionBinding>
+          }
+        } catch {
+          // unreadable/partial file: fall back to this process's view
+        }
+      }
+      for (const key of this.removed) delete merged[key];
+      for (const key of this.dirty) {
+        const b = this.data[key]
+        if (b !== undefined) merged[key] = b
+      }
       const tmp = join(dirname(this.file), '.' + require$$basename(this.file) + '.tmp')
-      writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8')
+      writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8')
       renameSync(tmp, this.file);
+      // Adopt the merge so this process sees keys other hosts contributed.
+      this.data = merged;
+      this.dirty.clear();
+      this.removed.clear();
     } catch {
       // best-effort persistence; memory copy still serves this process
     }

@@ -39,3 +39,21 @@ test('all returns a readonly snapshot', () => {
   s.set('a', { conversationId: 'x', lastMessageCount: 0, updatedAt: 1 })
   assert.equal(Object.keys(s.all()).length, 1)
 })
+
+test('a concurrent writer does not lose the other host bindings (dirty-key merge)', () => {
+  const mergeFile = join(dir, 'merge.json')
+  rmSync(mergeFile, { force: true })
+  const web = new SessionStore(mergeFile)
+  const headless = new SessionStore(mergeFile)
+  // Both hosts loaded an empty file, then each writes its own session.
+  web.set('session-a', { conversationId: 'ca', lastMessageCount: 1, updatedAt: 1 })
+  headless.set('session-b', { conversationId: 'cb', lastMessageCount: 2, updatedAt: 2 })
+  const onDisk = JSON.parse(readFileSync(mergeFile, 'utf8')) as Record<string, unknown>
+  assert.ok('session-a' in onDisk, 'the first host binding must survive the second host write')
+  assert.ok('session-b' in onDisk)
+  assert.equal(new SessionStore(mergeFile).get('session-a')?.conversationId, 'ca')
+  // Deletions still win over a concurrent re-add of the SAME key.
+  headless.delete('session-a')
+  assert.equal(new SessionStore(mergeFile).get('session-a'), undefined)
+  assert.equal(new SessionStore(mergeFile).get('session-b')?.conversationId, 'cb')
+})

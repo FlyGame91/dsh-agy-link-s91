@@ -18,7 +18,7 @@
 // show the real oldText/newText content.
 import { execFile } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
-import { readFile, unlink, copyFile, stat, mkdir } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, unlink, copyFile, stat, mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { tmpdir } from 'node:os'
@@ -97,6 +97,22 @@ const TOOL_STEP_TYPES = new Set([5, 7, 8, 9, 17, 21, 33, 101, 132, 138, 139])
 const MAX_CACHE_AGE_MS = 300_000 // 5 minutes
 let cache: AgyDbCache | null = null
 let cacheTime = 0
+
+/**
+ * Failure backoff state. Without it, a missing `sqlite3` binary (or an
+ * oversized/locked DB) made EVERY step event re-spawn sqlite3: the empty
+ * result was cached as `loaded: true` with empty maps, every new stepIndex
+ * missed, and the spawn storm repeated for the whole session with no log.
+ *  - ENOENT (binary absent): negative-cache for the full cache window.
+ *  - Other failures (lock, maxBuffer, parse): short backoff so the adapter's
+ *    deliberate 50-100ms WAL-flush retries still get a fresh chance.
+ */
+let lastFailureAt = 0
+let failureWindowMs = 0
+let warnedUnavailable = false
+
+/** In-flight loader: parallel readFullToolArgs/readStepThoughts share one spawn. */
+let loadInFlight: { key: string; promise: Promise<AgyDbData> } | null = null
 
 /** agy conversation ids are path-safe tokens; reject anything else before join(). */
 const SAFE_CONVERSATION_ID = /^[A-Za-z0-9_-]{1,64}$/
@@ -260,8 +276,49 @@ export function extractStepThoughts(payload: Buffer): string | null {
 }
 
 /**
+ * node:sqlite reader (Node >= 22.5, REQUIRED node >= 24 for this plugin).
+ * Preferred over the sqlite3 CLI: GUI/desktop hosts often lack the CLI on
+ * PATH (macOS GUI apps do not inherit the shell PATH; Windows never ships
+ * one), which is exactly the "thinking/tool args invisible on desktop"
+ * report (issue #43). `undefined` = not probed yet, `null` = unavailable.
+ */
+let nodeSqliteQuery: ((dbPath: string, sql: string) => Promise<string[]>) | null | undefined
+
+async function queryViaNodeSqlite(dbPath: string, sql: string): Promise<string[]> {
+	if (nodeSqliteQuery === null) throw new Error('node:sqlite unavailable')
+	if (nodeSqliteQuery === undefined) {
+		try {
+			const mod = (await import('node:sqlite')) as {
+				DatabaseSync?: new (path: string, options?: { open?: boolean }) => {
+					prepare(sql: string): { all(...params: unknown[]): unknown[] }
+					close(): void
+				}
+			}
+			if (typeof mod.DatabaseSync !== 'function') throw new Error('DatabaseSync missing')
+			const Database = mod.DatabaseSync
+			nodeSqliteQuery = async (p, q) => {
+				// Open read-write so the copied -wal can be replayed into the
+				// temp copy; the copy is ours and chmod'd 0600.
+				const db = new Database(p)
+				try {
+					const rows = db.prepare(q).all() as Array<{ idx?: unknown; step_type?: unknown; payload_hex?: unknown }>
+					return rows.map((r) => `${String(r.idx)}|${String(r.step_type)}|${typeof r.payload_hex === 'string' ? r.payload_hex : ''}`)
+				} finally {
+					db.close()
+				}
+			}
+		} catch (err) {
+			nodeSqliteQuery = null
+			throw err instanceof Error ? err : new Error(String(err))
+		}
+	}
+	return nodeSqliteQuery(dbPath, sql)
+}
+
+/**
  * Copy the agy SQLite DB to a temp path (avoiding WAL lock issues), then
- * query tool and thought step payloads via sqlite3 CLI.
+ * query tool and thought step payloads — node:sqlite first, sqlite3 CLI as
+ * the fallback reader.
  */
 async function loadAgyDbData(conversationId: string, accountHome?: string): Promise<AgyDbData> {
   const steps = new Map<number, CachedStep>()
@@ -272,22 +329,44 @@ async function loadAgyDbData(conversationId: string, accountHome?: string): Prom
   if (dbPath === null) return { steps, thoughts, seenSteps }
 
   // Copy to temp to avoid WAL/shared-lock issues. Also copy -wal and -shm so
-  // recent writes in WAL mode are visible.
+  // recent writes in WAL mode are visible. A private mkdtemp directory (0700)
+  // replaces the old predictable /tmp filename, and the copy is chmod'd 0600:
+  // the DB carries the full conversation content and inherited the source
+  // file's permissions before.
+  let tmpDir: string | null = null
   const tmpDb = join(tmpdir(), `agy-db-${conversationId.slice(0, 8)}-${Date.now()}.db`)
   try {
-    await copyFile(dbPath, tmpDb)
-    try { await copyFile(dbPath + '-wal', tmpDb + '-wal') } catch { /* ignore */ }
-    try { await copyFile(dbPath + '-shm', tmpDb + '-shm') } catch { /* ignore */ }
+    tmpDir = await mkdtemp(join(tmpdir(), 'agy-db-'))
+    const target = join(tmpDir, 'conversation.db')
+    await copyFile(dbPath, target)
+    await chmod(target, 0o600).catch(() => undefined)
+    try { await copyFile(dbPath + '-wal', target + '-wal') } catch { /* ignore */ }
+    try { await copyFile(dbPath + '-shm', target + '-shm') } catch { /* ignore */ }
 
-    // Query tool-type steps AND text/thinking steps with payload > 20 bytes
-    const sql = `SELECT idx, step_type, hex(step_payload) FROM steps WHERE (step_type IN (5,7,8,9,14,15,17,21,33,101,132,138,139)) AND length(step_payload) > 20`
-    const { stdout } = await execFileAsync('sqlite3', [tmpDb, sql], {
-      timeout: 5_000,
-      encoding: 'utf-8',
-      maxBuffer: 25 * 1024 * 1024,
-    })
+    // Query tool-type steps AND text/thinking steps with payload > 20 bytes.
+    // node:sqlite first (no external binary — desktop hosts, issue #43);
+    // the sqlite3 CLI stays as the fallback for runtimes without node:sqlite.
+    const sql = `SELECT idx, step_type, hex(step_payload) AS payload_hex FROM steps WHERE (step_type IN (5,7,8,9,14,15,17,21,33,101,132,138,139)) AND length(step_payload) > 20`
+    let lines: string[] | null = null
+    try {
+      lines = await queryViaNodeSqlite(target, sql)
+    } catch {
+      try {
+        const { stdout } = await execFileAsync('sqlite3', [target, sql], {
+          timeout: 5_000,
+          encoding: 'utf-8',
+          maxBuffer: 25 * 1024 * 1024,
+        })
+        lines = stdout.split('\n')
+      } catch {
+        lines = null
+      }
+    }
+    if (lines === null) {
+      throw new Error('no sqlite reader available (node:sqlite and sqlite3 CLI both failed)')
+    }
 
-    for (const line of stdout.split('\n')) {
+    for (const line of lines) {
       const firstPipe = line.indexOf('|')
       if (firstPipe < 0) continue
       const secondPipe = line.indexOf('|', firstPipe + 1)
@@ -316,12 +395,36 @@ async function loadAgyDbData(conversationId: string, accountHome?: string): Prom
         }
       }
     }
-  } catch {
-    // DB locked, sqlite3 missing, or parse error — graceful fallback
+    lastFailureAt = 0
+    failureWindowMs = 0
+  } catch (err) {
+    // DB locked, sqlite3 missing, or parse error — graceful fallback, but
+    // now BACKED OFF so callers cannot turn this into a spawn storm, and
+    // WARNED ONCE so the degradation is visible.
+    const code = (err as { code?: string }).code
+    if (code === 'ENOENT') {
+      // sqlite3 CLI not installed: re-probing per event is pure waste.
+      failureWindowMs = MAX_CACHE_AGE_MS
+    } else {
+      failureWindowMs = 300
+    }
+    lastFailureAt = Date.now()
+    if (!warnedUnavailable) {
+      warnedUnavailable = true
+      try {
+        console.error('[dsh-agy-link] agy conversation DB unavailable (' + String(err) + ') — falling back to stream-carried metadata only' + (code === 'ENOENT' ? '; install the sqlite3 CLI for full tool args and thoughts' : ''))
+      } catch {
+        // ignore
+      }
+    }
   } finally {
-    try { await unlink(tmpDb) } catch { /* ignore cleanup errors */ }
-    try { await unlink(tmpDb + '-wal') } catch { /* ignore */ }
-    try { await unlink(tmpDb + '-shm') } catch { /* ignore */ }
+    if (tmpDir !== null) {
+      try { await rm(tmpDir, { recursive: true, force: true }) } catch { /* ignore cleanup errors */ }
+    } else {
+      try { await unlink(tmpDb) } catch { /* ignore cleanup errors */ }
+      try { await unlink(tmpDb + '-wal') } catch { /* ignore */ }
+      try { await unlink(tmpDb + '-shm') } catch { /* ignore */ }
+    }
   }
 
   return { steps, thoughts, seenSteps }
@@ -448,6 +551,39 @@ function scanFallbackJson(payload: Buffer): CachedStep | null {
 }
 
 /**
+ * Shared loader behind readFullToolArgs/readStepThoughts: deduplicates
+ * concurrent callers into ONE spawn, and honors the failure backoff so a
+ * missing/failing sqlite3 cannot turn every step event into a re-spawn.
+ */
+async function loadCached(conversationId: string, accountHome?: string): Promise<void> {
+  const now = Date.now()
+  // Negative-cache window after a failed load: serve the (empty) cached view
+  // instead of re-spawning per event.
+  if (lastFailureAt !== 0 && now - lastFailureAt < failureWindowMs) return
+
+  const key = conversationId + '|' + (accountHome ?? '')
+  if (loadInFlight !== null && loadInFlight.key === key) {
+    await loadInFlight.promise
+    return
+  }
+  const promise = loadAgyDbData(conversationId, accountHome)
+  loadInFlight = { key, promise }
+  try {
+    const data = await promise
+    cache = {
+      conversationId,
+      steps: data.steps,
+      thoughts: data.thoughts,
+      checkedSteps: data.seenSteps,
+      loaded: true,
+    }
+    cacheTime = now
+  } finally {
+    if (loadInFlight !== null && loadInFlight.promise === promise) loadInFlight = null
+  }
+}
+
+/**
  * Read the full tool parameter object for a given step index from the agy
  * conversation database. Returns null when the DB is unavailable or does
  * not contain the requested step.
@@ -469,18 +605,9 @@ export async function readFullToolArgs(
     if (cache.checkedSteps.has(stepIndex)) return null
   }
 
-  // Load (or reload) the full tool step and thought map
-  const data = await loadAgyDbData(conversationId, accountHome)
-  cache = {
-    conversationId,
-    steps: data.steps,
-    thoughts: data.thoughts,
-    checkedSteps: data.seenSteps,
-    loaded: true,
-  }
-  cacheTime = now
+  await loadCached(conversationId, accountHome)
 
-  return data.steps.get(stepIndex) ?? null
+  return cache?.steps.get(stepIndex) ?? null
 }
 
 /**
@@ -502,23 +629,16 @@ export async function readStepThoughts(
     if (cache.checkedSteps.has(stepIndex)) return null
   }
 
-  // Load (or reload) the full tool step and thought map
-  const data = await loadAgyDbData(conversationId, accountHome)
-  cache = {
-    conversationId,
-    steps: data.steps,
-    thoughts: data.thoughts,
-    checkedSteps: data.seenSteps,
-    loaded: true,
-  }
-  cacheTime = now
+  await loadCached(conversationId, accountHome)
 
-  return data.thoughts.get(stepIndex) ?? null
+  return cache?.thoughts.get(stepIndex) ?? null
 }
 
 /** Clear the DB cache (e.g. when a run settles). */
 export function clearAgyDbCache(): void {
   cache = null
+  lastFailureAt = 0
+  failureWindowMs = 0
 }
 
 /**
@@ -530,4 +650,6 @@ export function __setAgyDbDirForTest(dir: string): void {
   AGY_DB_DIR = dir
   cache = null
   cacheTime = 0
+  lastFailureAt = 0
+  failureWindowMs = 0
 }

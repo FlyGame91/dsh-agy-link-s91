@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Fake agy CLI for offline tests. Modes via FAKE_AGY_MODE env:
-//   ok | auth | noise | exit12 | exit-error | real | real-error | real-quota
+//   ok | auth | auth-network | noise | exit12 | exit-error | real | real-error | real-quota
+//   real-fail (soft capacity) | real-bare (deterministic bare result error)
+//   quota-once (account-scoped failure on the FIRST invocation only, then succeeds)
 //   location-denied — result envelope with the real "User location is not supported" refusal, exit 3
 //   ok            — legacy flat event shapes (kept for compat coverage)
 //   real          — real agy 1.1.15 stream-json shapes (nested step_update
@@ -11,10 +13,20 @@
 //   exit-error    — stdout error envelope + exit 1 + empty stderr (the real
 //                   silent-failure shape that hid causes behind "exited 1")
 // Records its argv (JSON) to FAKE_AGY_ARGS_FILE when set.
-import { writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 
 const argv = process.argv.slice(2)
 const mode = process.env.FAKE_AGY_MODE ?? 'ok'
+/** How many times this fake has run (used by fail-then-succeed modes). */
+let invocation = 0
+if (process.env.FAKE_AGY_INVOCATION_FILE) {
+  try {
+    const f = process.env.FAKE_AGY_INVOCATION_FILE
+    const prev = existsSync(f) ? readFileSync(f, 'utf8') : ''
+    invocation = prev.split('\n').filter(Boolean).length
+    writeFileSync(f, prev + 'x\n')
+  } catch { /* counting is best-effort */ }
+}
 if (process.env.FAKE_AGY_ARGS_FILE) {
   try { writeFileSync(process.env.FAKE_AGY_ARGS_FILE, JSON.stringify(argv)) } catch {}
 }
@@ -115,11 +127,32 @@ if (mode === 'auth') {
   process.exit(0)
 }
 
+// Auth-shaped refusal wrapped in a TRANSPORT failure — the live 2026-10-10
+// shape: the stored token could not be validated because the token endpoint
+// died, so agy reports "not logged into Antigravity" for a healthy login.
+if (mode === 'auth-network') {
+  process.stderr.write('Print mode: token validation failed due to network error (token may still be valid): Post "https://oauth2.googleapis.com/token": EOF\n')
+  process.stdout.write('Print mode: silent auth failed\n')
+  process.stdout.write('Please sign in\n')
+  emit({ event: 'result', result: { conversation_id: '', status: 'ERROR', error: 'You are not logged into Antigravity.' } })
+  process.exit(1)
+}
+
+// Streams its conversation id, then stays busy long enough for a caller to
+// abort mid-flight (interrupted-turn bookkeeping tests).
+if (mode === 'slow-init') {
+  emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+  emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 0, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'working' } })
+  await sleep(Number(process.env.FAKE_AGY_DELAY_MS ?? 2000))
+  emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: 'late answer', duration_seconds: 2, num_turns: 1, usage: { input_tokens: 10, output_tokens: 2 } } })
+  process.exit(0)
+}
+
 if (mode === 'noise') {
   process.stdout.write('\u26a0 fetching model catalog\n')
   emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
   process.stdout.write('some progress noise\n')
-} else if (mode === 'real' || mode === 'real-error' || mode === 'real-denied' || mode === 'real-fail' || mode === 'real-quota') {
+} else if (mode === 'real' || mode === 'real-error' || mode === 'real-denied' || mode === 'real-fail' || mode === 'real-quota' || mode === 'real-bare' || mode === 'quota-once') {
   // Shapes captured from a live agy 1.1.15 binary
   // (`--output-format stream-json --mode plan --model ... --effort ...`).
   emit({ event: 'init', conversation_id: conv, init: { model: 'gemini-3-7-flash', cwd: '/tmp', tools: ['run_command', 'read_file'] } })
@@ -150,10 +183,23 @@ if (mode === 'noise') {
     // Real server hard-quota refusal (observed live): the account is spent, so
     // the adapter must cool it down and let the retry use another account.
     emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h54m14s.', duration_seconds: 5, num_turns: 1, usage: { input_tokens: 100, output_tokens: 0 } } })
+  } else if (mode === 'quota-once' && invocation === 0) {
+    // First invocation spends the account AFTER a tool step, so the failure
+    // surfaces in a tool-continuation span (the shape that used to replay the
+    // dead recording instead of failing over). Later invocations succeed.
+    emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h54m14s.', duration_seconds: 5, num_turns: 1, usage: { input_tokens: 100, output_tokens: 0 } } })
+  } else if (mode === 'real-bare') {
+    // Bare result error with NO response — must still surface a diagnosable
+    // code (not a bare "exited 1"), and it is NOT account-scoped.
+    emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: 'upstream request failed while generating (request id 8f3ac2)', duration_seconds: 5, num_turns: 1, usage: { input_tokens: 100, output_tokens: 0 } } })
   } else if (mode === 'real-fail') {
     emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: 'model overloaded', duration_seconds: 5, num_turns: 1, usage: { input_tokens: 100, output_tokens: 0 } } })
   } else if (mode === 'real') {
     emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: 'There are 2 files, 6 words total.', duration_seconds: 5, num_turns: 1, usage: { input_tokens: 900, output_tokens: 100, thinking_tokens: 95, cache_read_tokens: 200, total_tokens: 1000 } } })
+  } else if (mode === 'quota-once') {
+    // Second and later invocations: the account that survived the failover
+    // answers normally.
+    emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: 'answered after failover', duration_seconds: 2, num_turns: 1, usage: { input_tokens: 700, output_tokens: 40, total_tokens: 740 } } })
   } else {
     emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: 'There are 2 files, 6 words total.', error: toolError, duration_seconds: 5, num_turns: 1, usage: { input_tokens: 900, output_tokens: 100, thinking_tokens: 95, cache_read_tokens: 200, total_tokens: 1000 } } })
   }

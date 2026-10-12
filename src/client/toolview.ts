@@ -335,7 +335,7 @@ function isError(block: ToolBlock): boolean {
 const TERMINAL_TOOLS = new Set(['run_command', 'bash', 'execute_command']);
 const DIFF_TOOLS = new Set(['replace_file_content', 'edit_file', 'replace_in_file', 'edit', 'write_to_file', 'write_file', 'create_file']);
 const READ_TOOLS = new Set(['read_file', 'view_file', 'read', 'open_file']);
-const SEARCH_TOOLS = new Set(['find_by_name', 'glob', 'search_files', 'grep_search', 'search', 'search_file_content', 'grep']);
+const SEARCH_TOOLS = new Set(['find_by_name', 'glob', 'search_files', 'grep_search', 'search', 'search_file_content', 'grep', 'search_web', 'web_search']);
 const LIST_TOOLS = new Set(['list_dir', 'ls']);
 const DELETE_TOOLS = new Set(['delete_file', 'remove_file', 'rm']);
 
@@ -455,22 +455,46 @@ function cls(...names: Array<string | false | null | undefined>): string {
 	return names.filter((n): n is string => typeof n === 'string' && n !== '').join(' ');
 }
 
-function displayTitle(model: MirrorCardModel): string {
+type Translate = (key: string, params?: Record<string, unknown>) => string;
+
+/**
+ * Locale lookup with an English fallback: the mirror card renders through
+ * host-provided `t` when the registration declares the namespace, but tests
+ * and hosts without the seat call it bare. The old literals were mixed
+ * 中文 and English as BOTH fallback and primary, so non-Chinese users saw
+ * Chinese buttons on mirror cards.
+ */
+function tr(t: Translate | undefined, key: string, fallback: string, params?: Record<string, unknown>): string {
+	if (typeof t === 'function') {
+		try {
+			const v = t(key, params);
+			if (typeof v === 'string' && v !== '' && v !== key) return v;
+		} catch {
+			// unbound namespace — fall through
+		}
+	}
+	if (params !== undefined && params.count !== undefined && fallback.includes('{count}')) {
+		return fallback.replace('{count}', String(params.count));
+	}
+	return fallback;
+}
+
+function displayTitle(model: MirrorCardModel, t?: Translate): string {
 	switch (model.kind) {
 		case 'terminal':
-			return 'Command';
+			return tr(t, 'tv.command', 'Command');
 		case 'diff':
-			return (model.tool === 'write_to_file' || model.tool === 'write_file' || model.tool === 'create_file') ? 'Write' : 'Edit';
+			return (model.tool === 'write_to_file' || model.tool === 'write_file' || model.tool === 'create_file') ? tr(t, 'tv.write', 'Write') : tr(t, 'tv.edit', 'Edit');
 		case 'read':
-			return 'Read';
+			return tr(t, 'tv.read', 'Read');
 		case 'search':
-			return 'Search';
+			return (model.tool === 'search_web' || model.tool === 'web_search') ? tr(t, 'tv.webSearch', 'Web Search') : tr(t, 'tv.search', 'Search');
 		case 'list':
-			return 'List';
+			return tr(t, 'tv.list', 'List');
 		case 'delete':
-			return 'Delete';
+			return tr(t, 'tv.delete', 'Delete');
 		default:
-			return model.tool ? model.tool.replace(/_/g, ' ') : 'Tool';
+			return model.tool ? model.tool.replace(/_/g, ' ') : tr(t, 'tv.tool', 'Tool');
 	}
 }
 
@@ -487,7 +511,7 @@ function displaySummary(model: MirrorCardModel, cwd?: string, home?: string): st
 		return rawPath !== '' ? relativize(rawPath, cwd, home) : model.title;
 	}
 	if (model.kind === 'search') {
-		return model.title.replace(/^Search\s*/i, '') || model.title;
+		return model.title.replace(/^(Web search|Search)\s*/i, '') || model.title;
 	}
 	if (model.kind === 'list') {
 		return model.title.replace(/^List\s*(directory\s*)?/i, '') || model.title;
@@ -508,17 +532,21 @@ function diffStat(model: MirrorCardModel): string | null {
 
 // ---- Copy button component ------------------------------------------------
 
-function CopyButton({ text, labels }: { text: string; labels?: readonly [string, string] }): unknown {
+function CopyButton({ text, labels, t }: { text: string; labels?: readonly [string, string]; t?: Translate }): unknown {
 	const [copied, setCopied] = react().useState(false);
-	const copyLabel = labels?.[0] ?? '复制';
-	const copiedLabel = labels?.[1] ?? '已复制';
+	const copyLabel = labels?.[0] ?? tr(t, 'code.copy', 'Copy');
+	const copiedLabel = labels?.[1] ?? tr(t, 'code.copied', 'Copied');
 	const onCopy = (e: { stopPropagation: () => void }) => {
 		e.stopPropagation();
 		if (typeof navigator !== 'undefined' && navigator.clipboard) {
 			navigator.clipboard.writeText(text).then(() => {
 				setCopied(true);
 				setTimeout(() => setCopied(false), 1500);
-			}).catch(() => {});
+			}).catch(() => {
+				// Clipboard unavailable (insecure context): show the failure on
+				// the button instead of silently doing nothing.
+				setCopied(false);
+			});
 		}
 	};
 	return hx('button', {
@@ -534,45 +562,57 @@ function CopyButton({ text, labels }: { text: string; labels?: readonly [string,
 
 // ---- Diff body renderer ---------------------------------------------------
 
-function DiffBody({ model }: { model: MirrorCardModel; openFile?: (p: string, o?: unknown) => void; cwd?: string; home?: string }): unknown {
+/** Per-side render cap: a 5000-line write_to_file used to build 10k DOM rows
+ *  inside a max-height:280px pane (99% of them invisible). */
+const DIFF_MAX_LINES = 400;
+
+function DiffBody({ model, t }: { model: MirrorCardModel; openFile?: (p: string, o?: unknown) => void; cwd?: string; home?: string; t?: Translate }): unknown {
 	const h = hx;
 	const oldText = model.oldText ?? '';
 	const newText = model.newText ?? '';
 	const rows: unknown[] = [];
+	const moreRow = (count: number, key: string): unknown =>
+		h('div', { key, className: 'agy-tv-diff-line', style: { color: 'var(--dsw-alias-label-tertiary)' } },
+			tr(t, 'tv.diffMore', '… {count} more lines not rendered', { count }));
 	if (oldText !== '') {
 		const lines = oldText.split('\n');
-		for (let i = 0; i < lines.length; i++) {
+		const shown = Math.min(lines.length, DIFF_MAX_LINES);
+		for (let i = 0; i < shown; i++) {
 			const line = lines[i];
 			rows.push(h('div', { key: 'del-' + i, className: 'agy-tv-diff-line agy-tv-diff-del' },
 				h('span', { className: 'agy-tv-diff-marker' }, '-'),
 				h('span', { style: { flex: 1 } }, line === '' ? ' ' : line)
 			));
 		}
+		if (lines.length > shown) rows.push(moreRow(lines.length - shown, 'del-more'));
 	}
 	if (newText !== '') {
 		const lines = newText.split('\n');
-		for (let i = 0; i < lines.length; i++) {
+		const shown = Math.min(lines.length, DIFF_MAX_LINES);
+		for (let i = 0; i < shown; i++) {
 			const line = lines[i];
 			rows.push(h('div', { key: 'add-' + i, className: 'agy-tv-diff-line agy-tv-diff-add' },
 				h('span', { className: 'agy-tv-diff-marker' }, '+'),
 				h('span', { style: { flex: 1 } }, line === '' ? ' ' : line)
 			));
 		}
+		if (lines.length > shown) rows.push(moreRow(lines.length - shown, 'add-more'));
 	}
 	if (rows.length === 0) {
-		rows.push(h('div', { key: 'empty', className: 'agy-tv-diff-line', style: { color: 'var(--dsw-alias-label-tertiary)' } }, '(no textual changes)'));
+		rows.push(h('div', { key: 'empty', className: 'agy-tv-diff-line', style: { color: 'var(--dsw-alias-label-tertiary)' } }, tr(t, 'tv.noChanges', '(no textual changes)')));
 	}
 	return h('div', { className: 'agy-tv-diff-list' }, ...rows);
 }
 
 // ---- Card body renderer ---------------------------------------------------
 
-function CardBody({ model, openFile, cwd, home, inspect }: {
+function CardBody({ model, openFile, cwd, home, inspect, t }: {
 	model: MirrorCardModel;
 	openFile?: (p: string, o?: unknown) => void;
 	cwd?: string;
 	home?: string;
 	inspect?: () => void;
+	t?: Translate;
 }): unknown {
 	const h = hx;
 	const inspectNode = inspect !== undefined
@@ -581,13 +621,13 @@ function CardBody({ model, openFile, cwd, home, inspect }: {
 				type: 'button',
 				className: 'agy-tv-inspect-btn',
 				onClick: inspect,
-			}, IconInspectOutline12(12), '检查')
+			}, IconInspectOutline12(12), tr(t, 'code.inspect', 'Inspect'))
 		)
 		: null;
 
 	switch (model.kind) {
 		case 'terminal': {
-			const rawBody = model.output !== undefined && model.output !== '' ? trimTrailingBlankLines(model.output) : '(no output)';
+			const rawBody = model.output !== undefined && model.output !== '' ? trimTrailingBlankLines(model.output) : tr(t, 'tv.noOutput', '(no output)');
 			const copyText = model.output !== undefined && model.output !== '' ? model.output : (model.command ?? '');
 			return h('div', { className: 'agy-tv-card' },
 				h('div', { className: 'agy-tv-card-header' },
@@ -596,7 +636,7 @@ function CardBody({ model, openFile, cwd, home, inspect }: {
 						...(model.cwd ? [h('span', { key: 'cwd', className: 'agy-tv-card-cwd' }, model.cwd)] : []),
 						h('span', { className: 'agy-tv-card-cmd', title: model.command }, model.command ?? '')
 					),
-					h(CopyButton, { text: copyText })
+					h(CopyButton, { text: copyText, t })
 				),
 				h('pre', { className: 'agy-tv-card-content' }, clip(rawBody, 16000)),
 				inspectNode
@@ -616,49 +656,49 @@ function CardBody({ model, openFile, cwd, home, inspect }: {
 					),
 					h(CopyButton, { text: copyText })
 				),
-				h(DiffBody, { model, openFile, cwd, home }),
+				h(DiffBody, { model, openFile, cwd, home, t }),
 				inspectNode
 			);
 		}
 		case 'read': {
 			const path = model.path ?? 'file';
 			const pathLabel = relativize(path, cwd, home);
-			const rawBody = model.output !== undefined && model.output !== '' ? trimTrailingBlankLines(model.output) : '(no output)';
+			const rawBody = model.output !== undefined && model.output !== '' ? trimTrailingBlankLines(model.output) : tr(t, 'tv.noOutput', '(no output)');
 			return h('div', { className: 'agy-tv-card' },
 				h('div', { className: 'agy-tv-card-header' },
 					h('div', { className: 'agy-tv-card-header-left' },
 						IconBrowseOutline16(13),
 						h('span', { className: 'agy-tv-card-path' }, pathLabel)
 					),
-					h(CopyButton, { text: model.output ?? '' })
+					h(CopyButton, { text: model.output ?? '', t })
 				),
 				h('pre', { className: 'agy-tv-card-content' }, clip(rawBody, 16000)),
 				inspectNode
 			);
 		}
 		case 'search': {
-			const rawBody = model.output !== undefined && model.output !== '' ? trimTrailingBlankLines(model.output) : '(no matches)';
+			const rawBody = model.output !== undefined && model.output !== '' ? trimTrailingBlankLines(model.output) : tr(t, 'tv.noMatches', '(no matches)');
 			return h('div', { className: 'agy-tv-card' },
 				h('div', { className: 'agy-tv-card-header' },
 					h('div', { className: 'agy-tv-card-header-left' },
 						IconSearchOutline16(13),
 						h('span', { className: 'agy-tv-card-path' }, model.title)
 					),
-					h(CopyButton, { text: model.output ?? '' })
+					h(CopyButton, { text: model.output ?? '', t })
 				),
 				h('pre', { className: 'agy-tv-card-content' }, clip(rawBody, 16000)),
 				inspectNode
 			);
 		}
 		case 'list': {
-			const rawBody = model.output !== undefined && model.output !== '' ? trimTrailingBlankLines(model.output) : '(empty directory)';
+			const rawBody = model.output !== undefined && model.output !== '' ? trimTrailingBlankLines(model.output) : tr(t, 'tv.emptyDir', '(empty directory)');
 			return h('div', { className: 'agy-tv-card' },
 				h('div', { className: 'agy-tv-card-header' },
 					h('div', { className: 'agy-tv-card-header-left' },
 						IconBrowseOutline16(13),
 						h('span', { className: 'agy-tv-card-path' }, model.title)
 					),
-					h(CopyButton, { text: model.output ?? '' })
+					h(CopyButton, { text: model.output ?? '', t })
 				),
 				h('pre', { className: 'agy-tv-card-content' }, clip(rawBody, 16000)),
 				inspectNode
@@ -668,14 +708,14 @@ function CardBody({ model, openFile, cwd, home, inspect }: {
 			const copyText = model.output !== undefined && model.output !== '' ? model.output : (model.raw ?? '');
 			const rawBody = model.output !== undefined && model.output !== ''
 				? trimTrailingBlankLines(model.output)
-				: (model.raw !== undefined && model.raw !== '' ? clip(model.raw, 4000) : '(no detail)');
+				: (model.raw !== undefined && model.raw !== '' ? clip(model.raw, 4000) : tr(t, 'tv.noDetail', '(no detail)'));
 			return h('div', { className: 'agy-tv-card' },
 				h('div', { className: 'agy-tv-card-header' },
 					h('div', { className: 'agy-tv-card-header-left' },
 						IconCodeOutline16(13),
 						h('span', { className: 'agy-tv-card-path' }, model.tool || 'Tool')
 					),
-					h(CopyButton, { text: copyText })
+					h(CopyButton, { text: copyText, t })
 				),
 				h('pre', { className: 'agy-tv-card-content' }, clip(rawBody, 16000)),
 				inspectNode
@@ -689,12 +729,12 @@ function CardBody({ model, openFile, cwd, home, inspect }: {
 export function AgyMirrorToolView(props: AgyToolViewProps): unknown {
 	const [open, setOpen] = useToggle(false);
 	const h = hx;
-	const { block, cwd, home, openFile, inspect } = props;
+	const { block, cwd, home, openFile, inspect, t } = props;
 	const settle = isSettled(block);
 	const err = isError(block);
 	const model = mirrorCardModel(block, cwd, home);
 	const state: 'ok' | 'err' | 'run' = !settle ? 'run' : err ? 'err' : 'ok';
-	const title = displayTitle(model);
+	const title = displayTitle(model, t);
 	const summary = displaySummary(model, cwd, home);
 	const stat = diffStat(model);
 	const preview = !open && model.kind !== 'diff' ? previewLine(model, cwd, home) : undefined;
@@ -743,8 +783,8 @@ export function AgyMirrorToolView(props: AgyToolViewProps): unknown {
 			}
 		},
 		title: inspect !== undefined
-			? (open ? 'Click to collapse · right-click to inspect' : 'Click to expand · right-click to inspect')
-			: (open ? 'Click to collapse' : 'Click to expand'),
+			? (open ? tr(t, 'tv.hint.collapseInspect', 'Click to collapse · right-click to inspect') : tr(t, 'tv.hint.expandInspect', 'Click to expand · right-click to inspect'))
+			: (open ? tr(t, 'tv.hint.collapse', 'Click to collapse') : tr(t, 'tv.hint.expand', 'Click to expand')),
 		onContextMenu: inspect !== undefined ? (e: { preventDefault: () => void }) => { e.preventDefault(); inspect(); } : undefined,
 	},
 		leading,
@@ -762,7 +802,7 @@ export function AgyMirrorToolView(props: AgyToolViewProps): unknown {
 	},
 		header,
 		...(open ? [h('div', { key: 'wrap', className: 'agy-tv-body-wrap' },
-			h(CardBody, { model, openFile, cwd, home, inspect })
+			h(CardBody, { model, openFile, cwd, home, inspect, t })
 		)] : [])
 	);
 }
@@ -842,8 +882,8 @@ export function AgyCodeToolView(props?: AgyToolViewProps): unknown {
 			}
 		},
 		title: inspect !== undefined
-			? (open ? 'Click to collapse · right-click to inspect' : 'Click to expand · right-click to inspect')
-			: (open ? 'Click to collapse' : 'Click to expand'),
+			? (open ? tr(t, 'tv.hint.collapseInspect', 'Click to collapse · right-click to inspect') : tr(t, 'tv.hint.expandInspect', 'Click to expand · right-click to inspect'))
+			: (open ? tr(t, 'tv.hint.collapse', 'Click to collapse') : tr(t, 'tv.hint.expand', 'Click to expand')),
 		onContextMenu: inspect !== undefined ? (e: { preventDefault: () => void }) => { e.preventDefault(); inspect(); } : undefined,
 	},
 		leading,
@@ -903,7 +943,7 @@ function AgyRunCodeToolView(props?: unknown): unknown {
 			}),
 		},
 	} as unknown as ToolBlock;
-	return AgyMirrorToolView({ block: synthetic } as never);
+	return AgyMirrorToolView({ block: synthetic, t: typed?.t } as never);
 }
 
 export function installAgyToolView(ctx: {
@@ -914,7 +954,9 @@ export function installAgyToolView(ctx: {
 }): void {
 	ctx.slots.inject('tool.call.toolview', () => {
 		const d1 = ctx.slots.register(
-			{ name: 'tool.call.toolview', key: 'agy_tool', id: 'agy-tool-view', label: 'Antigravity tool' },
+			// locale: NS seats `t` so mirror cards localize titles/buttons like
+			// the run_code view does (they used to hard-code 中文 + English).
+			{ name: 'tool.call.toolview', key: 'agy_tool', id: 'agy-tool-view', label: 'Antigravity tool', locale: NS },
 			AgyMirrorToolView as (p: unknown) => unknown,
 		);
 		// Code Mode wraps the mirror in run_code. This keyed registration REPLACES

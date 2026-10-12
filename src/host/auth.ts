@@ -27,10 +27,12 @@ export class AuthHelper {
   private state: AuthStatus = { phase: 'idle' };
   private probe: RunningProcess | null = null;
   private capturedUrl: string | null = null;
-  private urlWaiter: ((url: string) => void) | null = null;
+  private urlWaiter: ((url: string | null) => void) | null = null;
   private urlTimer: NodeJS.Timeout | null = null;
   private activeHomeDir: string | null = null;
   private activeAccountId: string | null = null;
+  /** Monotonic begin() generation; a superseded begin must not write state. */
+  private beginSeq = 0;
 
   private signedInCache: { value: boolean | null; at: number } | null = null
   private signedInFlight: Promise<boolean | null> | null = null
@@ -139,6 +141,7 @@ export class AuthHelper {
 
   /** Start (or restart) the login flow; resolves with the consent URL. */
   async begin(homeDir?: string, accountId?: string, proxyUrl?: string): Promise<AuthStatus> {
+    const seq = ++this.beginSeq;
     this.activeHomeDir = homeDir || null;
     this.activeAccountId = accountId || null;
     const proc = this.startProbe(homeDir, proxyUrl);
@@ -155,6 +158,10 @@ export class AuthHelper {
         resolve(null);
       }, URL_WAIT_MS);
     });
+    // A cancel() or a newer begin() resolved our waiter: a stale begin must
+    // not clobber the newer flow's state (it used to overwrite `pending` with
+    // "already authenticated?" right after a restart).
+    if (seq !== this.beginSeq) return this.status();
     if (this.urlTimer) clearTimeout(this.urlTimer);
     this.urlTimer = null;
     if (!url) {
@@ -174,6 +181,7 @@ export class AuthHelper {
     } catch {
       // ignore qr generation error
     }
+    if (seq !== this.beginSeq) return this.status();
     this.state = { phase: 'pending', accountId: this.activeAccountId || undefined, url, qrDataUrl, startedAt, expiresAt: startedAt + 120_000 };
     return this.status();
   }
@@ -197,10 +205,14 @@ export class AuthHelper {
       this.state = { phase: 'failed', message: 'probe stdin closed' };
       return this.status();
     }
+    let settleTimer: NodeJS.Timeout | null = null;
     const outcome = await Promise.race([
       proc.outcome,
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), CODE_SETTLE_MS)),
+      new Promise<null>((resolve) => {
+        settleTimer = setTimeout(() => resolve(null), CODE_SETTLE_MS);
+      }),
     ]);
+    if (settleTimer !== null) clearTimeout(settleTimer);
     if (outcome === null) {
       this.state = { phase: 'failed', message: 'timed out waiting for agy to finish the exchange' };
       this.cancel();
@@ -231,7 +243,13 @@ export class AuthHelper {
     }
     if (this.urlTimer) clearTimeout(this.urlTimer);
     this.urlTimer = null;
+    // Resolve a pending begin() instead of dropping its resolver: the HTTP
+    // route awaits that promise, and a dropped waiter left
+    // /plugins/agy-link/auth hanging forever after a cancel during the
+    // URL wait. null = "no URL" and begin() reports "already authenticated?".
+    const waiter = this.urlWaiter;
     this.urlWaiter = null;
+    waiter?.(null);
   }
 
   dispose(): void {

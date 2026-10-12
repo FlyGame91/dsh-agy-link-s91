@@ -52,6 +52,7 @@ In DSH, click the `AGY (n)` badge and choose **Add Account** to complete Google 
 | `defaultModel` | `DSH_AGY_DEFAULT_MODEL` | agy default | Default model slug |
 | `defaultEffort` | `DSH_AGY_DEFAULT_EFFORT` | model default | `low`, `medium`, or `high` |
 | `timeoutMs` | `DSH_AGY_TIMEOUT_MS` | `600000` | Activity watchdog timeout in ms |
+| `longToolIdleMinutes` | `DSH_AGY_LONG_TOOL_IDLE_MINUTES` | `240` | Idle budget (minutes) while an agy tool step is still open; `0` = keep `timeoutMs` so a wedged tool fails fast |
 | `workspaceRoot` | `DSH_AGY_WORKSPACE_ROOT` | session cwd | Workspace root |
 
 ## `/agy` commands

@@ -39,10 +39,19 @@ const waiters: unique symbol = Symbol('waiters')
 export class RunRecording {
   readonly runId: string
   private readonly events: AgyEvent[] = []
+  /** Arrival timestamp for every recorded event (same index as `events`). */
+  private readonly eventTimes: number[] = []
   private settled = false
   private failure: RecordingFailure | null = null
   private resultConversationId: string | null = null
   private lastStepUsageRaw: RawUsage | null = null
+  /**
+   * Per-step generation timing for token-speed statistics: stepKey ->
+   * { startedAt, lastAt, outputTokens }. The last usage sample of a step wins
+   * (updates are cumulative snapshots of one internal call), so replacing —
+   * not accumulating — keeps the numbers honest.
+   */
+  private readonly stepSpeed = new Map<string, { startedAt: number; lastAt: number; outputTokens: number }>()
   private [waiters] = new Set<() => void>()
   /** DB-resolved full tool args keyed by event index (set during span driving). */
   private fullArgs: Map<number, Record<string, unknown>> | null = null
@@ -50,6 +59,17 @@ export class RunRecording {
   private thoughts: Map<number, string> | null = null
   /** Isolated pool-account HOME used for this run's agy conversation DB. */
   accountHome: string | undefined = undefined
+
+  /**
+   * Index of the event where the most recent span CUT (the last event the
+   * previous run_code call yielded), or null while no span has finished on
+   * this recording. Lets the duplicate-request debounce RESCUE an identical
+   * prompt by re-driving the live recording from the cut point instead of
+   * throwing BUSY at a mid-flight agentic turn (2026-10-10 23:0x incident:
+   * a span whose mirror result did not parse as a continuation fell through
+   * to full prompt assembly and the debounce killed the whole turn).
+   */
+  lastCutIndex: number | null = null
 
   /**
    * Set by the adapter right after spawn. A mid-turn user steer makes DSH
@@ -67,13 +87,76 @@ export class RunRecording {
   append(ev: AgyEvent): void {
     if (this.settled) return
     this.events.push(ev)
+    const now = Date.now()
+    this.eventTimes.push(now)
     if (ev.kind === 'result') this.resultConversationId = ev.conversationId ?? null
     if (ev.kind === 'init' && typeof ev.conversationId === 'string' && ev.conversationId !== '') {
       // init can carry the conversation id before the result envelope; prefer
       // the earliest known id so continuation spans can resolve the agy DB.
       this.resultConversationId = this.resultConversationId ?? ev.conversationId
     }
+    if (ev.kind === 'step' && ev.usage) {
+      const out = typeof ev.usage.output_tokens === 'number' && Number.isFinite(ev.usage.output_tokens)
+        ? ev.usage.output_tokens
+        : 0
+      if (out > 0) {
+        const prev = this.stepSpeed.get(ev.stepKey)
+        if (prev === undefined) this.stepSpeed.set(ev.stepKey, { startedAt: now, lastAt: now, outputTokens: out })
+        else {
+          prev.lastAt = now
+          prev.outputTokens = out
+        }
+      }
+    }
     this.wake()
+  }
+
+  /**
+   * Token-speed statistics over the generation steps recorded so far
+   * (tokens/second of model OUTPUT, thinking included where agy reports it).
+   *
+   * `avgTps` is the output-weighted mean (Σ tokens / Σ seconds) over steps
+   * with a measurable window (≥ 500 ms); `lastTps` is the most recently
+   * measured step. Tool-only and instantaneous steps are excluded, so the
+   * numbers reflect actual generation speed rather than tool wait time.
+   */
+  speedStats(): {
+    lastTps: number | null
+    avgTps: number | null
+    outputTokens: number
+    measuredSteps: number
+    generatingMs: number
+  } {
+    let tokens = 0
+    let ms = 0
+    let steps = 0
+    let lastTps: number | null = null
+    for (const s of this.stepSpeed.values()) {
+      tokens += s.outputTokens
+      const windowMs = s.lastAt - s.startedAt
+      if (s.outputTokens > 0 && windowMs >= 500) {
+        ms += windowMs
+        steps++
+      }
+    }
+    // `lastTps` comes from the LAST generation step in event-arrival order.
+    for (let i = this.events.length - 1; i >= 0; i--) {
+      const ev = this.events[i]
+      if (ev === undefined || ev.kind !== 'step') continue
+      const s = this.stepSpeed.get(ev.stepKey)
+      if (s === undefined) continue
+      if (s.outputTokens > 0 && s.lastAt - s.startedAt >= 500) {
+        lastTps = s.outputTokens / ((s.lastAt - s.startedAt) / 1000)
+      }
+      break
+    }
+    return {
+      lastTps,
+      avgTps: ms > 0 ? tokens / (ms / 1000) : null,
+      outputTokens: tokens,
+      measuredSteps: steps,
+      generatingMs: ms,
+    }
   }
 
   /**
@@ -251,9 +334,21 @@ export function parseMirrorCallId(callId: string): { runId: string; eventIndex: 
 
 const MAX_RETAINED_RUNS = 8
 
-/** Bounded registry keeping the most recent runs for continuation spans. */
+/**
+ * Bounded registry keeping the most recent runs for continuation spans.
+ *
+ * Eviction is deliberately conservative: a run is only dropped when it is
+ * SETTLED, UNPINNED and is not the most recently used entry. A wedged agy
+ * tool step can keep a run alive for hours while other DSH sessions create
+ * their own runs (flash-blast incident, 2026-10-10): a pure FIFO cap evicted
+ * that run mid-flight, and the mirror call the span had already queued —
+ * `agy_tool({run, step})` — could no longer be resolved, so the model lost
+ * the tool result and burned the turn debugging the bridge instead.
+ */
 export class RunRegistry {
   private readonly runs = new Map<string, RunRecording>()
+  /** runId -> pin count while a span is actively driving that recording. */
+  private readonly pinned = new Map<string, number>()
 
   create(): RunRecording {
     const rec = new RunRecording()
@@ -261,21 +356,81 @@ export class RunRegistry {
     return rec
   }
 
+  /**
+   * Insert a run, or refresh one that is about to be consumed again (a
+   * continuation span re-registers its recording so a long-lived run is the
+   * most recent entry and survives the eviction that follows its cut).
+   */
   remember(rec: RunRecording): void {
+    // Map.set keeps an existing key's original position, so delete first to
+    // make this a true most-recently-used refresh.
+    if (this.runs.has(rec.runId)) this.runs.delete(rec.runId)
     this.runs.set(rec.runId, rec)
-    while (this.runs.size > MAX_RETAINED_RUNS) {
-      const oldest = this.runs.keys().next().value
-      if (oldest === undefined) break
-      this.runs.delete(oldest)
-    }
+    this.evict()
   }
 
   get(runId: string): RunRecording | undefined {
     return this.runs.get(runId)
   }
 
+  /**
+   * Pin a run for the duration of a span drive. Pinned (and unsettled) runs
+   * are exempt from eviction, so a span that waits hours for a wedged tool
+   * step can still resolve the mirror calls it emits afterwards.
+   */
+  pin(runId: string): void {
+    this.pinned.set(runId, (this.pinned.get(runId) ?? 0) + 1)
+  }
+
+  unpin(runId: string): void {
+    const n = this.pinned.get(runId)
+    if (n === undefined) return
+    if (n <= 1) this.pinned.delete(runId)
+    else this.pinned.set(runId, n - 1)
+  }
+
   /** Drop a settled run early (called when its final span finished stop). */
   forget(runId: string): void {
     this.runs.delete(runId)
+    this.pinned.delete(runId)
+  }
+
+  /** Retained run ids, oldest first (diagnostics / tests). */
+  get runIds(): readonly string[] {
+    return [...this.runs.keys()]
+  }
+
+  /** Number of retained runs. */
+  get size(): number {
+    return this.runs.size
+  }
+
+  /** Number of currently pinned run ids (diagnostics / tests). */
+  get pinnedCount(): number {
+    return this.pinned.size
+  }
+
+  /**
+   * Trim back to the cap without ever breaking an in-flight run: evict the
+   * oldest SETTLED, UNPINNED entry, never the most recent one (the next
+   * mirror dispatch or continuation addresses it). Live (unsettled) and
+   * pinned runs are exempt, so the registry may temporarily exceed the cap
+   * while several runs are in flight — strictly better than failing a replay.
+   */
+  private evict(): void {
+    while (this.runs.size > MAX_RETAINED_RUNS) {
+      let newest: string | undefined
+      for (const id of this.runs.keys()) newest = id
+      let victim: string | undefined
+      for (const [id, rec] of this.runs) {
+        if (id === newest) continue
+        if (!rec.isSettled) continue
+        if (this.pinned.has(id)) continue
+        victim = id
+        break
+      }
+      if (victim === undefined) return
+      this.runs.delete(victim)
+    }
   }
 }

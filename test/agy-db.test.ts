@@ -84,7 +84,16 @@ test('extractStepThoughts: extracts Field 20.3 from protobuf payload', () => {
 })
 
 test('readFullToolArgs and readStepThoughts: parse realistic nested protobuf step_payloads', async (t) => {
-  if (!sqliteOk) return t.skip('sqlite3 CLI not available')
+  // The reader prefers node:sqlite (no external binary — the desktop-host
+  // fix for issue #43) and falls back to the sqlite3 CLI. The FIXTURE is now
+  // also built through node:sqlite, so the test runs on machines without the
+  // CLI at all.
+  let Database: new (path: string) => { prepare(sql: string): { run(...p: unknown[]): unknown }; close(): void }
+  try {
+    ({ DatabaseSync: Database } = await import('node:sqlite') as { DatabaseSync: new (path: string) => { prepare(sql: string): { run(...p: unknown[]): unknown }; close(): void } })
+  } catch {
+    return t.skip('node:sqlite unavailable')
+  }
   tempDir = await mkdtemp(join(tmpdir(), 'agy-db-test-'))
   const dbPath = join(tempDir, 'conv123.db')
 
@@ -98,15 +107,15 @@ test('readFullToolArgs and readStepThoughts: parse realistic nested protobuf ste
   const thoughtText = 'First I should inspect the target directory.'
   const thoughtPayload = buildThoughtStepPayload(thoughtText, 'Done creating file.')
 
-  // Create DB via sqlite3 CLI (hex literal avoids quoting issues)
-  const toolHex = toolPayload.toString('hex')
-  const thoughtHex = thoughtPayload.toString('hex')
-  await execFileAsync('sqlite3', [
-    dbPath,
-    `CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);`,
-    `INSERT INTO steps (idx,step_type,status,step_payload) VALUES (23,132,3,X'${toolHex}');`,
-    `INSERT INTO steps (idx,step_type,status,step_payload) VALUES (22,15,3,X'${thoughtHex}');`,
-  ])
+  // Create DB via node:sqlite (hex literal avoids quoting issues)
+  const db = new Database(dbPath)
+  try {
+    db.prepare(`CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);`).run()
+    db.prepare(`INSERT INTO steps (idx,step_type,status,step_payload) VALUES (23,132,3,X'${toolPayload.toString('hex')}');`).run()
+    db.prepare(`INSERT INTO steps (idx,step_type,status,step_payload) VALUES (22,15,3,X'${thoughtPayload.toString('hex')}');`).run()
+  } finally {
+    db.close()
+  }
 
   __setAgyDbDirForTest(tempDir)
   clearAgyDbCache()

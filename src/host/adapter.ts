@@ -7,10 +7,10 @@
 // first bind (ADR-7).
 import { join } from 'node:path'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
-import { Err, looksLikeAuthFailure, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeRateLimit, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
+import { Err, isAccountScopedFailure, looksLikeAuthFailure, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeNetworkError, looksLikeRateLimit, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
 import { modelFamilyOf, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
-import { diffConversations, snapshotConversations } from './discovery.ts'
+import { conversationsDirFor, diffConversations, snapshotConversations } from './discovery.ts'
 import { EventMapper } from './mapper.ts'
 import { parseMirrorCallId, type RunRecording, type RunRegistry } from './recording.ts'
 import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug, sanitizeCatalogEntries } from './models.ts'
@@ -22,7 +22,7 @@ import { SENT_IMAGE_IDS_MAX, type SessionStore } from './sessions.ts'
 import { readFullToolArgs, readStepThoughts, clearAgyDbCache } from './agy-db.ts'
 import { getGitHeadContent } from './mirror-tool.ts'
 
-type ForeignSource = { source?: { kind?: string; provider?: string; callId?: string } }
+type ForeignSource = { source?: { kind?: string; provider?: string; callId?: string; replayState?: unknown } }
 
 /** Loose content-block view spanning dsh-llm schema revisions. */
 type UnknownBlock = {
@@ -89,23 +89,124 @@ function textOf(m: Message): string {
   return parts.filter((s) => s !== '').join('\n')
 }
 
-function isForeignAssistant(m: Message): boolean {
+function isForeignAssistant(m: Message, currentConvId?: string): boolean {
   if (m.role !== 'assistant') return false
   const src = (m as unknown as ForeignSource).source
-  return !src || src.provider !== PROVIDER_ID
+  if (!src || src.provider !== PROVIDER_ID) return true
+  if (currentConvId) {
+    const replayConvId = src.replayState && typeof src.replayState === 'object'
+      ? (src.replayState as { response?: { conversationId?: unknown } }).response?.conversationId
+      : undefined
+    if (typeof replayConvId === 'string' && replayConvId !== '' && replayConvId !== currentConvId) {
+      return true
+    }
+  }
+  return false
 }
 
 /**
- * Latest real human turn (not a tool result, not assistant). This is the
- * live task; a digest or tool-result-only trailing span must never drop it
+ * Detect synthetic harness messages injected by DSH.
+ *
+ * DSH injects runtime telemetry and reminder blocks with `role: 'user'`, such as:
+ * - time-context: "Time sampled while preparing turn X, step Y: ..."
+ * - skill-catalog: "<system-reminder>\nA skill is a reusable set..."
+ * - runtime-context: "Current runtime context. This snapshot supersedes..."
+ * - model-selection: "[model changed: ...]"
+ * - system-reminder: "<system-reminder>..."
+ *
+ * These are harness infrastructure, NEVER real human user tasks. If treated
+ * as a user task, they overwrite the user's actual instruction with a timestamp
+ * or reminder block, causing agy to completely ignore the user's latest input
+ * (e.g. session-c65a826e where 42 time samples were appended).
+ */
+export function isSyntheticHarnessMessage(m: Message): boolean {
+  if (isToolResultMessage(m)) return false
+  const src = (m as unknown as ForeignSource).source
+  const kind = src?.kind
+  if (kind !== undefined && kind !== '' && kind !== 'user') {
+    if (
+      kind === 'time-context' ||
+      kind === 'skill-catalog' ||
+      kind === 'runtime-context' ||
+      kind === 'model-selection' ||
+      kind === 'system-reminder' ||
+      kind === 'dsh-session-title-llm' ||
+      kind === 'synthetic'
+    ) {
+      return true
+    }
+    if (kind === 'plugin' && (src as { form?: string }).form === 'snapshot') {
+      return true
+    }
+  }
+  const text = textOf(m).trim()
+  if (
+    text.startsWith('Time sampled while preparing') ||
+    text.startsWith('<system-reminder>') ||
+    text.startsWith('Current runtime context') ||
+    text.startsWith('[model changed:') ||
+    text.startsWith('[conversation so far]') ||
+    text.startsWith('A skill is a reusable set of task-specific instructions')
+  ) {
+    return true
+  }
+  return false
+}
+
+/** True for a real human user turn (not a tool result, not a synthetic harness snapshot). */
+export function isRealUserMessage(m: Message): boolean {
+  const role = (m as { role?: string }).role
+  if (role !== 'user') return false
+  if (isToolResultMessage(m)) return false
+  if (isSyntheticHarnessMessage(m)) return false
+  return textOf(m).trim() !== ''
+}
+
+/**
+ * Latest real human turn (not a tool result, not assistant, not harness metadata).
+ * This is the live task; a digest or tool-result-only trailing span must never drop it
  * (issue #35: "续跑提示词里没有任务").
  */
 export function latestUserTaskText(messages: readonly Message[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
-    if (m === undefined || m.role === 'system' || m.role === 'assistant') continue
-    if (isToolResultMessage(m)) continue
-    const text = textOf(m)
+    if (m === undefined) continue
+    if (isSyntheticHarnessMessage(m)) continue
+    if (isToolResultMessage(m) || m.role === 'assistant' || m.role === 'system') continue
+    if (m.role === 'user') {
+      return textOf(m).trim()
+    }
+  }
+  return ''
+}
+
+/**
+ * Last user message REGARDLESS of the synthetic-looking prefix heuristics,
+ * searched only within the TRAILING span (after the last assistant message).
+ *
+ * The sniffing exists so harness telemetry (time samples, skill catalogs,
+ * `<system-reminder>` snapshots) never overwrites a REAL task. But when the
+ * synthetic-looking message is the ONLY user content of the turn — the user
+ * pasted a reminder block to ask about it — filtering it left the turn with
+ * no task at all ("request carries no user text"). Callers fall back to this.
+ *
+ * The span bound keeps the image-only regression fixed: a trailing
+ * image-only turn must NOT rescue an older question from before the last
+ * assistant reply, exactly as latestUserTaskText refuses to.
+ */
+export function latestUserMessageAny(messages: readonly Message[]): string {
+  let lastAssistantIdx = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m !== undefined && m.role === 'assistant') {
+      lastAssistantIdx = i
+      break
+    }
+  }
+  for (let i = messages.length - 1; i > lastAssistantIdx; i--) {
+    const m = messages[i]
+    if (m === undefined || m.role !== 'user' || isToolResultMessage(m)) continue
+    const text = textOf(m).trim()
     if (text !== '') return text
   }
   return ''
@@ -202,6 +303,7 @@ export function buildDigest(messages: readonly Message[], fromIdx: number, maxCh
   for (let i = fromIdx; i < messages.length; i++) {
     const m = messages[i]
     if (m === undefined || m.role === 'system') continue
+    if (isSyntheticHarnessMessage(m)) continue
     const text = textOf(m)
     if (text === '') continue
     if (taskLine !== '' && !isToolResultMessage(m) && m.role === 'user' && text === taskText) continue
@@ -252,7 +354,15 @@ export interface AgyAdapterDeps {
    */
   sessionCwd?: (sessionId: string) => string | undefined
   /** Last-run telemetry surfaced by /agy status. Process completion and tool failures are distinct. */
-  onRun?: (info: { processOk: boolean; processCode: string; toolErrors: readonly string[]; durationMs: number; model: string }) => void
+  onRun?: (info: {
+    processOk: boolean
+    processCode: string
+    toolErrors: readonly string[]
+    durationMs: number
+    model: string
+    /** Output-token speed over this run's generation steps (see RunRecording.speedStats). */
+    tokenSpeed: ReturnType<RunRecording['speedStats']>
+  }) => void
   /** Reads image bytes from DSH attachment storage (multimodal staging). */
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
   /** Called with each run's parser so the host can keep the last stdout ring for /agy doctor. */
@@ -305,12 +415,15 @@ function sawAuthFailure(parser: StreamJsonParser, outcome: { stderrTail: string;
 /**
  * Bounded wait for an aborted run to settle, so a steer replacement never
  * overlaps the process it just killed on the same agy conversation.
+ * Returns whether the run actually settled before the deadline.
  */
-async function waitForRunSettle(run: { isSettled: boolean }, timeoutMs: number): Promise<void> {
+async function waitForRunSettle(run: { isSettled: boolean }, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
-  while (!run.isSettled && Date.now() < deadline) {
+  while (Date.now() < deadline) {
+    if (run.isSettled) return true
     await new Promise((r) => setTimeout(r, 50))
   }
+  return run.isSettled
 }
 
 export class AgyAdapter extends LlmAdapter {
@@ -328,6 +441,32 @@ export class AgyAdapter extends LlmAdapter {
   private readonly minSpawnIntervalMs = 500
   /** Global sliding window timestamps for batch rate-limiting protection */
   private readonly requestTimestamps: number[] = []
+  /**
+   * sessionKey -> account failovers claimed inside the current window.
+   *
+   * A settled recording that died of an ACCOUNT-scoped failure is retried on
+   * another account instead of being replayed (post-tool quota exhaustion used
+   * to dead-end the turn). That retry happens inside one DSH step, so DSH's own
+   * retry budget cannot bound it: without this counter a soft capacity refusal
+   * (which cools nothing) would rotate A→B→C→A…, re-running the user's tools on
+   * every cycle.
+   */
+  private readonly failoverBudget = new Map<string, { count: number; firstAt: number }>()
+  private static readonly FAILOVER_WINDOW_MS = 120_000
+  /**
+   * Same shape, but for HARD rate-limit hops only. A hard 429 gives the failed
+   * account a cooldown of at least the server-quoted reset (default 10m), so
+   * each claim provably makes progress and cannot loop. The generic 120s/2-hop
+   * budget above exists to stop SOFT failures (which cool nothing) from
+   * rotating forever — but a long-running turn's quota failures arrive spread
+   * over minutes (observed live: 429 at 20:28 with "Resets in 11m", further
+   * hops at 20:28:43 and 20:29:17), so the tight window spent itself while a
+   * full-quota account sat idle and the turn dead-ended (2026-10-10 20:29).
+   * Rate-limit hops get their own pool-depth budget over a window as long as
+   * the default cooldown, refreshed on every fresh failure.
+   */
+  private readonly rateLimitFailover = new Map<string, { count: number; firstAt: number }>()
+  private static readonly RATE_LIMIT_FAILOVER_WINDOW_MS = 600_000
 
   constructor(private readonly deps: AgyAdapterDeps) {
     super()
@@ -348,19 +487,73 @@ export class AgyAdapter extends LlmAdapter {
   }
 
   /**
-   * Fail fast on auth and abort; allow one retry for transient process
-   * failures (timeout, crash, malformed stream) per ADR-11.
+   * Claim one account failover for a session, bounded by the pool's spare
+   * depth ((enabled accounts - 1) inside a short window). Returns false when
+   * the failure is not account-scoped or the budget is spent — the caller then
+   * replays the recorded failure so the turn ends with the real error.
+   */
+  private claimFailover(sessionKey: string, code: string | undefined): boolean {
+    if (!isAccountScopedFailure(code)) return false
+    const enabled = (this.deps.pool?.getAccounts() ?? []).filter((a) => a.enabled).length
+    const max = Math.max(1, enabled - 1)
+    const now = Date.now()
+    // HARD rate limits are tracked separately: every claim cools the failed
+    // account for the server-quoted reset, so hops are self-bounding by pool
+    // depth — they must not starve the tiny soft-failure budget (see the
+    // rateLimitFailover field comment for the live incident).
+    if (code === Err.RATE_LIMIT) {
+      const prevRl = this.rateLimitFailover.get(sessionKey)
+      const freshRl = prevRl === undefined || now - prevRl.firstAt > AgyAdapter.RATE_LIMIT_FAILOVER_WINDOW_MS
+      const countRl = freshRl ? 0 : prevRl.count
+      if (countRl >= max) return false
+      this.rateLimitFailover.set(sessionKey, { count: countRl + 1, firstAt: freshRl ? now : prevRl.firstAt })
+      return true
+    }
+    const prev = this.failoverBudget.get(sessionKey)
+    const fresh = prev === undefined || now - prev.firstAt > AgyAdapter.FAILOVER_WINDOW_MS
+    const count = fresh ? 0 : prev.count
+    if (count >= max) return false
+    this.failoverBudget.set(sessionKey, { count: count + 1, firstAt: fresh ? now : prev.firstAt })
+    return true
+  }
+
+  /**
+   * Fail fast on auth and abort; allow retries for transient process failures
+   * (timeout, crash, malformed stream) per ADR-11.
    *
-   * RATE_LIMIT is retryable on purpose: the failed account was put into
-   * cooldown and the sticky pointer advanced before the error surfaced, so the
-   * retry is served by the NEXT account in the pool — quota exhaustion used to
-   * dead-end in a user-visible error even though a healthy account was idle.
+   * Account-scoped failures (RATE_LIMIT / ELIGIBILITY / NETWORK / OVERLOADED)
+   * are retryable on purpose: the failed account was cooled down or skipped and
+   * the sticky pointer advanced BEFORE the error surfaced, so the retry is
+   * served by the NEXT account in the pool — quota exhaustion used to dead-end
+   * in a user-visible error even though a healthy account was idle.
+   *
+   * The budget follows the pool: a 3-account pool gets 2 retries, because one
+   * hop is not enough to survive a spent account followed by a second account
+   * whose token expired mid-flight (observed live: primary ELIGIBILITY → g98
+   * "not signed in" → turn lost, 2026-10-10 14:17). A single-account pool keeps
+   * the old single retry.
    */
   override providerRetryPolicy(_provider: string) {
+    const enabledAccounts = (this.deps.pool?.getAccounts() ?? []).filter((a) => a.enabled).length
+    const retryableCodes: string[] = [
+      Err.TIMEOUT,
+      Err.PROCESS_EXIT,
+      Err.INVALID_OUTPUT,
+      Err.RATE_LIMIT,
+      Err.ELIGIBILITY,
+      Err.NETWORK,
+      Err.OVERLOADED,
+    ]
+    // A genuine sign-out is only worth retrying when the pool has ANOTHER
+    // account that may still be signed in: the failed one is flagged
+    // authRequired (excluded from rotation) and the retry continues the session
+    // on the next account instead of interrupting it. With one account the
+    // retry would just burn a second request against the same dead login.
+    if (enabledAccounts >= 2) retryableCodes.push(Err.AUTH)
     return {
       mode: 'normal' as const,
-      maxRetries: 1,
-      retryableCodes: [Err.TIMEOUT, Err.PROCESS_EXIT, Err.INVALID_OUTPUT, Err.RATE_LIMIT, Err.ELIGIBILITY],
+      maxRetries: enabledAccounts >= 3 ? 2 : 1,
+      retryableCodes,
       initialDelayMs: 2_000,
       maxDelayMs: 10_000,
       jitterRatio: 0.1,
@@ -537,14 +730,34 @@ export class AgyAdapter extends LlmAdapter {
     const continuation = detectContinuation(options.messages)
     if (continuation !== null) {
       const rec = this.deps.runs.get(continuation.runId)
-      if (rec !== undefined) {
+      // A SETTLED recording that ended in an ACCOUNT-scoped failure must not be
+      // re-driven: DSH re-issues the same step (same trailing tool result), so
+      // resuming it merely replays the identical failure. That is why quota
+      // exhaustion AFTER a tool call used to dead-end the turn while a healthy
+      // account sat idle — the fix is to forget the dead run and fall through,
+      // which re-assembles the prompt and re-selects an account.
+      //
+      // Only account-scoped codes qualify, and only up to the pool's spare
+      // depth: a deterministic failure (or a pool with nothing left to try)
+      // must still surface as the turn's error instead of re-running the work
+      // forever on rotating accounts.
+      const deadFailure = rec !== undefined && rec.isSettled ? rec.failureInfo : null
+      if (rec !== undefined && !(deadFailure !== null && this.claimFailover(sessionKey, deadFailure.code))) {
         yield* this.driveSpan(rec, continuation.eventIndex + 1, hasToolSupport, isCodeMode)
         return
       }
-      this.warnOnce(
-        'stale-continuation:' + continuation.runId,
-        'agy run ' + continuation.runId + ' is no longer available in memory (server restarted?) — falling back to fresh turn prompt assembly',
-      )
+      if (rec !== undefined) {
+        this.deps.runs.forget(continuation.runId)
+        this.warnOnce(
+          'dead-continuation:' + continuation.runId,
+          'agy run ' + continuation.runId + ' settled in ' + (deadFailure?.code ?? '') + ' — retrying this step on another account instead of replaying it',
+        )
+      } else {
+        this.warnOnce(
+          'stale-continuation:' + continuation.runId,
+          'agy run ' + continuation.runId + ' is no longer available in memory (server restarted?) — falling back to fresh turn prompt assembly',
+        )
+      }
     }
     // Session ownership (steer preemption + duplicate debounce) is decided
     // AFTER prompt assembly below, so an identical retry can never abort a
@@ -635,9 +848,32 @@ export class AgyAdapter extends LlmAdapter {
         }
       }
       if (!account) {
-        const countdown = this.deps.pool.getEarliestResetCountdown(family)
-        const waitStr = countdown ? ` (earliest reset in ${Math.ceil(countdown / 1000)}s)` : ''
-        throw new LlmError(`All Antigravity accounts in pool are in cooldown for ${family}${waitStr}. Add an account or wait for reset.`, Err.AGY_ERROR)
+        // Distinguish WHY nothing is available: "in cooldown" for a spent
+        // quota, a signed-out login, or a disabled account. The old text named
+        // a cooldown even when every account was quota-exhausted (whose reset
+        // time lives in quotas, not cooldowns, so the ETA was silently
+        // dropped) — leaving the user with no idea when the turn can run again.
+        const pool = this.deps.pool
+        const accounts = pool.getAccounts().filter((a) => a.enabled)
+        const cooling = accounts.filter((a) => pool.isAccountEligible(a, family) === false && !a.authRequired).length
+        const signedOut = accounts.filter((a) => a.authRequired === true).length
+        const countdown = pool.getEarliestAvailableCountdown?.(family) ?? pool.getEarliestResetCountdown(family)
+        // A reset that is seconds away is not worth failing a turn over: wait
+        // it out (bounded) and let the scheduler re-pick instead of making the
+        // user resend. Longer waits still fail fast with an accurate ETA.
+        if (countdown !== null && countdown > 0 && countdown <= 20_000) {
+          await new Promise((r) => setTimeout(r, countdown + 250))
+          account = pool.selectAccount(family)
+        }
+        if (!account) {
+          const why = signedOut > 0 && signedOut === accounts.length
+            ? 'every account needs a re-login (run /agy auth)'
+            : `no account can serve ${family} right now (${cooling} in cooldown, ${signedOut} signed out)`
+          const waitStr = countdown !== null && countdown > 0
+            ? ` (earliest reset in ${Math.ceil(countdown / 1000)}s)`
+            : ''
+          throw new LlmError(`All Antigravity accounts are unavailable: ${why}${waitStr}. Add an account, wait for reset, or run /agy clear-cooldown.`, Err.AGY_ERROR)
+        }
       }
     }
 
@@ -646,16 +882,44 @@ export class AgyAdapter extends LlmAdapter {
     // families the user is not currently running).
     if (account && !isAux) this.deps.pool?.markAccountActive(account.id)
 
+    // Windows: go-keyring maps to the system-wide Credential Manager slot
+    // `gemini:antigravity` (issue #45). HOME isolation moves FILES, not the
+    // credential, so an isolated pool account still authenticates — and
+    // bills — as the system login. Warn once per account so "round-robin is
+    // cosmetic on Windows" is visible instead of a silent quota mystery.
+    if (process.platform === 'win32' && account && !account.systemHome && !isAux) {
+      this.warnOnce(
+        'win-keyring-slot:' + account.id,
+        'Windows cannot isolate pool credentials: agy authenticates via the system-wide Credential Manager slot (gemini:antigravity), so this isolated account still uses the system login (issue #45 — see KNOWN-GAPS.md)',
+      )
+    }
+
     const sessionAccountKey = account ? `${sessionKey}:${account.id}` : sessionKey
     let binding = sessionAccountKey !== '' ? this.deps.store.get(sessionAccountKey) : undefined
+    if (binding === undefined && sessionKey !== '') {
+      binding = this.deps.store.get(sessionKey)
+      if (binding === undefined && account === undefined) {
+        for (const [k, b] of Object.entries(this.deps.store.all())) {
+          if (k.startsWith(`${sessionKey}:`)) {
+            binding = b
+            break
+          }
+        }
+      }
+    }
 
     // If a live run already owns this session and has named an agy
     // conversation, adopt it before prompt assembly. A tool-cut or caller
     // abort used to drop that id entirely, so the next hop started a brand
     // new conversation with a digest-only prompt (issue #35).
+    // The live run must belong to the SAME account: a conversation id from
+    // account A's isolated HOME does not exist under account B, and adopting it
+    // there produced "conversation not found" plus a wasted turn.
     if (binding === undefined && !isAux && sessionKey !== '') {
       const live = this.activeRuns.get(sessionKey)
-      const liveCid = live !== undefined && !live.isSettled ? live.conversationId : null
+      const liveCid = live !== undefined && !live.isSettled && (live.accountHome ?? '') === (account?.dir ?? '')
+        ? live.conversationId
+        : null
       if (liveCid) {
         binding = {
           conversationId: liveCid,
@@ -696,12 +960,48 @@ export class AgyAdapter extends LlmAdapter {
       }
       prompt = '[summarize this conversation for context compaction]\n\n' + parts.join('\n\n') + '\n\nProduce a compact summary that preserves decisions, file paths, and open tasks.'
     } else {
-      const trailingText = trailingUser.map(textOf).filter((s) => s !== '')
-      // A tool-result-only trailing span used to assemble an empty prompt
-      // (or a digest that had already eaten the task). Always re-state the
-      // latest real user turn so agy never runs without a question
-      // (issues #34 / #35).
-      const taskText = latestUserTaskText(messages)
+      // Two corrections over a naive "flatten everything after the last
+      // assistant message":
+      //
+      // 1. REDUNDANCY: tool-result payloads are not re-sent when a live agy
+      //    conversation already owns them. agy executed those tools itself, so
+      //    its server-side history holds the output; piping it back duplicated
+      //    large blobs (observed: a live command line carrying a 6.4 KB Godot
+      //    simulation dump) AND put that stale output BEFORE the actual
+      //    question, which is one of the ways the model ends up answering the
+      //    previous work instead of the newest message. A FRESH conversation is
+      //    different: it has never seen those tool results, so they stay.
+      // 2. STALE TASK: the prompt task is the LAST user message, never an older
+      //    one. When the newest message carried no text (image-only turn) the
+      //    old fallback re-sent a PREVIOUS question verbatim — agy then
+      //    answered the wrong message outright.
+      // When returning to an established agy conversation (binding !== undefined),
+      // agy already natively holds everything up to binding.lastMessageCount.
+      // If the previous turn was aborted or interrupted, its user message was already
+      // absorbed into agy's conversation (or was dropped) — taking messages from
+      // lastAssistantIdx + 1 used to drag the aborted message into the new prompt,
+      // causing agy to answer the old interrupted task instead of the new one.
+      // Start strictly after the watermark when returning, or after the last assistant.
+      const trailingStart = binding !== undefined
+        ? Math.max(Math.min(binding.lastMessageCount, messages.length), lastAssistantIdx + 1)
+        : lastAssistantIdx + 1
+
+      const effectiveTrailingUser = messages.slice(trailingStart).filter((m) => {
+        const role = (m as { role?: string }).role
+        if (role !== 'user' && role !== 'tool') return false
+        if (isSyntheticHarnessMessage(m)) return false
+        return true
+      })
+
+      // Real task first; the any-message fallback only fires when the sniffing
+      // filtered out every user message (a pasted reminder block IS the task).
+      const taskText = latestUserTaskText(messages) || latestUserMessageAny(messages)
+      const dropToolPayloads = binding !== undefined
+      const trailingText = effectiveTrailingUser
+        .filter((m) => !(dropToolPayloads && isToolResultMessage(m)))
+        .map(textOf)
+        .map((s) => s.trim())
+        .filter((s) => s !== '')
       const trailingJoined = trailingText.join('\n\n')
       if (taskText !== '') {
         prompt = trailingText.includes(taskText) || trailingJoined.includes(taskText)
@@ -709,6 +1009,11 @@ export class AgyAdapter extends LlmAdapter {
           : (trailingJoined === '' ? taskText : taskText + '\n\n' + trailingJoined)
       } else {
         prompt = trailingJoined
+      }
+      if (prompt === '' && dropToolPayloads && effectiveTrailingUser.length > 0) {
+        // Everything this hop carried was agy's own tool output, which the live
+        // conversation already contains: nudge instead of piping it back.
+        prompt = '[continue — the tool output for your last tool call is already in this conversation]'
       }
       if (binding === undefined && lastAssistantIdx >= 0) {
         // First contact / account switch / model switch / compaction re-seed:
@@ -724,16 +1029,31 @@ export class AgyAdapter extends LlmAdapter {
         // trailing user run is already the live prompt below.
         const from = Math.min(binding.lastMessageCount, messages.length)
         const end = Math.max(from, lastAssistantIdx + 1)
+        const currentConvId = binding.conversationId
         const span = messages
           .slice(from, end)
-          .filter((m) => m.role !== 'assistant' || isForeignAssistant(m))
+          .filter((m) => m.role !== 'assistant' || isForeignAssistant(m, currentConvId))
         if (span.some((m) => m.role === 'assistant')) {
           prompt = buildDigest(span, 0, cfg.digestMaxChars) + prompt
         }
+        if (binding.interrupted === true) {
+          // The previous turn was cut mid-flight (Stop / steer / watchdog):
+          // agy's conversation still ends with an unanswered user turn, so
+          // without this boundary the model treats THAT as the live question
+          // and answers it instead of the newest message. Clearing the flag is
+          // this hop's job (a successful run rewrites the binding without it).
+          prompt = '[the previous turn was interrupted before it finished — do not continue or answer that unfinished work; respond only to the newest request below]\n\n' + prompt
+        }
       }
     }
-    if (cfg.forwardSystemPrompt && options.system) {
-      prompt = 'System instructions:\n' + options.system + '\n\n' + prompt;
+    if (cfg.forwardSystemPrompt) {
+      const sysInstruction = options.system || (() => {
+        const sm = messages.find((m) => m.role === 'system')
+        return sm ? textOf(sm).trim() : ''
+      })()
+      if (sysInstruction) {
+        prompt = 'System instructions:\n' + sysInstruction + '\n\n' + prompt
+      }
     }
     // ---- multimodal staging (v0.2): images ride as staged files ----
     let stagedDirs: string[] = []
@@ -802,6 +1122,25 @@ export class AgyAdapter extends LlmAdapter {
       const runLive = liveRun !== undefined && !liveRun.isSettled
       const samePrompt = prevPrompt !== undefined && prevPrompt.prompt === prompt
       if (runLive && samePrompt) {
+        // RESCUE before BUSY: an identical prompt for a session whose run is
+        // still alive is normally a continuation span — but when the trailing
+        // mirror result failed to parse as one (malformed callId, harness-side
+        // re-send after a mirror dispatch hiccup), full prompt assembly lands
+        // here and the old behaviour threw BUSY, killing a mid-flight agentic
+        // turn that was perfectly healthy (2026-10-10 23:0x incident). If the
+        // live recording has already cut a span we know exactly where DSH's
+        // consumption stopped: re-drive it from there. Without a cut point
+        // (first span still streaming, nothing consumed yet) a duplicate
+        // really is a duplicate → BUSY stands.
+        const rescueFrom = liveRun.lastCutIndex !== null ? liveRun.lastCutIndex + 1 : null
+        if (rescueFrom !== null) {
+          this.deps.log?.(
+            'duplicate-debounce rescue: identical prompt for a live agy run ' + liveRun.runId + ' — re-driving from event ' + rescueFrom + ' instead of throwing BUSY',
+          )
+          this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
+          yield* this.driveSpan(liveRun, rescueFrom, hasToolSupport, isCodeMode)
+          return
+        }
         throw new LlmError(
           'Duplicate request ignored: an identical request is already running for this session.',
           Err.BUSY,
@@ -829,7 +1168,7 @@ export class AgyAdapter extends LlmAdapter {
         // caller abort used to drop the binding entirely, so the replacement
         // process started a brand-new agy conversation with digest-only
         // prompt (issue #35 root cause ②).
-        const liveCid = liveRun.conversationId
+        const liveCid = (liveRun.accountHome ?? '') === (account?.dir ?? '') ? liveRun.conversationId : null
         if (
           liveCid !== null &&
           binding === undefined &&
@@ -841,34 +1180,120 @@ export class AgyAdapter extends LlmAdapter {
             lastMessageCount: Math.max(0, lastAssistantIdx + 1),
             updatedAt: Date.now(),
             model: currentModel,
+            interrupted: true,
+          }
+        } else if (binding !== undefined) {
+          binding.interrupted = true
+        }
+        // A run whose result was ALREADY consumed is just finishing its own
+        // shutdown: killing it there cut agy mid-finalize (re-creating the
+        // server-side divergence that makes it answer the previous message)
+        // and recorded a false ABORTED for a turn that actually answered.
+        // Give it a moment to exit on its own; only a still-running turn is
+        // actually preempted.
+        if (liveRun.hasResult) {
+          const exited = await waitForRunSettle(liveRun, 1_500)
+          if (!exited) this.deps.log?.('previous agy run did not exit within 1.5s after producing its result — preempting it')
+        }
+        if (!liveRun.isSettled) {
+          liveRun.requestAbort?.()
+          // Two agy processes must never append to one conversation at the same
+          // time. Give the aborted process a bounded moment to actually exit
+          // (SIGTERM, then the SIGKILL escalation) before the replacement spawns.
+          const exited = await waitForRunSettle(liveRun, 3_500)
+          if (!exited) {
+            this.warnOnce(
+              'settle-timeout:' + sessionKey,
+              'the preempted agy run did not exit within 3.5s — starting the replacement anyway; its late write-back is ignored because the newer run owns the session',
+            )
+          }
+          if (!prompt.includes('the previous turn was interrupted')) {
+            prompt = '[the previous turn was interrupted before it finished — do not continue or answer that unfinished work; respond only to the newest request below]\n\n' + prompt
           }
         }
-        liveRun.requestAbort?.()
-        // Two agy processes must never append to one conversation at the same
-        // time. Give the aborted process a bounded moment to actually exit
-        // (SIGTERM, then the SIGKILL escalation) before the replacement spawns.
-        await waitForRunSettle(liveRun, 3_500)
       }
       this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
     }
 
     // ---- spawn + record (v0.3: spans consume a shared recording) ----
-    const before = snapshotConversations()
     const rec = this.deps.runs.create()
     rec.accountHome = account && account.dir ? account.dir : undefined
+    // The fallback conversation-id discovery must watch the SAME HOME the
+    // child runs under: an isolated pool account's conversation DB lives in
+    // its own HOME and the system-HOME snapshot never sees it.
+    const conversationsDir = conversationsDirFor(rec.accountHome)
+    const before = snapshotConversations(conversationsDir)
     const parser = new StreamJsonParser()
     this.deps.onParser?.(parser)
     let streamCid: string | null = null
     // In-progress agy tool steps (ACTIVE without DONE/ERROR). While any is
     // outstanding the child is legitimately silent on stdout (maven compile,
-    // language-server build, …) — issue #33. Raise the idle budget to the
-    // print-mode ceiling so the watchdog does not kill healthy long tools.
+    // language-server build, …) — issue #33. Raise the idle budget so the
+    // watchdog does not kill healthy long tools. The budget is configurable
+    // (`longToolIdleMinutes`, 0 = keep the normal timeout) so a wedged step
+    // can be bounded instead of holding a session for hours.
     const openToolKeys = new Set<string>()
-    const printTimeoutMinutes = Math.max(240, Math.ceil(cfg.timeoutMs / 60_000))
-    const longToolIdleMs = printTimeoutMinutes * 60_000
+    const openToolSince = new Map<string, number>()
+    const longToolIdleMinutes = cfg.longToolIdleMinutes > 0 ? cfg.longToolIdleMinutes : 0
+    const printTimeoutMinutes = Math.max(
+      longToolIdleMinutes > 0 ? longToolIdleMinutes : 240,
+      Math.ceil(cfg.timeoutMs / 60_000),
+    )
+    const longToolIdleMs = longToolIdleMinutes > 0 ? longToolIdleMinutes * 60_000 : cfg.timeoutMs
     let runningProc: ReturnType<typeof startAgyProcess> | null = null
+    /**
+     * True once agy produced ANY output for this run. A run that has already
+     * emitted events is demonstrably alive and authenticated; a silent gap
+     * after that is a long model/tool phase, not a dead process. The idle
+     * watchdog used to kill those at the 10-minute default — 12 of the 37
+     * failures in one week of this user's logs were exactly
+     * "agy run was idle for 600000ms without output", each one costing the
+     * whole turn and a resend. Before the first event the strict budget stays:
+     * that is the genuinely wedged/unreachable-Google shape.
+     */
+    let sawAnyEvent = false
+    /** Timestamp of the most recent stdout line — drives the silence heartbeat. */
+    let lastOutputAt = 0
     const applyToolIdleBudget = (): void => {
-      runningProc?.noteActivity(openToolKeys.size > 0 ? longToolIdleMs : cfg.timeoutMs)
+      runningProc?.noteActivity(openToolKeys.size > 0 || sawAnyEvent ? longToolIdleMs : cfg.timeoutMs)
+    }
+    // Long-tool heartbeat: while a tool step is open nothing else is
+    // observable, so log its age every few minutes. A 3h silent hang used to
+    // look like a dead session (flash-blast incident, 2026-10-10).
+    const TOOL_HEARTBEAT_MS = 5 * 60_000
+    let toolHeartbeat: NodeJS.Timeout | null = null
+    const stopToolHeartbeat = (): void => {
+      if (toolHeartbeat !== null) {
+        clearInterval(toolHeartbeat)
+        toolHeartbeat = null
+      }
+    }
+    const startToolHeartbeat = (): void => {
+      if (toolHeartbeat !== null) return
+      toolHeartbeat = setInterval(() => {
+        if (openToolKeys.size === 0 && !sawAnyEvent) {
+          stopToolHeartbeat()
+          return
+        }
+        let oldest = Date.now()
+        for (const startedAt of openToolSince.values()) {
+          if (startedAt < oldest) oldest = startedAt
+        }
+        // With no tool step open the interesting number is time since the LAST
+        // output, not since a tool start: an empty openToolSince map used to
+        // leave `oldest` at "now" and the log permanently claimed "1m" of
+        // silence while the run had actually been quiet for hours.
+        if (openToolKeys.size === 0 && lastOutputAt > 0) oldest = lastOutputAt
+        const mins = Math.max(1, Math.round((Date.now() - oldest) / 60_000))
+        this.deps.log?.(
+          openToolKeys.size > 0
+            ? 'agy tool step still running: ' + openToolKeys.size + ' open, oldest ' + mins +
+              'm (idle budget ' + Math.round(longToolIdleMs / 60_000) + 'm) — the turn is waiting on agy'
+            : 'agy run still working: no new output for ' + mins + 'm (idle budget ' +
+              Math.round(longToolIdleMs / 60_000) + 'm) — the turn is waiting on agy; press Stop to cancel',
+        )
+      }, TOOL_HEARTBEAT_MS)
+      toolHeartbeat.unref?.()
     }
     const activeModelForArgs = activeModel === '' ? cfg.defaultModel : activeModel
     // agy does not treat process cwd as its Active Workspace — it requires
@@ -912,6 +1337,22 @@ export class AgyAdapter extends LlmAdapter {
       released = true
       release()
     }
+    // The acquire→spawn window can be arbitrarily long (all slots busy on
+    // long tool runs). Two failure shapes used to leak permanently:
+    //  1. the caller abandons this generator while it is suspended after
+    //     acquire (steer abort / DSH closing the stream) — with no try/finally
+    //     the release closure was simply dropped and one maxConcurrent slot
+    //     leaked per incident, dead-locking every future run once enough
+    //     slots piled up;
+    //  2. the caller's signal aborted DURING the wait — addEventListener on an
+    //     already-aborted signal never fires, so the spawn below ran a full
+    //     turn for a request nobody was reading any more.
+    // Both are fixed by re-checking the signal here and by the try/finally
+    // that owns releaseOnce() until the process-outcome closure takes over.
+    if (options.signal?.aborted) {
+      releaseOnce()
+      throw new LlmError('request aborted before the agy process was spawned', Err.AGY_ERROR)
+    }
     // Only SECONDARY pool accounts get an isolated HOME. The primary
     // account rides the real system HOME (agy 1.1.15 keeps credentials in
     // the macOS Keychain); injecting HOME there signs agy out ("Please
@@ -932,20 +1373,23 @@ export class AgyAdapter extends LlmAdapter {
       ...proxyEnvFor(account?.proxyUrl || cfg.proxyUrl || undefined),
     }
 
-    // Per-account burst spacing throttle with randomized jitter (prevents high-frequency flood to Google endpoints)
-    if (account) {
-      const lastSpawn = this.lastAccountSpawnTime.get(account.id) ?? 0
-      const elapsed = Date.now() - lastSpawn
-      const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
-      const targetInterval = this.minSpawnIntervalMs + jitter
-      if (elapsed < targetInterval) {
-        await new Promise((r) => setTimeout(r, targetInterval - elapsed))
-      }
-      this.lastAccountSpawnTime.set(account.id, Date.now())
-    }
-
     let proc: ReturnType<typeof startAgyProcess>
+    let spawned = false
     try {
+      // Per-account burst spacing throttle with randomized jitter (prevents
+      // high-frequency flood to Google endpoints). Suspension point INSIDE the
+      // slot-owning window: a generator abandoned here must still give the
+      // slot back — the finally below owns that.
+      if (account) {
+        const lastSpawn = this.lastAccountSpawnTime.get(account.id) ?? 0
+        const elapsed = Date.now() - lastSpawn
+        const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
+        const targetInterval = this.minSpawnIntervalMs + jitter
+        if (elapsed < targetInterval) {
+          await new Promise((r) => setTimeout(r, targetInterval - elapsed))
+        }
+        this.lastAccountSpawnTime.set(account.id, Date.now())
+      }
       proc = startAgyProcess({
       bin,
       args,
@@ -954,7 +1398,15 @@ export class AgyAdapter extends LlmAdapter {
       signal: options.signal,
       env,
       stdinPayload,
+      // stderr is liveness too: agy prints progress/diagnostics there while a
+      // long step is running, and a run that only talks on stderr used to be
+      // "idle" as far as the watchdog was concerned.
+      stderrKeepalive: true,
       onLine: (line) => {
+        sawAnyEvent = true
+        lastOutputAt = Date.now()
+        startToolHeartbeat()
+        applyToolIdleBudget()
         for (const ev of parser.feed(line + '\n')) {
           if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
           if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
@@ -968,16 +1420,21 @@ export class AgyAdapter extends LlmAdapter {
             if (!completed) {
               if (!openToolKeys.has(ev.stepKey)) {
                 openToolKeys.add(ev.stepKey)
+                openToolSince.set(ev.stepKey, Date.now())
                 applyToolIdleBudget()
+                startToolHeartbeat()
               }
             } else if (openToolKeys.delete(ev.stepKey)) {
+              openToolSince.delete(ev.stepKey)
               applyToolIdleBudget()
+              if (openToolKeys.size === 0) stopToolHeartbeat()
             }
           }
           rec.append(ev)
         }
       },
       })
+      spawned = true
       runningProc = proc
       // stdout can deliver the first lines before this assignment lands —
       // re-apply whatever tool-idle budget those events already requested.
@@ -986,22 +1443,40 @@ export class AgyAdapter extends LlmAdapter {
         rec.requestAbort = () => proc.kill('abort')
         this.activeRuns.set(sessionKey, rec)
       }
+      // The abort listener in the runner never fires on an ALREADY-aborted
+      // signal: an abort that arrived while this call queued on the semaphore
+      // (or during the throttle sleep above) would otherwise run a full turn
+      // nobody is reading. Kill immediately so the outcome closure settles
+      // this run as ABORTED and returns the slot.
+      if (options.signal?.aborted) proc.kill('abort')
     } catch (e) {
       releaseOnce()
       this.clearInFlightPrompt(sessionKey, prompt)
       throw new LlmError('failed to spawn agy: ' + brief(String(e)), Err.PROCESS_EXIT)
+    } finally {
+      // Generator abandoned while suspended inside the try (throttle sleep):
+      // the async outcome closure below was never created, so nothing else
+      // would ever return the concurrency slot. releaseOnce() no-ops when the
+      // catch already released.
+      if (!spawned) {
+        releaseOnce()
+        this.clearInFlightPrompt(sessionKey, prompt)
+      }
     }
 
     void (async () => {
       const outcome = await proc.outcome
       releaseOnce()
+      stopToolHeartbeat()
+      openToolKeys.clear()
+      openToolSince.clear()
       if (this.activeRuns.get(sessionKey) === rec) this.activeRuns.delete(sessionKey)
       this.clearInFlightPrompt(sessionKey, prompt)
       for (const ev of parser.flush()) {
         if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
         rec.append(ev)
       }
-      const diffed = diffConversations(before).conversationId
+      const diffed = diffConversations(before, conversationsDir).conversationId
       const conversationId = streamCid ?? diffed
       // A result envelope the mapper will finish on: ok, or an error that
       // still carries a usable response. Anything else leaves the live span
@@ -1015,6 +1490,13 @@ export class AgyAdapter extends LlmAdapter {
       // error and slapping a ghost cooldown on a healthy account.
       const rawErrText = [outcome.stderrTail, parser.stats.lastResultError].filter(Boolean).join(' ')
       const isRateLimit = looksLikeRateLimit(rawErrText)
+      // Transport evidence anywhere in the run: stderr, the result envelope, or
+      // the auth-shaped banner agy prints on stdout ("silent auth failed").
+      // A flaky proxy makes agy report "not logged into Antigravity" for a
+      // login that is perfectly fine, so this decides AUTH vs NETWORK below.
+      const transportFailure = looksLikeNetworkError(
+        [rawErrText, parser.stats.authFailureText ?? '', outcome.stderrTail, outcome.stdout.slice(0, 4000)].filter(Boolean).join(' '),
+      )
       // A timeout that never produced a single stdout event is an account-level
       // black hole (unreachable Google / wedged credential), not a long tool:
       // the retry must try a different account rather than the same dead one.
@@ -1028,19 +1510,38 @@ export class AgyAdapter extends LlmAdapter {
             ? ' — agy never emitted a single event; it is likely unable to reach Google (check proxy/network). 无法连接 Google，请检查代理或网络配置'
             : '') }
       } else if (sawAuthFailure(parser, outcome)) {
-        failure = { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — run /agy auth (or run agy once in a terminal) to login' }
+        // agy says "not logged in" both for a real sign-out AND when it cannot
+        // validate a good token over a broken network (observed live: the
+        // retry account had a token that expired 9 minutes earlier, its refresh
+        // died on `Post https://oauth2.googleapis.com/token: EOF`, and agy fell
+        // back to "not logged in and no controlling terminal"). Reporting AUTH
+        // there ends the turn on a healthy account AND DSH renders the AUTH
+        // code as "API key is invalid" — a label that sent users hunting for a
+        // credential that was never the problem.
+        failure = transportFailure
+          ? {
+              kind: 'error',
+              code: Err.NETWORK,
+              message: 'agy could not validate its Google login over the network (transport failure, not a sign-out) — retrying on another account. '
+                + (rawErrText !== '' ? brief(rawErrText) : ''),
+            }
+          : { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — run /agy auth (or run agy once in a terminal) to login' }
       } else if (isRateLimit) {
         const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
-        // Only HARD server-issued refusals are retryable: that path cools the
-        // account down and advances the sticky pointer, so DSH's automatic
-        // retry is served by the NEXT account instead of dead-ending the turn.
-        // Soft capacity signals ("model overloaded") keep the deterministic
-        // AGY_ERROR code — nothing was cooled, so a retry would only re-hit the
-        // same overloaded model.
+        // Two different animals:
+        //  - HARD server refusal (429 / quota reached): the account is spent, so
+        //    it is cooled down and the sticky pointer advances; the retry is
+        //    served by the next account.
+        //  - SOFT capacity signal ("model overloaded" / high traffic): nothing
+        //    was spent, so no cooldown — but the pointer still advances and the
+        //    code is retryable, because dead-ending the turn while another
+        //    account could serve it is exactly the interruption users complain
+        //    about. Worst case the retry hits the same capacity wall and the
+        //    same error surfaces ~2s later.
         const hard = looksLikeHardRateLimit(rawErrText)
         failure = {
           kind: 'error',
-          code: hard ? Err.RATE_LIMIT : Err.AGY_ERROR,
+          code: hard ? Err.RATE_LIMIT : Err.OVERLOADED,
           message: 'Google Antigravity quota / rate limit reached: ' + bestMsg,
         }
       } else if (looksLikeEligibilityFailure(rawErrText) || looksLikeEligibilityFailure(parser.stats.lastResultError ?? '')) {
@@ -1071,9 +1572,17 @@ export class AgyAdapter extends LlmAdapter {
         }
       }
       rec.settle(failure)
+      // A newer run may already own this session (steer preemption whose
+      // bounded settle wait expired). Its own handler writes the authoritative
+      // binding — letting this stale closure write afterwards used to regress
+      // lastMessageCount/sentImageIds and re-digest or re-attach old images.
+      const superseded = this.activeRuns.get(sessionKey) !== undefined
+        && this.activeRuns.get(sessionKey) !== rec
       if (failure === null) {
         if (account) this.deps.pool?.recordSuccess(account.id, family)
-        if (!isAux && sessionAccountKey !== '') {
+        this.failoverBudget.delete(sessionKey)
+        this.rateLimitFailover.delete(sessionKey)
+        if (!isAux && sessionAccountKey !== '' && !superseded) {
           const finalId = binding !== undefined ? binding.conversationId : conversationId
           if (finalId) {
             this.deps.store.set(sessionAccountKey, {
@@ -1086,7 +1595,6 @@ export class AgyAdapter extends LlmAdapter {
           }
         }
       } else {
-        const effectiveRateLimit = isRateLimit || looksLikeRateLimit(failure.message)
         // Cooldown is a costly local penalty (account leaves rotation): only
         // HARD server-issued signatures may trigger it. Soft signals (model
         // overloaded) shape the message above but never cool the account.
@@ -1109,21 +1617,54 @@ export class AgyAdapter extends LlmAdapter {
         if (account && failure.code === Err.ELIGIBILITY) {
           this.deps.pool?.advanceAccount(account.id, family)
         }
+        // Account-scoped failures must not let the retry land back on the
+        // account that could not serve this turn. One rotation per failure:
+        //  - NETWORK / OVERLOADED: transport blip or capacity refusal. Nothing
+        //    was spent, so NO cooldown — a 15-minute penalty would only shrink
+        //    the pool.
+        //  - AUTH: the account is marked authRequired below, which already
+        //    excludes it from rotation; rotating here makes the intent explicit.
+        //  - any other non-consumable refusal that came back with a nonzero
+        //    exit (quota phrasings the hard regex does not know, agy crashes):
+        //    the account is the only thing we can change, so try the next one.
+        //    Rotating costs nothing and is what keeps the session alive instead
+        //    of surfacing "run /agy auth"/"exited 1" while another account is
+        //    idle. RATE_LIMIT is excluded: recordFailure already cooled the
+        //    account, which is stronger than a bare pointer move.
+        const rotateAway = !outcome.aborted && failure.code !== Err.RATE_LIMIT
+          && (failure.code === Err.NETWORK
+            || failure.code === Err.OVERLOADED
+            || failure.code === Err.AUTH
+            || outcome.code !== 0
+            || parser.stats.lastResultError !== undefined)
+        if (rotateAway && account) this.deps.pool?.advanceAccount(account.id, family)
         // Only authoritative auth states may flag an account: the old
         // /auth/i substring matched "oauth2.googleapis.com … i/o timeout"
         // transport noise and quarantined healthy accounts until a manual
-        // quota refresh disproved the flag.
+        // quota refresh disproved the flag. NETWORK is not AUTH, and
+        // shouldMarkAuthRequired additionally exempts transport-shaped text.
         if (account && shouldMarkAuthRequired(failure.code, failure.message)) {
           this.deps.pool?.markAuthRequired(account.id, failure.message)
         }
+        // A conversation only becomes unusable when the login died or agy
+        // itself rejected the id. Rate limits / overload / transport blips do
+        // NOT invalidate it: deleting the binding there threw away a resumable
+        // native conversation (and its tool history) for a 15-minute cooldown,
+        // forcing a fresh 660K-char digest seed on the next turn.
         const staleConversation =
           failure.code === Err.AUTH ||
-          effectiveRateLimit ||
-          (failure.message && /conversation.*(not found|invalid|not recognized|expired|does not exist)|session.*(expired|invalid)/i.test(failure.message))
+          (failure.message !== '' && /conversation.*(not found|invalid|not recognized|expired|does not exist)|session.*(expired|invalid)/i.test(failure.message))
+        // The run was cut mid-flight (Stop button / steer preemption / idle
+        // watchdog) or aborted before it finished. agy's server-side turn has
+        // no finalized reply, so the NEXT prompt must say so explicitly —
+        // otherwise the model treats the interrupted user turn as the live
+        // question and answers it instead of the newest message (the "latest
+        // input ignored" bug, reproduced from session-c65a826e turns 17→19).
+        const interruptedTurn = failure.kind === 'aborted' || outcome.timedOut === true
         if (!isAux && sessionAccountKey !== '' && staleConversation) {
-          // If auth expired or rate limit hit or conversation rejected, drop stale binding
+          // If auth expired or conversation rejected, drop stale binding
           this.deps.store.delete(sessionAccountKey)
-        } else if (!isAux && sessionAccountKey !== '' && !staleConversation) {
+        } else if (!isAux && sessionAccountKey !== '' && !superseded) {
           // Abort / timeout / process-exit still leave a usable agy
           // conversation behind once init or the result envelope named one.
           // Persisting it here is what lets the next hop continue instead of
@@ -1136,7 +1677,13 @@ export class AgyAdapter extends LlmAdapter {
               lastMessageCount: messages.length,
               updatedAt: Date.now(),
               model: activeModel,
-              sentImageIds: mergeSentImageIds(binding?.sentImageIds, newlySentImageIds),
+              // Images are only "delivered" when the run actually consumed
+              // them. A killed run used to mark its staged screenshots as sent,
+              // so re-sending the same image after a Stop was silently deduped
+              // away and an image-only follow-up died with "request carries no
+              // user text or images".
+              sentImageIds: mergeSentImageIds(binding?.sentImageIds, []),
+              ...((interruptedTurn || binding?.interrupted === true) ? { interrupted: true } : {}),
             })
           }
         }
@@ -1156,6 +1703,7 @@ export class AgyAdapter extends LlmAdapter {
         toolErrors: rec.toolErrors(),
         durationMs: outcome.durationMs,
         model,
+        tokenSpeed: rec.speedStats(),
       })
     })().catch((err) => {
       releaseOnce()
@@ -1175,6 +1723,28 @@ export class AgyAdapter extends LlmAdapter {
    * provider error.
    */
   private async *driveSpan(
+    rec: RunRecording,
+    from: number,
+    cutOnTool: boolean,
+    useCodeWrapper: boolean,
+  ): AsyncIterable<StreamChunk> {
+    // A span can wait hours for a wedged agy tool step. Pin the recording for
+    // its whole lifetime so the shared registry can never evict a run whose
+    // mirror calls are still queued behind that cut, and refresh its recency
+    // on the way out so the agy_tool dispatch that follows the final cut
+    // still resolves (flash-blast incident, 2026-10-10).
+    this.deps.runs.remember(rec)
+    this.deps.runs.pin(rec.runId)
+    try {
+      yield* this.driveSpanBody(rec, from, cutOnTool, useCodeWrapper)
+    } finally {
+      this.deps.runs.unpin(rec.runId)
+      this.deps.runs.remember(rec)
+    }
+  }
+
+  /** Body of {@link driveSpan}: map recorded events until the span finishes. */
+  private async *driveSpanBody(
     rec: RunRecording,
     from: number,
     cutOnTool: boolean,
@@ -1272,7 +1842,13 @@ export class AgyAdapter extends LlmAdapter {
           }
           for (const ch of mapper.map(ev, i)) queue.push(ch)
           i++
-          if (mapper.isFinished) break
+          if (mapper.isFinished) {
+            // Remember where the span stopped so a duplicate-debounce rescue
+            // can re-drive this recording from exactly the cut point without
+            // a parseable mirror callId (see RunRecording.lastCutIndex).
+            rec.lastCutIndex = i - 1
+            break
+          }
         }
         if (!mapper.isFinished) {
           const f = rec.failureInfo

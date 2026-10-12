@@ -80,7 +80,14 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   let binCache: string | null | undefined = undefined
   let versionCache: string | null = null
   let dormantReason: string | null = null
-  let lastRun: { processOk: boolean; processCode: string; toolErrors: readonly string[]; durationMs: number; model: string } | null = null
+  let lastRun: {
+    processOk: boolean
+    processCode: string
+    toolErrors: readonly string[]
+    durationMs: number
+    model: string
+    tokenSpeed: { lastTps: number | null; avgTps: number | null; outputTokens: number; measuredSteps: number; generatingMs: number }
+  } | null = null
   let lastParser = new StreamJsonParser()
 
   const getConfig = (): PluginConfig => resolveConfig(entryConfig)
@@ -441,6 +448,11 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           catalogModels: sanitizeCatalogEntries(cat.models).entries,
           hiddenModels: cfg.hiddenModels,
           bindings: Object.keys(store.all()).length,
+          // Windows Credential Manager is ONE shared keyring slot (issue #45):
+          // pool accounts cannot isolate credentials there, so rotation is
+          // cosmetic. The settings panel shows a warning when this is true.
+          credentialIsolationLimited:
+            process.platform === 'win32' && pool.getAccounts().some((a) => a.enabled && !a.systemHome),
           lastRun,
         })
       })()
@@ -578,6 +590,10 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         const body = await readBody(req)
         const alias = typeof body.alias === 'string' ? body.alias : undefined
         const acc = pool.createAccountSlot(alias)
+        // Quarantine until the terminal login completes (same contract as
+        // /agy add-account): the scheduler must not route real runs to a
+        // slot nobody has signed into yet.
+        pool.markAuthRequired(acc.id, 'not signed in yet — complete the terminal login')
         const autoOpen = body.autoOpenTerminal !== false
         if (autoOpen && acc.dir) {
           if (process.platform === 'darwin') {

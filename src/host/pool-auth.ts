@@ -101,6 +101,7 @@ export class PoolAuthFlow {
       this.doneResetTimer = setTimeout(() => {
         if (this.statusValue.phase === 'done') this.statusValue = { phase: 'idle' }
       }, DONE_STATUS_TTL_MS)
+      this.doneResetTimer.unref?.()
     }
   }
 
@@ -152,7 +153,7 @@ export class PoolAuthFlow {
 
     if (listener) {
       void listener.result
-        .then(({ code, state: returnedState }) => this.finishWithCode(code, returnedState))
+        .then(({ code, state: returnedState }) => this.finishWithCode(code, returnedState, active))
         .catch((err: unknown) => {
           if (!this.flow || this.flow.listener !== listener) return
           this.fail('callback_failed', err)
@@ -190,14 +191,25 @@ export class PoolAuthFlow {
     if (parsed.state && parsed.state !== flow.state) {
       return { ok: false, phase: 'waiting', code: 'invalid_state' }
     }
-    await this.finishWithCode(parsed.code, parsed.state ?? flow.state)
+    await this.finishWithCode(parsed.code, parsed.state ?? flow.state, flow)
     const after = this.status()
     return { ...after, ok: after.phase === 'done' }
   }
 
-  private async finishWithCode(code: string, returnedState: string): Promise<void> {
+  /**
+   * Settle the ACTIVE flow with an authorization code.
+   *
+   * `owner` names the flow the code belongs to. Without it, a STALE flow's
+   * late callback (its `exchangeCode` still in flight while the user cancelled
+   * and began flow B) settled against `this.flow` — flow B — and either killed
+   * the new flow with `invalid_state` (deleting B's staging dir) or, worse,
+   * wrote flow A's token file into the freshly cleaned A dir and committed a
+   * ghost account. The identity check makes a stale settlement a no-op.
+   */
+  private async finishWithCode(code: string, returnedState: string, owner?: ActiveFlow): Promise<void> {
     const flow = this.flow
     if (!flow || this.statusValue.phase !== 'waiting') return
+    if (owner !== undefined && owner !== flow) return
     if (returnedState !== flow.state) {
       this.fail('invalid_state')
       return

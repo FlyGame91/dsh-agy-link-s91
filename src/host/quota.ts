@@ -8,7 +8,7 @@
 // "API key is invalid" in the UI. Quota refresh degrades silently to
 // "unavailable" when credentials cannot be sourced.
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -197,22 +197,33 @@ function parseGoKeyringPayload(raw: string): StoredToken | null {
 }
 
 /**
+ * Promisified execFile with a hard timeout. The keyring readers used to run
+ * execFileSync, so a locked Keychain prompt or a slow PowerShell cold start
+ * (up to 8s) froze the WHOLE DSH event loop on every quota poll — the service
+ * runs inside the host process. Async with a timeout keeps the host live.
+ */
+function execFileT(file: string, args: readonly string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, [...args], { encoding: 'utf8', timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+      if (err !== null && err !== undefined) reject(err)
+      else resolve(typeof stdout === 'string' ? stdout : String(stdout))
+    })
+  })
+}
+
+/**
  * Reads the active primary Antigravity OAuth token from the Linux Secret
  * Service (GNOME Keyring / KDE Wallet via FreeDesktop secrets). agy 1.1.15+
  * on Linux stores primary credentials via go-keyring under service "gemini"
  * / username "antigravity" — the same JSON shape as the macOS Keychain.
  * GH #8: without this reader, Linux quota resolution always returned null.
  */
-export function readLinuxSecretToken(): StoredToken | null {
+export async function readLinuxSecretToken(): Promise<StoredToken | null> {
   if (process.platform !== 'linux') return null
 
   // 1. secret-tool (standard libsecret CLI) when available.
   try {
-    const raw = execFileSync(
-      'secret-tool',
-      ['lookup', 'service', 'gemini', 'username', 'antigravity'],
-      { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] },
-    ).trim()
+    const raw = (await execFileT('secret-tool', ['lookup', 'service', 'gemini', 'username', 'antigravity'], 3000)).trim()
     if (raw) {
       const tok = parseGoKeyringPayload(raw)
       if (tok) return tok
@@ -240,11 +251,7 @@ export function readLinuxSecretToken(): StoredToken | null {
   ].join('\n')
   for (const pyBin of ['python3', 'python']) {
     try {
-      const raw = execFileSync(pyBin, ['-c', pyScript], {
-        encoding: 'utf8',
-        timeout: 4000,
-        stdio: ['ignore', 'pipe', 'ignore'],
-      }).trim()
+      const raw = (await execFileT(pyBin, ['-c', pyScript], 4000)).trim()
       if (raw) {
         const tok = parseGoKeyringPayload(raw)
         if (tok) return tok
@@ -261,14 +268,10 @@ export function readLinuxSecretToken(): StoredToken | null {
  * agy 1.1.15+ on macOS stores primary credentials via go-keyring in the Keychain
  * under service "gemini" / account "antigravity" (base64-encoded JSON).
  */
-export function readMacKeychainToken(): StoredToken | null {
+export async function readMacKeychainToken(): Promise<StoredToken | null> {
   if (process.platform !== 'darwin') return null
   try {
-    const raw = execFileSync('security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'], {
-      encoding: 'utf8',
-      timeout: 3000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim()
+    const raw = (await execFileT('security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'], 3000)).trim()
     if (!raw) return null
     return parseGoKeyringPayload(raw)
   } catch {
@@ -284,7 +287,7 @@ export function readMacKeychainToken(): StoredToken | null {
  * empty on Windows: the on-disk `antigravity-oauth-token` file is often
  * absent while agy itself still authenticates via CredRead (issue #30).
  */
-export function readWindowsCredentialToken(): StoredToken | null {
+export async function readWindowsCredentialToken(): Promise<StoredToken | null> {
   if (process.platform !== 'win32') return null
   try {
     const script = [
@@ -319,11 +322,11 @@ export function readWindowsCredentialToken(): StoredToken | null {
       'if ($b -eq $null) { exit 1 }',
       '[Console]::Out.Write([System.Text.Encoding]::UTF8.GetString($b))',
     ].join('\n')
-    const raw = execFileSync(
+    const raw = (await execFileT(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
-    ).trim()
+      8000,
+    )).trim()
     if (!raw) return null
     return parseGoKeyringPayload(raw)
   } catch {
@@ -333,6 +336,8 @@ export function readWindowsCredentialToken(): StoredToken | null {
 
 export class QuotaService {
   private preferredEndpointIndex = 0
+  /** accountId -> in-flight getValidAccessToken attempt (dedup). */
+  private readonly tokenRefreshInFlight = new Map<string, Promise<string | null>>()
 
   /**
    * @param globalProxy resolves the plugin-wide proxy URL; used when the
@@ -359,7 +364,7 @@ export class QuotaService {
    * Read the system-HOME Keychain credential. Protected so tests (and future
    * platforms) can substitute the reader without touching the real Keychain.
    */
-  protected readSystemKeychainToken(): StoredToken | null {
+  protected async readSystemKeychainToken(): Promise<StoredToken | null> {
     if (process.platform === 'darwin') return readMacKeychainToken()
     if (process.platform === 'linux') return readLinuxSecretToken()
     if (process.platform === 'win32') return readWindowsCredentialToken()
@@ -378,7 +383,7 @@ export class QuotaService {
    * WRONG account's numbers). Isolated pool accounts only ever read their
    * own directory's file; the Keychain is one shared slot they must not see.
    */
-  getStoredToken(account: ManagedAccount): StoredToken | null {
+  async getStoredToken(account: ManagedAccount): Promise<StoredToken | null> {
     const disk = (() => {
       const file = this.getTokenFilePath(account)
       if (!existsSync(file)) return null
@@ -393,7 +398,7 @@ export class QuotaService {
     })()
 
     if (account.systemHome || !account.dir) {
-      const keychainToken = this.readSystemKeychainToken()
+      const keychainToken = await this.readSystemKeychainToken()
       if (keychainToken && (keychainToken.accessToken || keychainToken.refreshToken)) {
         return keychainToken
       }
@@ -424,7 +429,7 @@ export class QuotaService {
         raw.access_token = tokens.access_token
         if (tokens.expiryMs) raw.expiry = tokens.expiryMs
       }
-      writeFileSync(file, JSON.stringify(raw), 'utf8')
+      writeFileSync(file, JSON.stringify(raw), { encoding: 'utf8', mode: 0o600 })
     } catch {
       // Best-effort
     }
@@ -434,9 +439,24 @@ export class QuotaService {
    * Get a valid access token, refreshing via refresh_token when expired.
    * Uses the public Antigravity client credentials (env-overridable), so
    * refresh works out of the box.
+   *
+   * Concurrent calls for the SAME account share one in-flight attempt: the
+   * poll timer, three manual HTTP entry points and per-account allSettled
+   * used to race into duplicate refreshTokens for one account (double
+   * risk-control exposure for the same outcome).
    */
   async getValidAccessToken(account: ManagedAccount): Promise<string | null> {
-    const tok = this.getStoredToken(account)
+    const existing = this.tokenRefreshInFlight.get(account.id)
+    if (existing !== undefined) return existing
+    const attempt = this.getValidAccessTokenUncached(account).finally(() => {
+      this.tokenRefreshInFlight.delete(account.id)
+    })
+    this.tokenRefreshInFlight.set(account.id, attempt)
+    return attempt
+  }
+
+  private async getValidAccessTokenUncached(account: ManagedAccount): Promise<string | null> {
+    const tok = await this.getStoredToken(account)
     if (!tok) return null
 
     // Still fresh (with 60s buffer)? Use it directly.
@@ -662,11 +682,17 @@ export class QuotaService {
 
         for (const b of group.buckets || []) {
           const w = (b.window || b.bucketId || '').toLowerCase()
-          if (w.includes('5h')) {
-            fiveHourFrac = b.remainingFraction
+          // Server fractions are clamped to [0,1] and NaN rejected: a bogus
+          // remainingFraction (NaN/negative/>1) used to flow straight into
+          // isAccountEligible and the UI ("NaN%" rows, permanently ineligible).
+          const frac = typeof b.remainingFraction === 'number' && Number.isFinite(b.remainingFraction)
+            ? Math.min(1, Math.max(0, b.remainingFraction))
+            : undefined
+          if (w.includes('5h') || w.includes('five_hour') || w.includes('5-hour')) {
+            fiveHourFrac = frac
             fiveHourReset = b.resetTime
-          } else if (w.includes('weekly')) {
-            weeklyFrac = b.remainingFraction
+          } else if (w.includes('weekly') || w.includes('week')) {
+            weeklyFrac = frac
             weeklyReset = b.resetTime
           }
         }
@@ -690,10 +716,15 @@ export class QuotaService {
       for (const [modelId, entry] of Object.entries(discovered.models)) {
         const fam = modelFamilyOf(modelId)
         if (fam === 'unknown') continue
-        const remaining = entry.quotaInfo?.remainingFraction
+        const rawRemaining = entry.quotaInfo?.remainingFraction
+        // Clamp to [0,1]; non-numeric entries are skipped (same contract as
+        // the summary path above).
+        const remaining = typeof rawRemaining === 'number' && Number.isFinite(rawRemaining)
+          ? Math.min(1, Math.max(0, rawRemaining))
+          : undefined
         const resetTime = entry.quotaInfo?.resetTime
 
-        if (typeof remaining !== 'number' || !Number.isFinite(remaining)) continue
+        if (remaining === undefined) continue
 
         if (!familyModels[fam]) familyModels[fam] = []
         familyModels[fam]!.push({
@@ -753,7 +784,7 @@ export class QuotaService {
     if (!force) {
       const now = Date.now()
       for (const acc of accounts) {
-        const flagged = acc.authRequired || Object.values(acc.cooldowns).some((cd) => cd && cd.cooldownUntil > now)
+        const flagged = acc.authRequired || Object.values(acc.cooldowns ?? {}).some((cd) => cd && cd.cooldownUntil > now)
         if (!acc.systemHome || !flagged) continue
         const home = acc.systemHome || !acc.dir ? homedir() : acc.dir
         const detected = detectEmailFromAgyLogs(home)

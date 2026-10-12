@@ -259,7 +259,11 @@ export function startCallbackListener(timeoutMs = 300_000): CallbackHandle {
     const oauthError = url.searchParams.get('error')
     if (oauthError) {
       res.writeHead(400, { 'Content-Type': 'text/html', connection: 'close' })
-      res.end(`<h2>Authorization failed: ${oauthError}</h2>`)
+      // HTML-escape the reflected query parameter: the raw value used to land
+      // in the page unescaped (reflected XSS inside the loopback origin while
+      // the listener is alive).
+      res.end(`<h2>Authorization failed: ${oauthError.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch] ?? ch)}</h2>`)
+      clearTimeout(timeout)
       rejectResult(new Error(`oauth error: ${oauthError}`))
       setTimeout(() => server.close(), 1500)
       return
@@ -271,12 +275,14 @@ export function startCallbackListener(timeoutMs = 300_000): CallbackHandle {
     }
     res.writeHead(200, { 'Content-Type': 'text/html', connection: 'close' })
     res.end(CALLBACK_SUCCESS_HTML)
+    clearTimeout(timeout)
     resolveResult({ code, state })
     // Give the browser a moment to render before the listener closes.
     setTimeout(() => server.close(), 1500)
   })
 
   server.on('error', (error: NodeJS.ErrnoException) => {
+    clearTimeout(timeout)
     rejectResult(
       error.code === 'EADDRINUSE'
         ? new Error(`port ${OAUTH_CALLBACK_PORT} is busy`)
@@ -312,7 +318,15 @@ export function openBrowser(url: string): Promise<boolean> {
         execFile('open', [url], (err) => resolve(!err))
       } else if (process.platform === 'win32') {
         // The URL query string contains '&', which cmd.exe would read as a
-        // command separator — pass a pre-quoted command line verbatim.
+        // command separator — pass a pre-quoted command line verbatim. A URL
+        // carrying a double quote (or a newline) would escape that quoting
+        // and inject a cmd command, so refuse it: the real authorize URL
+        // never contains either, and a tampered/MITM'd value must not reach
+        // the shell.
+        if (url.includes('"') || /[\r\n]/.test(url)) {
+          resolve(false)
+          return
+        }
         execFile(
           'cmd.exe',
           ['/d', '/s', '/c', `start "" "${url}"`],

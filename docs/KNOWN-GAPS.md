@@ -2,6 +2,22 @@
 
 Deliberate v1 boundaries and upstream-behavior notes.
 
+## Platform limits
+
+- **Windows: pool accounts cannot isolate credentials (issue #45)** — agy on
+  Windows stores its login in the system-wide Credential Manager slot
+  `gemini:antigravity` (go-keyring). `HOME`/`USERPROFILE`/`GEMINI_CLI_HOME`
+  isolation moves files only, so every isolated pool account still
+  authenticates — and bills — as the system login: round-robin rotates
+  workspaces, not credentials. The plugin surfaces
+  `credentialIsolationLimited` in `/plugins/agy-link/status` (rendered as a
+  warning banner in the settings panel) and logs once per isolated account
+  when it is selected. A real fix needs agy to namespace its keyring per
+  HOME or to fall back to the per-HOME token file when the keyring slot is
+  empty; swapping the shared slot via `CredWrite` around each spawn is not
+  implemented because concurrent runs (`maxConcurrent > 1`) would overwrite
+  each other's credential mid-run.
+
 ## Not forwarded to agy
 
 - **Images as true multimodal blocks** - agy print mode (`-p`) has no image

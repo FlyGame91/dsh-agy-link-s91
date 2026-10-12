@@ -1,7 +1,7 @@
 // AccountPoolManager: multi-profile credential isolation, family-scoped cooldown,
 // and sticky sequential drain scheduling for Google Antigravity accounts.
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative } from 'node:path'
 import { homedir } from 'node:os'
 import {
   defaultPoolData,
@@ -23,6 +23,15 @@ export class AccountPoolManager {
   private data: AccountPoolData
   private readonly baseDir: string
   private readonly file: string
+  /**
+   * Account ids this process has seen (loaded from disk + created here). On
+   * persist, disk ids OUTSIDE this set were added by another host process and
+   * are preserved instead of being clobbered (same merge contract as
+   * sessions.json: web + headless share this file).
+   */
+  private readonly knownIds = new Set<string>()
+  /** Serialized snapshot of the last successful persist/load; skips no-op writes. */
+  private persistedJson = ''
 
   constructor(baseDir = defaultPoolDir()) {
     this.baseDir = baseDir
@@ -30,6 +39,8 @@ export class AccountPoolManager {
     this.data = this.load()
     this.bootstrapDefaultAccount()
     this.normalizeLegacyPrimary()
+    this.persistedJson = JSON.stringify(this.data)
+    for (const acc of this.data.accounts) this.knownIds.add(acc.id)
   }
 
   private load(): AccountPoolData {
@@ -39,11 +50,17 @@ export class AccountPoolManager {
         const parsed = JSON.parse(raw) as AccountPoolData
         if (parsed && Array.isArray(parsed.accounts)) {
           for (const acc of parsed.accounts) {
-            if (acc.cooldowns) {
-              for (const [fam, cd] of Object.entries(acc.cooldowns)) {
-                if (cd && cd.reason === 'agy run aborted by caller') {
-                  delete acc.cooldowns[fam as ModelFamily]
-                }
+            // Normalize PARTIAL records: a hand-edited or older pool.json whose
+            // account lacks cooldowns/quotas used to throw a TypeError inside
+            // isAccountEligible -> selectAccount, so EVERY turn failed with an
+            // opaque internal error and no failover at all.
+            if (!acc || typeof acc !== 'object') continue
+            if (acc.cooldowns === undefined || acc.cooldowns === null) acc.cooldowns = {}
+            if (acc.quotas === undefined || acc.quotas === null) acc.quotas = {}
+            if (acc.enabled === undefined) acc.enabled = true
+            for (const [fam, cd] of Object.entries(acc.cooldowns)) {
+              if (cd && cd.reason === 'agy run aborted by caller') {
+                delete acc.cooldowns[fam as ModelFamily]
               }
             }
           }
@@ -54,19 +71,58 @@ export class AccountPoolManager {
         }
       }
     } catch {
-      // Corrupt file recovery
+      // Corrupt file: preserve the only copy for forensics BEFORE the
+      // bootstrap defaults overwrite it on the next persist.
+      try {
+        if (existsSync(this.file)) {
+          copyFileSync(this.file, this.file + '.corrupt-' + Date.now())
+        }
+      } catch {
+        // best effort
+      }
     }
     return defaultPoolData()
   }
 
   private persist(): void {
+    const serialized = JSON.stringify(this.data)
+    // Merge with whatever another host process wrote since our last look so
+    // web + headless stop erasing each other's accounts/cooldowns: disk
+    // accounts this process has never seen are appended; everything else
+    // (including deletions of ids we know) stays as this process wrote it.
+    let merged: AccountPoolData = this.data
+    try {
+      if (existsSync(this.file)) {
+        const onDisk = JSON.parse(readFileSync(this.file, 'utf8')) as AccountPoolData
+        if (onDisk && Array.isArray(onDisk.accounts)) {
+          const ours = new Set(this.data.accounts.map((a) => a.id))
+          const foreign = onDisk.accounts.filter((a) => a && typeof a === 'object' && a.id !== undefined && !ours.has(a.id) && !this.knownIds.has(a.id))
+          if (foreign.length > 0) {
+            merged = { ...this.data, accounts: [...this.data.accounts, ...foreign] }
+            for (const acc of foreign) this.knownIds.add(acc.id as string)
+          }
+        }
+      }
+    } catch {
+      // unreadable/partial file: this process's view wins
+    }
     try {
       mkdirSync(dirname(this.file), { recursive: true })
+      if (serialized === this.persistedJson && merged === this.data) return
       const tmp = join(dirname(this.file), '.pool.json.tmp')
-      writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8')
+      writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8')
       renameSync(tmp, this.file)
-    } catch {
-      // Best-effort persistence
+      this.persistedJson = JSON.stringify(merged)
+      if (merged !== this.data) this.data = merged
+    } catch (e) {
+      // Persistence failure used to be fully silent: cooldowns/quota state
+      // quietly evaporated on restart. Surface it once per failure instead.
+      try {
+        // No logger reaches this class; stderr is the honest channel.
+        console.error('[dsh-agy-link] pool persist failed: ' + String(e))
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -180,6 +236,7 @@ export class AccountPoolManager {
     }
 
     this.data.accounts.push(newAccount)
+    this.knownIds.add(newAccount.id)
     this.persist()
     return newAccount
   }
@@ -278,6 +335,7 @@ export class AccountPoolManager {
     }
 
     this.data.accounts.push(newAccount)
+    this.knownIds.add(newAccount.id)
     this.persist()
     return newAccount
   }
@@ -287,12 +345,19 @@ export class AccountPoolManager {
     if (idx === -1) return false
     const [removed] = this.data.accounts.splice(idx, 1)
     if (removed) {
-      try {
-        if (existsSync(removed.dir)) {
+      // Only ever delete directories the pool itself created under baseDir.
+      // pool.json is hand-editable by design, and a hostile or typo'd `dir`
+      // ("~", "/", an unrelated project folder) used to be rmSync'd
+      // recursively — a data-destruction foot-gun. Out-of-base or system-HOME
+      // directories are left untouched.
+      const rel = removed.dir !== '' ? relative(this.baseDir, removed.dir) : ''
+      const contained = rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
+      if (removed.dir && contained && !removed.systemHome && existsSync(removed.dir)) {
+        try {
           rmSync(removed.dir, { recursive: true, force: true })
+        } catch {
+          // Ignore deletion errors
         }
-      } catch {
-        // Ignore deletion errors
       }
     }
     if (this.data.primaryAccountId === id) {
@@ -448,14 +513,18 @@ export class AccountPoolManager {
    */
   isAccountEligible(acc: ManagedAccount, family: ModelFamily, now = Date.now()): boolean {
     if (!acc.enabled || acc.authRequired) return false
-    const cd = acc.cooldowns[family]
+    const cd = acc.cooldowns?.[family]
     if (cd && cd.cooldownUntil > now) return false
     // If 5h quota remaining is <= 2% and reset time is in future, treat as in cooldown
-    const quota = acc.quotas[family]
+    const quota = acc.quotas?.[family]
     if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= 0.02) {
       if (quota.resetTime) {
         const resetMs = Date.parse(quota.resetTime)
-        if (!Number.isNaN(resetMs) && resetMs > now) return false
+        // An UNPARSEABLE reset behaves like a pending one: the fraction says
+        // the window is drained, so treating the garbage stamp as "already
+        // reset" kept a dead window sticky (same semantics as
+        // updateAccountQuotas' exhaustion check).
+        if (Number.isNaN(resetMs) || resetMs > now) return false
       }
     }
     // If weekly quota remaining is <= 1% and weekly reset time is in future, treat as in cooldown
@@ -492,7 +561,7 @@ export class AccountPoolManager {
    * sooner of the 5h window reset and the weekly cap reset. NaN when unknown.
    */
   private nextQuotaResetAt(acc: ManagedAccount, family: ModelFamily): number {
-    const q = acc.quotas[family]
+    const q = acc.quotas?.[family]
     const stamps = [q?.resetTime, q?.weeklyResetTime]
       .filter((v): v is string => typeof v === 'string' && v !== '')
       .map((v) => Date.parse(v))
@@ -570,12 +639,17 @@ export class AccountPoolManager {
 
     // If an updated family has exhausted its quota, proactively advance to the next account
     const now = Date.now()
+    // An INVALID resetTime must behave like an absent one: Date.parse(NaN) >
+    // now is false, which used to mark a drained window "already reset" and
+    // kept the drained account sticky.
+    const futureReset = (iso: string | undefined): boolean =>
+      typeof iso === 'string' && iso !== '' && !Number.isNaN(Date.parse(iso)) && Date.parse(iso) > now
     for (const [famKey, info] of Object.entries(quotas) as [ModelFamily, FamilyQuotaInfo][]) {
       if (!info) continue
       const isExhausted5h = typeof info.remainingFraction === 'number' && info.remainingFraction <= 0.02 &&
-        (!info.resetTime || Date.parse(info.resetTime) > now)
+        !futureReset(info.resetTime)
       const isExhaustedWeekly = typeof info.weeklyFraction === 'number' && info.weeklyFraction <= 0.01 &&
-        (!info.weeklyResetTime || Date.parse(info.weeklyResetTime) > now)
+        !futureReset(info.weeklyResetTime)
       if (isExhausted5h || isExhaustedWeekly) {
         if (this.data.activeAccountIds?.[famKey] === id || this.data.lastActiveAccountId === id) {
           this.selectAccount(famKey)
@@ -592,6 +666,7 @@ export class AccountPoolManager {
   recordFailure(id: string, family: ModelFamily, reason: string, serverResetTime?: string): void {
     const acc = this.getAccount(id)
     if (!acc) return
+    acc.cooldowns ??= {}
 
     const prev = acc.cooldowns[family]
     const failures = (prev?.consecutiveFailures ?? 0) + 1
@@ -637,7 +712,7 @@ export class AccountPoolManager {
       delete acc.authError
       delete acc.authMarkedAt
     }
-    if (acc.cooldowns[family]) {
+    if (acc.cooldowns?.[family]) {
       delete acc.cooldowns[family]
     }
     this.persist()
@@ -647,10 +722,12 @@ export class AccountPoolManager {
     if (id) {
       const acc = this.getAccount(id)
       if (!acc) return
+      acc.cooldowns ??= {}
       if (family) delete acc.cooldowns[family]
       else acc.cooldowns = {}
     } else {
       for (const acc of this.data.accounts) {
+        acc.cooldowns ??= {}
         if (family) delete acc.cooldowns[family]
         else acc.cooldowns = {}
       }
@@ -717,7 +794,7 @@ export class AccountPoolManager {
     let earliest: number | null = null
     for (const acc of this.data.accounts) {
       if (!acc.enabled) continue
-      const cd = acc.cooldowns[family]
+      const cd = acc.cooldowns?.[family]
       if (cd && cd.cooldownUntil > now) {
         if (earliest === null || cd.cooldownUntil < earliest) {
           earliest = cd.cooldownUntil
@@ -725,5 +802,37 @@ export class AccountPoolManager {
       }
     }
     return earliest !== null ? Math.max(0, earliest - now) : null
+  }
+
+  /**
+   * Earliest moment ANY enabled account could serve `family` again: the sooner
+   * of a cooldown expiry and a quota-window reset.
+   *
+   * `getEarliestResetCountdown` only inspects cooldowns, while an account can
+   * be excluded by its remaining 5h/weekly fraction (isAccountEligible) — so a
+   * fully quota-drained pool reported NO wait at all ("Add an account or wait
+   * for reset") even though every account knew exactly when it resets. Signed
+   * out and disabled accounts are skipped: no countdown can fix them.
+   */
+  getEarliestAvailableCountdown(family: ModelFamily): number | null {
+    const now = Date.now()
+    let earliest: number | null = null
+    const bump = (at: number | null): void => {
+      if (at === null || Number.isNaN(at) || at <= now) return
+      if (earliest === null || at < earliest) earliest = at
+    }
+    for (const acc of this.data.accounts) {
+      if (!acc.enabled || acc.authRequired) continue
+      const cd = acc.cooldowns?.[family]
+      if (cd && cd.cooldownUntil > now) bump(cd.cooldownUntil)
+      const quota = acc.quotas?.[family]
+      if (quota === undefined) continue
+      const drained5h = typeof quota.remainingFraction === 'number' && quota.remainingFraction <= 0.02
+        && typeof quota.resetTime === 'string' && Date.parse(quota.resetTime) > now
+      const drainedWeekly = typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= 0.01
+        && typeof quota.weeklyResetTime === 'string' && Date.parse(quota.weeklyResetTime) > now
+      if (drained5h || drainedWeekly) bump(this.nextQuotaResetAt(acc, family))
+    }
+    return earliest !== null ? Math.max(0, (earliest as number) - now) : null
   }
 }

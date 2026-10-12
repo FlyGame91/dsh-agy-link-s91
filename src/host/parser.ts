@@ -216,6 +216,14 @@ export interface ParserStats {
   consecutiveGarbage: number
   authUrl: string | undefined
   sawAuthFailure: boolean
+  /**
+   * The auth-shaped stdout line(s) that raised `sawAuthFailure`, bounded.
+   * The adapter asks whether THOSE lines also carry transport evidence: agy
+   * reports "silent auth failed / not logged in" for a network-broken token
+   * check just as often as for a real sign-out, and the two need different
+   * treatment (retry on another account vs. stop and ask for a re-login).
+   */
+  authFailureText: string | undefined
   /** Error text from the last result envelope, if any (adapter maps it to AGY_ERROR). */
   lastResultError: string | undefined
 }
@@ -223,7 +231,7 @@ export interface ParserStats {
 export class StreamJsonParser {
   private buffer = ''
   private seq = 0
-  readonly stats: ParserStats = { lines: 0, garbage: 0, consecutiveGarbage: 0, authUrl: undefined, sawAuthFailure: false, lastResultError: undefined }
+  readonly stats: ParserStats = { lines: 0, garbage: 0, consecutiveGarbage: 0, authUrl: undefined, sawAuthFailure: false, authFailureText: undefined, lastResultError: undefined }
   /** Ring buffer of raw stdout lines for /agy doctor export. */
   readonly recentLines: string[] = []
   private readonly maxRecent = 2000
@@ -256,7 +264,13 @@ export class StreamJsonParser {
     this.stats.lines++
     this.recentLines.push(line)
     if (this.recentLines.length > this.maxRecent) this.recentLines.splice(0, this.recentLines.length - this.maxRecent)
-    if (looksLikeAuthFailure(line)) this.stats.sawAuthFailure = true
+    if (looksLikeAuthFailure(line)) {
+      this.stats.sawAuthFailure = true
+      const prev = this.stats.authFailureText ?? ''
+      if (prev.length < 600) {
+        this.stats.authFailureText = (prev === '' ? '' : prev + ' ') + line.trim().slice(0, 300)
+      }
+    }
     if (this.stats.authUrl === undefined) {
       const u = extractAuthUrl(line)
       if (u) this.stats.authUrl = u

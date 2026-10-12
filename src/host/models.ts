@@ -199,6 +199,14 @@ export type DiscoverFn = (signal?: AbortSignal) => Promise<{ stdout: string; std
 export class ModelCatalog {
   private current: Catalog;
   private refreshing: Promise<void> | null = null;
+  /**
+   * While the catalog is still on the fallback source, re-probe at most once
+   * per this interval: `agy models` costs a 30s-capped spawn, and with the
+   * user signed out EVERY listModels call (picker open, resolveModel, stream)
+   * used to trigger one — a spawn storm that never converged.
+   */
+  private static readonly FALLBACK_RETRY_MS = 60_000;
+  private lastAttemptAt = 0;
 
   constructor(
     private readonly discover: DiscoverFn,
@@ -219,8 +227,11 @@ export class ModelCatalog {
   /** Refresh if stale; never throws — failures keep the previous catalog. */
   async refreshIfNeeded(): Promise<void> {
     if (this.refreshing) return this.refreshing;
-    const age = Date.now() - this.current.discoveredAt;
+    const now = Date.now();
+    const age = now - this.current.discoveredAt;
     if (this.current.source === 'discovered' && age < this.ttlMs) return;
+    if (this.current.source === 'fallback' && now - this.lastAttemptAt < ModelCatalog.FALLBACK_RETRY_MS) return;
+    this.lastAttemptAt = now;
     this.refreshing = this.refresh().finally(() => {
       this.refreshing = null;
     });
