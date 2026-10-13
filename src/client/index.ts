@@ -33,10 +33,10 @@ const win = globalThis as unknown as {
 	removeEventListener?: (type: string, listener: (ev: any) => void, useCapture?: boolean) => void;
 };
 
-const bodyEl = win.document?.body ?? null;
 const portalToBody = (node: unknown) => {
-	if (bodyEl && reactDom && typeof reactDom.createPortal === 'function') {
-		return reactDom.createPortal(node, bodyEl);
+	const body = win.document?.body ?? (typeof document !== 'undefined' ? document.body : null);
+	if (body && reactDom && typeof reactDom.createPortal === 'function') {
+		return reactDom.createPortal(node, body);
 	}
 	return node;
 };
@@ -145,6 +145,16 @@ async function postJson(path: string, body: Record<string, unknown>): Promise<an
 	}
 }
 
+async function getJson<T = any>(path: string): Promise<T | null> {
+	try {
+		const res = await win.fetch?.(base + path);
+		if (!res || !res.ok) return null;
+		return (await res.json()) as T;
+	} catch {
+		return null;
+	}
+}
+
 // ---- shared status polling ----
 // ONE module-level fetch loop serves every mounted consumer (settings panel,
 // header badge, modal). Per-component 3s loops used to stack (three full
@@ -153,6 +163,16 @@ async function postJson(path: string, body: Record<string, unknown>): Promise<an
 const statusListeners = new Set<(s: StatusPayload) => void>();
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusFetchSeq = 0;
+
+function isStatusEqual(a: StatusPayload | null, b: StatusPayload | null): boolean {
+	if (a === b) return true;
+	if (a === null || b === null) return false;
+	try {
+		return JSON.stringify(a) === JSON.stringify(b);
+	} catch {
+		return false;
+	}
+}
 
 function notifyStatus(st: StatusPayload): void {
 	statusCache = st;
@@ -165,7 +185,12 @@ async function statusPollTick(): Promise<void> {
 	const seq = ++statusFetchSeq;
 	const st = await getStatus();
 	// A slow response from an older tick must never overwrite newer data.
-	if (st !== null && seq === statusFetchSeq) notifyStatus(st);
+	// Only notify when payload actually changed to prevent needless re-renders.
+	if (st !== null && seq === statusFetchSeq) {
+		if (!isStatusEqual(statusCache, st)) {
+			notifyStatus(st);
+		}
+	}
 }
 
 function ensureStatusPolling(): void {
@@ -219,6 +244,28 @@ const agyModalStore = {
 		};
 	},
 };
+
+/**
+ * Singleton modal instance manager: ensures at most one modal dialog is
+ * rendered into document.body at any time even when multiple session headers mount.
+ */
+let primaryModalInstanceId: string | null = null;
+const modalInstanceIds = new Set<string>();
+
+function registerModalInstance(id: string): boolean {
+	modalInstanceIds.add(id);
+	if (primaryModalInstanceId === null || !modalInstanceIds.has(primaryModalInstanceId)) {
+		primaryModalInstanceId = id;
+	}
+	return primaryModalInstanceId === id;
+}
+
+function unregisterModalInstance(id: string): void {
+	modalInstanceIds.delete(id);
+	if (primaryModalInstanceId === id) {
+		primaryModalInstanceId = modalInstanceIds.values().next().value ?? null;
+	}
+}
 
 /**
  * Format reset timestamp into readable date/time + relative countdown.
@@ -585,12 +632,13 @@ body.dark,
 	border-radius: 50%;
 }
 .agy-card-hover {
-	transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease;
+	transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s ease;
 }
 .agy-card-hover:hover {
 	border-color: var(--agy-border-card-primary, #3b82f6) !important;
 	box-shadow: var(--agy-shadow-card-hover) !important;
 }
+
 .agy-btn {
 	transition: all 0.15s ease;
 	user-select: none;
@@ -645,6 +693,18 @@ body.dark,
 	color: var(--agy-text-primary);
 }
 `;
+
+function injectGlobalStyles(): void {
+	if (typeof document === 'undefined') return;
+	const styleId = 'dsh-agy-link-global-css';
+	if (document.getElementById(styleId) === null) {
+		const st = document.createElement('style');
+		st.id = styleId;
+		st.textContent = GLOBAL_CSS;
+		const host = document.head ?? document.documentElement;
+		if (host) host.appendChild(st);
+	}
+}
 
 const S: Record<string, Record<string, unknown>> = {
 	container: {
@@ -716,27 +776,29 @@ const S: Record<string, Record<string, unknown>> = {
 	card: {
 		background: 'var(--agy-bg-card)',
 		border: '1px solid var(--agy-border-card)',
-		borderRadius: '10px',
-		padding: '14px 16px',
-		marginBottom: '12px',
+		borderRadius: '8px',
+		padding: '10px 14px',
+		marginBottom: '8px',
 		color: 'var(--agy-text-primary)',
 		boxShadow: 'var(--agy-shadow-card)',
+		transition: 'all 0.18s cubic-bezier(0.16, 1, 0.3, 1)',
 	},
 	cardPrimary: {
-		background: 'var(--agy-bg-card-primary)',
-		border: '1.5px solid var(--agy-border-card-primary)',
-		borderRadius: '10px',
-		padding: '14px 16px',
-		marginBottom: '12px',
-		boxShadow: 'var(--agy-shadow-card-primary)',
+		background: 'var(--agy-bg-card)',
+		border: '1px solid var(--agy-border-card)',
+		borderRadius: '8px',
+		padding: '10px 14px',
+		marginBottom: '8px',
 		color: 'var(--agy-text-primary)',
+		boxShadow: 'var(--agy-shadow-card)',
+		transition: 'all 0.18s cubic-bezier(0.16, 1, 0.3, 1)',
 	},
 	quotaBox: {
 		background: 'var(--agy-bg-box)',
 		border: '1px solid var(--agy-border-box)',
 		borderRadius: '8px',
 		padding: '8px 10px',
-		marginTop: '10px',
+		marginTop: '8px',
 	},
 	progressBarBg: {
 		flex: '1',
@@ -891,6 +953,7 @@ export function apply(ctx: ClientContext): void {
 		return locale.bind(NS) as (key: AgyLocaleKey, params?: Record<string, unknown>) => string;
 	};
 	const AgySettingsSection = (props?: any): unknown => {
+		injectGlobalStyles();
 		const t = useAgyTranslation();
 		const { status, refresh } = useAgyStatus();
 		const [aliasInput, setAliasInput] = useState('');
@@ -901,6 +964,11 @@ export function apply(ctx: ClientContext): void {
 		const [loadingAction, setLoadingAction] = useState<string | null>(null);
 		const [toast, setToast] = useState<ToastNotice | null>(null);
 		const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
+		const [addType, setAddType] = useState<'agy' | 'gemini-web'>('agy');
+		const [selectedBrowser, setSelectedBrowser] = useState<'chrome' | 'edge'>('chrome');
+		const [addProxyInput, setAddProxyInput] = useState('');
+
+		const [browserLoginState, setBrowserLoginState] = useState<{ active?: boolean; status?: string; message?: string } | null>(null);
 
 		// Cooldown expiry and quota countdowns are Date.now()-derived while the
 		// payload itself does NOT change when they lapse — without a wall-clock
@@ -925,6 +993,7 @@ export function apply(ctx: ClientContext): void {
 				setAddingAccount(false);
 				setAuthCodeInput('');
 				setAliasInput('');
+				setAddProxyInput('');
 				showToast(safeMessage(pa.code), 'success');
 			} else if (pa.phase === 'failed') {
 				flowStartedRef.current = false;
@@ -956,7 +1025,11 @@ export function apply(ctx: ClientContext): void {
 		const handleBeginAddAccount = async (): Promise<void> => {
 			setLoadingAction('pool:beginAdd');
 			const alias = aliasInput.trim();
-			const res = await postJson('/plugins/agy-link/pool/begin-add', alias ? { alias } : {});
+			const proxyUrl = addProxyInput.trim();
+			const res = await postJson('/plugins/agy-link/pool/begin-add', {
+				...(alias ? { alias } : {}),
+				...(proxyUrl ? { proxyUrl } : {}),
+			});
 			setLoadingAction(null);
 			if (res && res.ok) {
 				flowStartedRef.current = true;
@@ -980,6 +1053,7 @@ export function apply(ctx: ClientContext): void {
 				flowStartedRef.current = false;
 				setAuthCodeInput('');
 				setAliasInput('');
+				setAddProxyInput('');
 				setAddingAccount(false);
 				await refresh();
 				showToast(safeMessage(res.code), 'success');
@@ -991,11 +1065,102 @@ export function apply(ctx: ClientContext): void {
 		const handleCancelAddAccount = async (): Promise<void> => {
 			flowStartedRef.current = false;
 			await postJson('/plugins/agy-link/pool/cancel-add', {});
+			if (browserLoginState?.active) {
+				await postJson('/plugins/agy-link/pool/cancel-browser-login', {});
+				setBrowserLoginState(null);
+			}
 			setAuthCodeInput('');
 			setAliasInput('');
+			setAddProxyInput('');
 			setAddingAccount(false);
 			await refresh();
 		};
+
+		const reorderAccounts = async (newIds: string[]): Promise<void> => {
+			setLoadingAction('pool:reorder');
+			const res = await postJson('/plugins/agy-link/pool/reorder', { ids: newIds });
+			setLoadingAction(null);
+			if (res && res.ok) {
+				await refresh();
+				showToast(t('account.reordered'), 'success');
+			} else {
+				actionFailed();
+			}
+		};
+
+		const moveAccount = async (accId: string, delta: number): Promise<void> => {
+			const ids = (status?.pool?.accounts ?? []).map((a) => a.id);
+			const idx = ids.indexOf(accId);
+			if (idx === -1) return;
+			const newIdx = idx + delta;
+			if (newIdx < 0 || newIdx >= ids.length) return;
+			const [moved] = ids.splice(idx, 1);
+			if (moved) ids.splice(newIdx, 0, moved);
+			await reorderAccounts(ids);
+		};
+
+		const handleStartBrowserLogin = async (browser?: 'chrome' | 'edge', accountId?: string): Promise<void> => {
+			setLoadingAction(accountId ? `relogin:${accountId}` : 'pool:startBrowserLogin');
+			const targetBrowser = browser || selectedBrowser;
+			const res = await postJson('/plugins/agy-link/pool/start-browser-login', {
+				alias: accountId ? '' : aliasInput.trim(),
+				proxyUrl: (accountId ? undefined : addProxyInput.trim()) || undefined,
+				browser: targetBrowser,
+				accountId,
+			});
+			setLoadingAction(null);
+			if (res && res.ok) {
+				setBrowserLoginState({ active: true, status: 'launching', message: '正在启动独立 Profile 浏览器环境...' });
+				showToast(`已启动 ${targetBrowser === 'edge' ? 'Microsoft Edge' : 'Google Chrome'}（独立隔离 Profile）...`, 'info');
+			} else {
+				showToast(res?.error || '启动浏览器登录失败', 'error');
+			}
+		};
+
+		const handleCancelBrowserLogin = async (): Promise<void> => {
+			await postJson('/plugins/agy-link/pool/cancel-browser-login', {});
+			setBrowserLoginState(null);
+		};
+
+		const testWebAccount = async (id: string): Promise<void> => {
+			setLoadingAction(`testWeb:${id}`);
+			const res = await postJson('/plugins/agy-link/pool/test-web-account', { id });
+			setLoadingAction(null);
+			if (res && res.ok) {
+				await refresh();
+				const emailSuffix = res.email ? ` (${res.email})` : '';
+				showToast(`${t('web.testSuccess')}${emailSuffix}`, 'success');
+			} else {
+				showToast(res?.error || t('web.testFailed'), 'error');
+			}
+		};
+
+		useEffect(() => {
+			if (!browserLoginState?.active) return;
+			const timer = setInterval(async () => {
+				const res = await getJson<{ ok?: boolean; progress?: { active?: boolean; status?: string; message?: string } }>('/plugins/agy-link/pool/browser-login-status');
+				if (res && res.progress) {
+					setBrowserLoginState((prev) => {
+						if (prev && prev.active === res.progress?.active && prev.status === res.progress?.status && prev.message === res.progress?.message) {
+							return prev;
+						}
+						return res.progress!;
+					});
+					if (res.progress.status === 'success') {
+						setBrowserLoginState(null);
+						setAddingAccount(false);
+						setAliasInput('');
+						setAddProxyInput('');
+						await refresh();
+						showToast(res.progress.message || 'Gemini 网页端账号添加成功', 'success');
+					} else if (res.progress.status === 'failed') {
+						setBrowserLoginState(null);
+						showToast(res.progress.message || '浏览器登录捕获失败', 'error');
+					}
+				}
+			}, 1500);
+			return () => clearInterval(timer);
+		}, [browserLoginState?.active]);
 
 		const setCfg = async (key: string, value: unknown): Promise<void> => {
 			setLoadingAction(`config:${key}`);
@@ -1248,12 +1413,19 @@ export function apply(ctx: ClientContext): void {
 			const dotColor = !acc.enabled ? '#64748b' : isAuthRequired ? '#ef4444' : hasCooldown ? '#f59e0b' : '#10b981';
 			const isEditingProxy = editingProxyId === acc.id;
 			const isExpanded = expandedModels[acc.id] ?? false;
+			const isWeb = acc.type === 'gemini-web';
+			const accIndex = accounts.indexOf(acc);
 
-			const cardStyle = isPrimary ? { ...S.cardPrimary } : { ...S.card };
+			const cardStyle = {
+				...S.card,
+				cursor: 'default',
+				padding: '10px 14px',
+				marginBottom: '8px',
+			};
 			// Built-in aliases are canonical server data; translate display only.
 			const legacyDefault = acc.defaultAlias === undefined && acc.systemHome && acc.alias === '主账号 (系统登录)';
 			const displayAlias = acc.defaultAlias || legacyDefault
-				? acc.systemHome ? t('account.defaultAlias') : t('account.aliasDefault', { number: accounts.indexOf(acc) + 1 })
+				? acc.systemHome ? t('account.defaultAlias') : t('account.aliasDefault', { number: accIndex + 1 })
 				: acc.alias;
 
 			const googleModels = acc.quotas.google?.models ?? [];
@@ -1265,29 +1437,126 @@ export function apply(ctx: ClientContext): void {
 				...openaiModels.map((m) => ({ family: 'OpenAI', model: m })),
 			];
 
-			return h('div', { key: acc.id, className: 'agy-card-hover', style: cardStyle },
-				h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' } },
-					h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
+			return h('div', {
+				key: acc.id,
+				className: 'agy-card-hover',
+				style: cardStyle,
+			},
+				// Header row
+				h('div', {
+					style: {
+						display: 'flex',
+						alignItems: 'center',
+						justifyContent: 'space-between',
+						userSelect: 'none',
+						gap: '8px',
+						marginBottom: '8px',
+					},
+				},
+					h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', flex: '1', minWidth: 0 } },
+						h('span', {
+							style: {
+								...S.badgeTag,
+								fontWeight: 700,
+								fontSize: '10.5px',
+								padding: '1px 5px',
+								background: isPrimary ? 'var(--agy-badge-primary-bg)' : 'var(--agy-badge-tag-bg)',
+								color: isPrimary ? 'var(--agy-badge-primary-text)' : 'var(--agy-badge-tag-text)',
+								borderColor: isPrimary ? 'var(--agy-badge-primary-border)' : 'var(--agy-badge-tag-border)',
+							},
+							title: `优先级 #${accIndex + 1}`,
+						}, `#${accIndex + 1}`),
+						accounts.length > 1 ? h('div', {
+							style: { display: 'inline-flex', gap: '2px', alignItems: 'center' },
+						},
+							accIndex > 0 ? h('button', {
+								type: 'button',
+								className: 'agy-btn',
+								style: { ...S.btnSm, padding: '1px 4px', fontSize: '10px', lineHeight: 1, height: '18px' },
+								title: t('account.moveUp'),
+								onClick: () => void moveAccount(acc.id, -1),
+							}, uiIcon('arrowUp', 10)) : null,
+							accIndex < accounts.length - 1 ? h('button', {
+								type: 'button',
+								className: 'agy-btn',
+								style: { ...S.btnSm, padding: '1px 4px', fontSize: '10px', lineHeight: 1, height: '18px' },
+								title: t('account.moveDown'),
+								onClick: () => void moveAccount(acc.id, 1),
+							}, uiIcon('arrowDown', 10)) : null,
+						) : null,
 						h('span', {
 							className: 'agy-pulse-dot',
-							style: { background: dotColor, boxShadow: `0 0 8px ${dotColor}aa` },
+							style: { background: dotColor, boxShadow: `0 0 6px ${dotColor}aa`, marginLeft: '1px' },
 						}),
-						h('span', { style: { fontWeight: 700, fontSize: '13.5px', color: 'var(--agy-text-primary)' } }, displayAlias),
+						h('span', {
+							style: {
+								fontWeight: 700,
+								fontSize: '13px',
+								color: 'var(--agy-text-primary)',
+								whiteSpace: 'nowrap',
+							},
+							title: displayAlias,
+						}, displayAlias),
+						isWeb ? h('span', {
+							style: {
+								...S.badgeTag,
+								background: 'rgba(142, 117, 178, 0.15)',
+								color: '#8e75b2',
+								borderColor: 'rgba(142, 117, 178, 0.4)',
+								gap: '3px',
+								fontSize: '10px',
+								padding: '1px 5px',
+								fontWeight: 700,
+							},
+						}, brandIcon('gemini', 10), 'Web') : h('span', {
+							style: {
+								...S.badgeTag,
+								background: 'rgba(59, 130, 246, 0.12)',
+								color: '#3b82f6',
+								borderColor: 'rgba(59, 130, 246, 0.35)',
+								fontSize: '10px',
+								padding: '1px 5px',
+								fontWeight: 700,
+							},
+						}, 'AGY'),
 						isAuthRequired ? h('span', {
 							style: {
 								...S.badgeTag,
 								background: 'var(--agy-badge-email-bg)',
 								color: '#ef4444',
 								borderColor: '#fca5a5',
-								gap: '4px',
+								gap: '3px',
+								fontSize: '10px',
+								padding: '1px 5px',
 								fontWeight: 700,
 							},
-						}, uiIcon('alert', 11, '#ef4444'), t('status.authRequired')) : null,
-						acc.email ? h('span', { style: { ...S.badgeTag, background: 'var(--agy-badge-email-bg)', color: 'var(--agy-badge-email-text)', borderColor: 'var(--agy-badge-email-border)', gap: '5px' } },
-							uiIcon('mail', 11, 'var(--agy-badge-email-text)'),
-							acc.email,
-						) : null,
-						isPrimary ? h('span', { style: { ...S.badgePrimary, gap: '4px' } },
+						}, uiIcon('alert', 10, '#ef4444'), t('status.authRequired')) : null,
+						hasCooldown ? h('span', {
+							style: {
+								...S.badgeTag,
+								background: 'rgba(245, 158, 11, 0.15)',
+								color: '#f59e0b',
+								borderColor: 'rgba(245, 158, 11, 0.4)',
+								gap: '3px',
+								fontSize: '10px',
+								padding: '1px 5px',
+								fontWeight: 700,
+							},
+						}, uiIcon('alert', 10, '#f59e0b'), '冷却中') : null,
+						acc.email ? h('span', {
+							style: {
+								...S.badgeTag,
+								background: 'var(--agy-badge-email-bg)',
+								color: 'var(--agy-badge-email-text)',
+								borderColor: 'var(--agy-badge-email-border)',
+								gap: '4px',
+								fontSize: '11px',
+								padding: '1px 6px',
+								whiteSpace: 'nowrap',
+							},
+							title: acc.email,
+						}, uiIcon('mail', 10, 'var(--agy-badge-email-text)'), acc.email) : null,
+						isPrimary ? h('span', { style: { ...S.badgePrimary, gap: '3px', fontSize: '10.5px', padding: '1px 5px' } },
 							uiIcon('star', 10, 'var(--agy-badge-primary-text)'),
 							t('status.primary'),
 						) : null,
@@ -1297,84 +1566,152 @@ export function apply(ctx: ClientContext): void {
 								background: 'rgba(16, 185, 129, 0.12)',
 								color: '#10b981',
 								borderColor: 'rgba(16, 185, 129, 0.45)',
-								gap: '4px',
+								gap: '3px',
+								fontSize: '10px',
+								padding: '1px 5px',
 								fontWeight: 700,
 							},
 							title: t('status.inUse'),
-						}, uiIcon('zap', 11, '#10b981'), t('status.inUse')) : null,
-						acc.proxyUrl ? h('span', { style: { ...S.badgeTag, background: 'var(--agy-badge-proxy-bg)', color: 'var(--agy-badge-proxy-text)', borderColor: 'var(--agy-badge-proxy-border)', gap: '5px' } },
-							uiIcon('globe', 11, 'var(--agy-badge-proxy-text)'),
-							t('status.proxy'),
-						) : null,
+						}, uiIcon('zap', 10, '#10b981'), t('status.inUse')) : null,
+						acc.proxyUrl ? h('span', {
+							style: {
+								...S.badgeTag,
+								background: 'var(--agy-badge-proxy-bg)',
+								color: 'var(--agy-badge-proxy-text)',
+								borderColor: 'var(--agy-badge-proxy-border)',
+								gap: '4px',
+								fontSize: '10px',
+								padding: '1px 5px',
+							},
+						}, uiIcon('globe', 10, 'var(--agy-badge-proxy-text)'), t('status.proxy')) : null,
 					),
-					h('div', { style: { display: 'flex', gap: '5px', alignItems: 'center' } },
-						allChildModels.length > 0 ? h('button', {
+					h('div', {
+						style: { display: 'flex', gap: '4px', alignItems: 'center', flexShrink: 0 },
+					},
+						isWeb ? [
+							h('button', {
+								type: 'button',
+								className: 'agy-btn',
+								style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
+								disabled: isBusy,
+								onClick: () => void testWebAccount(acc.id),
+							}, loadingAction === `testWeb:${acc.id}` ? [renderSpinner(), t('web.testing')] : [uiIcon('zap', 10), ' 测试连接']),
+							isAuthRequired ? h('button', {
+								type: 'button',
+								className: 'agy-btn',
+								style: { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' },
+								disabled: isBusy,
+								onClick: () => void handleStartBrowserLogin(undefined, acc.id),
+							}, loadingAction === `relogin:${acc.id}` ? [renderSpinner(), '登录中...'] : [uiIcon('externalLink', 10), ` ${t('web.relogin')}`]) : null,
+						] : null,
+						!isWeb ? h('button', {
 							type: 'button',
 							className: 'agy-btn',
-							style: isExpanded ? { ...S.btnSmPrimary, gap: '3px' } : { ...S.btnSm, gap: '3px' },
+							style: isExpanded ? { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' } : { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							onClick: () => toggleExpand(acc.id),
-						}, isExpanded ? [uiIcon('chevronUp', 11), ` ${t('account.collapse')}`] : [uiIcon('chevronDown', 11), ` ${t('account.details')}`]) : null,
-						h('button', {
+						}, isExpanded ? [uiIcon('chevronUp', 10), ` ${t('account.collapse')}`] : [uiIcon('chevronDown', 10), ` ${t('account.otherModels')}`]) : null,
+						!isWeb ? h('button', {
 							type: 'button',
 							className: 'agy-btn',
-							style: { ...S.btnSm, gap: '4px' },
+							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							title: t('account.syncTitle'),
 							disabled: isBusy,
 							onClick: () => void refreshQuota(acc.id),
-						}, loadingAction === `refresh:${acc.id}` ? [renderSpinner(), t('account.syncing')] : [uiIcon('refresh', 11), ` ${t('account.sync')}`]),
+						}, loadingAction === `refresh:${acc.id}` ? [renderSpinner(), t('account.syncing')] : [uiIcon('refresh', 10), ` ${t('account.sync')}`]) : null,
 						!isPrimary ? h('button', {
 							type: 'button',
 							className: 'agy-btn',
-							style: { ...S.btnSm, gap: '4px' },
+							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							disabled: isBusy,
 							onClick: () => void setPrimary(acc.id),
-						}, loadingAction === `primary:${acc.id}` ? [renderSpinner(), t('account.settingPrimary')] : [uiIcon('star', 11), ` ${t('account.setPrimary')}`]) : null,
+						}, loadingAction === `primary:${acc.id}` ? [renderSpinner(), t('account.settingPrimary')] : [uiIcon('star', 10), ` ${t('account.setPrimary')}`]) : null,
 						h('button', {
 							type: 'button',
 							className: 'agy-btn',
-							style: isEditingProxy ? { ...S.btnSmPrimary, gap: '4px' } : { ...S.btnSm, gap: '4px' },
+							style: isEditingProxy ? { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' } : { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							disabled: isBusy,
 							onClick: () => setEditingProxyId(isEditingProxy ? null : acc.id),
-						}, [uiIcon('globe', 11), ` ${t('proxy.button')}`]),
+						}, [uiIcon('globe', 10), ` ${t('proxy.button')}`]),
 						accounts.length > 1 ? h('button', {
 							type: 'button',
 							className: 'agy-btn',
-							style: { ...S.btnDanger, padding: '3px 7px' },
+							style: { ...S.btnDanger, padding: '2px 6px', fontSize: '11px' },
 							title: t('account.removeTitle'),
 							'aria-label': t('account.removeTitle'),
 							disabled: isBusy,
 							onClick: () => void removeAccount(acc.id, displayAlias),
-						}, loadingAction === `remove:${acc.id}` ? renderSpinner() : uiIcon('trash', 12, 'var(--agy-danger-text)')) : null,
+						}, loadingAction === `remove:${acc.id}` ? renderSpinner() : uiIcon('trash', 11, 'var(--agy-danger-text)')) : null,
 					),
 				),
-				h('div', { style: S.quotaBox },
-					renderQuotaBar('Gemini', 'google', acc),
-					renderQuotaBar('Claude', 'anthropic', acc),
-					renderQuotaBar('GPT-OSS', 'openai', acc),
-					isExpanded && allChildModels.length > 0 ? h('div', {
-						style: {
-							marginTop: '8px',
-							paddingTop: '8px',
-							borderTop: '1px solid var(--agy-border-box)',
+				// Body: Always directly visible, showing Gemini quota
+				isWeb
+					? h('div', { key: 'web-body', style: S.quotaBox },
+						h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 8px', background: 'var(--agy-bg-subbox)', borderRadius: '6px' } },
+							h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, fontSize: '12px' } },
+								brandIcon('gemini', 14),
+								h('span', null, 'Gemini 网页端免额度通道 (chat.gemini.google.com)'),
+							),
+							h('span', { style: { fontSize: '11px', color: '#10b981', fontWeight: 700 } }, '✓ 正常就绪'),
+						),
+						h('div', { style: { fontSize: '11px', color: 'var(--agy-text-secondary)', marginTop: '6px', padding: '0 4px', lineHeight: 1.4 } },
+							'仅服务 Google 模型家族（直接映射用户选中的模型）；非 Google 家族请求将自动顺延调度至 agy 账号。'
+						),
+					)
+					: h('div', { key: 'agy-body', style: S.quotaBox },
+						renderQuotaBar('Gemini', 'google', acc),
+						h('button', {
+							type: 'button',
+							className: 'agy-btn',
+							style: {
+								width: '100%',
+								display: 'flex',
+								alignItems: 'center',
+								justifyContent: 'center',
+								gap: '5px',
+								marginTop: '6px',
+								padding: '5px 10px',
+								fontSize: '11px',
+								fontWeight: 600,
+								cursor: 'pointer',
+								color: isExpanded ? 'var(--dsw-alias-state-business-primary, #3b82f6)' : 'var(--agy-text-secondary)',
+								background: 'var(--agy-bg-subbox)',
+								border: '1px dashed var(--agy-border-box)',
+								borderRadius: '6px',
+							},
+							onClick: () => toggleExpand(acc.id),
 						},
-					},
-						h('div', { style: { color: 'var(--agy-text-secondary)', marginBottom: '6px', fontWeight: 600, fontSize: '11px' } }, t('account.models')),
-						allChildModels.map(({ family, model }) => {
-							const frac = model.remainingFraction ?? 1;
-							const pct = Math.round(frac * 100);
-							const w = formatQuotaWindow(t, model.resetTime);
-							const pColor = pct <= 20 ? 'var(--agy-quota-low-text)' : pct <= 50 ? 'var(--agy-quota-med-text)' : 'var(--agy-quota-high-text)';
-							return h('div', { key: model.modelId, className: 'agy-submodel-row' },
-								h('span', { style: { fontWeight: 500, color: 'var(--agy-text-primary)' } }, `[${family}] ${model.displayName || model.modelId}`),
-								h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-									h('span', { style: { color: pColor, fontWeight: 700 } }, `${pct}%`),
-									w.resetText ? h('span', { style: { color: 'var(--agy-text-tertiary)', fontSize: '10.5px' } }, `↻ ${w.resetText}`) : null,
-								),
-							);
-						}),
-					) : null,
-				),
+							uiIcon(isExpanded ? 'chevronUp' : 'chevronDown', 10),
+							h('span', null, isExpanded ? t('account.collapseOthers') : t('account.expandOthers')),
+						),
+						isExpanded ? [
+							renderQuotaBar('Claude', 'anthropic', acc),
+							renderQuotaBar('GPT-OSS', 'openai', acc),
+							allChildModels.length > 0 ? h('div', {
+								style: {
+									marginTop: '8px',
+									paddingTop: '8px',
+									borderTop: '1px solid var(--agy-border-box)',
+								},
+							},
+								h('div', { style: { color: 'var(--agy-text-secondary)', marginBottom: '6px', fontWeight: 600, fontSize: '11px' } }, t('account.models')),
+								allChildModels.map(({ family, model }) => {
+									const frac = model.remainingFraction ?? 1;
+									const pct = Math.round(frac * 100);
+									const w = formatQuotaWindow(t, model.resetTime);
+									const pColor = pct <= 20 ? 'var(--agy-quota-low-text)' : pct <= 50 ? 'var(--agy-quota-med-text)' : 'var(--agy-quota-high-text)';
+									return h('div', { key: `${family}-${model.modelId}`, className: 'agy-submodel-row' },
+										h('span', { style: { fontWeight: 500, color: 'var(--agy-text-primary)' } }, `[${family}] ${model.displayName || model.modelId}`),
+										h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+											h('span', { style: { color: pColor, fontWeight: 700 } }, `${pct}%`),
+											w.resetText ? h('span', { style: { color: 'var(--agy-text-tertiary)', fontSize: '10.5px' } }, `↻ ${w.resetText}`) : null,
+										),
+									);
+								}),
+							) : null,
+						] : null,
+					),
 				hasCooldown ? h('div', {
+					key: 'cd-body',
 					style: {
 						background: 'var(--agy-warn-bg)',
 						border: '1px solid var(--agy-warn-border)',
@@ -1402,6 +1739,7 @@ export function apply(ctx: ClientContext): void {
 					}, loadingAction === `clearCooldown:${acc.id}` ? [renderSpinner(), ''] : [uiIcon('zap', 11, 'var(--agy-warn-btn-text)'), ` ${t('account.clearCooldown')}`]),
 				) : null,
 				isEditingProxy ? h('div', {
+					key: 'proxy-body',
 					style: {
 						marginTop: '8px',
 						padding: '10px 12px',
@@ -1442,13 +1780,124 @@ export function apply(ctx: ClientContext): void {
 
 		const addAccountSection = addingAccount
 			? h('div', { style: S.authModal, role: 'group', 'aria-label': t('account.add') },
-				h('div', { style: { fontWeight: 700, fontSize: '13.5px', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--agy-text-primary)' } },
-					uiIcon('plus', 13, 'var(--agy-btn-primary-bg)'),
-					t('account.add'),
+				h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px', flexWrap: 'wrap', gap: '8px' } },
+					h('div', { style: { fontWeight: 700, fontSize: '13.5px', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--agy-text-primary)' } },
+						uiIcon('plus', 13, 'var(--agy-btn-primary-bg)'),
+						t('account.add'),
+					),
+					h('div', { style: S.segGroup },
+						h('button', {
+							type: 'button',
+							style: addType === 'agy' ? S.segBtnActive : S.segBtn,
+							onClick: () => setAddType('agy'),
+						}, t('account.type.agy')),
+						h('button', {
+							type: 'button',
+							style: addType === 'gemini-web' ? S.segBtnActive : S.segBtn,
+							onClick: () => setAddType('gemini-web'),
+						}, t('account.type.web')),
+					),
 				),
-				!flowActive
-					? h('div', null,
-						h('div', { style: { display: 'flex', gap: '8px' } },
+				addType === 'agy'
+					? (!flowActive
+						? h('div', null,
+							h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' } },
+								h('input', {
+									style: S.input,
+									value: aliasInput,
+									placeholder: t('account.aliasPlaceholder'),
+									'aria-label': t('aria.aliasInput'),
+									onChange: (e: { target: { value: string } }) => setAliasInput(e.target.value),
+								}),
+								h('input', {
+									style: S.input,
+									value: addProxyInput,
+									placeholder: t('web.proxyPlaceholder'),
+									'aria-label': t('aria.proxyInput'),
+									onChange: (e: { target: { value: string } }) => setAddProxyInput(e.target.value),
+								}),
+							),
+							h('div', { style: { display: 'flex', gap: '8px' } },
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: { ...S.btnPrimary, gap: '4px' },
+									disabled: isBusy,
+									onClick: () => void handleBeginAddAccount(),
+								}, loadingAction === 'pool:beginAdd' ? [renderSpinner(), t('auth.openingBrowser')] : [uiIcon('externalLink', 12, '#ffffff'), ` ${t('auth.openBrowser')}`]),
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: S.btn,
+									onClick: () => handleCancelAddAccount(),
+								}, t('cancel')),
+							),
+							flowPhase === 'failed' ? h('div', {
+								style: { ...S.muted, color: 'var(--agy-danger-text)', marginTop: '8px', display: 'flex', alignItems: 'center', gap: '5px', fontWeight: 600 },
+							}, uiIcon('alert', 12, 'var(--agy-danger-text)'), safeMessage(poolAuth?.code)) : null,
+						)
+						: h('div', null,
+							h('div', { style: { display: 'flex', alignItems: 'center', color: 'var(--agy-text-secondary)', marginBottom: '8px', lineHeight: 1.5, fontSize: '12px' } },
+								renderSpinner(),
+								flowPhase === 'exchanging'
+									? t('auth.exchanging')
+									: t('auth.waiting'),
+							),
+							poolAuth?.url ? h('div', { style: { marginBottom: '8px' } },
+								h('a', {
+									href: poolAuth.url,
+									target: '_blank',
+									style: { color: 'var(--dsw-alias-state-business-primary, #2563eb)', textDecoration: 'underline', fontSize: '12px', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '4px' },
+								}, uiIcon('externalLink', 12, 'currentColor'), t('auth.openManual')),
+							) : null,
+							h('div', { style: { color: 'var(--agy-text-tertiary)', marginBottom: '6px', fontSize: '11px', fontWeight: 500 } },
+								t('auth.pasteHint'),
+							),
+							h('div', { style: { display: 'flex', gap: '8px' } },
+								h('input', {
+									style: S.input,
+									value: authCodeInput,
+									placeholder: t('auth.codePlaceholder'),
+									'aria-label': t('aria.authCodeInput'),
+									onChange: (e: { target: { value: string } }) => setAuthCodeInput(e.target.value),
+								}),
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: { ...S.btnPrimary, gap: '4px' },
+									disabled: isBusy || !authCodeInput.trim(),
+									onClick: () => void handleCompleteAddAccount(),
+								}, loadingAction === 'pool:completeAdd' ? [renderSpinner(), t('auth.activating')] : [uiIcon('check', 12, '#ffffff'), ` ${t('auth.activate')}`]),
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: S.btn,
+									onClick: () => handleCancelAddAccount(),
+								}, t('cancel')),
+							),
+						))
+					: h('div', null,
+						h('div', { style: { color: 'var(--agy-text-secondary)', fontSize: '12px', marginBottom: '12px', lineHeight: 1.5 } },
+							t('web.browserLoginDesc'),
+						),
+						h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' } },
+							h('span', { style: { fontSize: '12px', fontWeight: 600, color: 'var(--agy-text-secondary)' } }, t('web.browserSelect')),
+							h('div', { style: S.segGroup },
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: selectedBrowser === 'chrome' ? S.segBtnActive : S.segBtn,
+									onClick: () => setSelectedBrowser('chrome'),
+								}, [brandIcon('chrome', 13), ' ', t('web.browserChrome')]),
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: selectedBrowser === 'edge' ? S.segBtnActive : S.segBtn,
+									onClick: () => setSelectedBrowser('edge'),
+								}, [brandIcon('edge', 13), ' ', t('web.browserEdge')]),
+							),
+						),
+						h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' } },
 							h('input', {
 								style: S.input,
 								value: aliasInput,
@@ -1456,76 +1905,53 @@ export function apply(ctx: ClientContext): void {
 								'aria-label': t('aria.aliasInput'),
 								onChange: (e: { target: { value: string } }) => setAliasInput(e.target.value),
 							}),
-							h('button', {
-								type: 'button',
-								className: 'agy-btn',
-								style: { ...S.btnPrimary, gap: '4px' },
-								disabled: isBusy,
-								onClick: () => void handleBeginAddAccount(),
-							}, loadingAction === 'pool:beginAdd' ? [renderSpinner(), t('auth.openingBrowser')] : [uiIcon('externalLink', 12, '#ffffff'), ` ${t('auth.openBrowser')}`]),
-							h('button', {
-								type: 'button',
-								className: 'agy-btn',
-								style: S.btn,
-								onClick: () => handleCancelAddAccount(),
-							}, t('cancel')),
-						),
-						flowPhase === 'failed' ? h('div', {
-							style: { ...S.muted, color: 'var(--agy-danger-text)', marginTop: '8px', display: 'flex', alignItems: 'center', gap: '5px', fontWeight: 600 },
-						}, uiIcon('alert', 12, 'var(--agy-danger-text)'), safeMessage(poolAuth?.code)) : null,
-					)
-					: h('div', null,
-						h('div', { style: { display: 'flex', alignItems: 'center', color: 'var(--agy-text-secondary)', marginBottom: '8px', lineHeight: 1.5, fontSize: '12px' } },
-							renderSpinner(),
-							flowPhase === 'exchanging'
-								? t('auth.exchanging')
-								: t('auth.waiting'),
-						),
-						poolAuth?.url ? h('div', { style: { marginBottom: '8px' } },
-							h('a', {
-								href: poolAuth.url,
-								target: '_blank',
-								style: { color: 'var(--dsw-alias-state-business-primary, #2563eb)', textDecoration: 'underline', fontSize: '12px', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '4px' },
-							}, uiIcon('externalLink', 12, 'currentColor'), t('auth.openManual')),
-						) : null,
-						h('div', { style: { color: 'var(--agy-text-tertiary)', marginBottom: '6px', fontSize: '11px', fontWeight: 500 } },
-							t('auth.pasteHint'),
-						),
-						h('div', { style: { display: 'flex', gap: '8px' } },
 							h('input', {
 								style: S.input,
-								value: authCodeInput,
-								placeholder: t('auth.codePlaceholder'),
-								'aria-label': t('aria.authCodeInput'),
-								onChange: (e: { target: { value: string } }) => setAuthCodeInput(e.target.value),
+								value: addProxyInput,
+								placeholder: t('web.proxyPlaceholder'),
+								'aria-label': t('aria.proxyInput'),
+								onChange: (e: { target: { value: string } }) => setAddProxyInput(e.target.value),
 							}),
-							h('button', {
-								type: 'button',
-								className: 'agy-btn',
-								style: { ...S.btnPrimary, gap: '4px' },
-								disabled: isBusy || !authCodeInput.trim(),
-								onClick: () => void handleCompleteAddAccount(),
-							}, loadingAction === 'pool:completeAdd' ? [renderSpinner(), t('auth.activating')] : [uiIcon('check', 12, '#ffffff'), ` ${t('auth.activate')}`]),
-							h('button', {
-								type: 'button',
-								className: 'agy-btn',
-								style: S.btn,
-								onClick: () => handleCancelAddAccount(),
-							}, t('cancel')),
 						),
-					),
+						browserLoginState?.active
+							? h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--agy-bg-subbox)', borderRadius: '6px' } },
+								h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--agy-text-primary)', fontSize: '12px' } },
+									renderSpinner(),
+									h('span', null, browserLoginState.message || t('web.loginRunning')),
+								),
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: { ...S.btnDanger, padding: '3px 8px' },
+									onClick: () => void handleCancelBrowserLogin(),
+								}, t('web.cancelLogin')),
+							)
+							: h('div', { style: { display: 'flex', gap: '8px' } },
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: { ...S.btnPrimary, gap: '4px' },
+									disabled: isBusy,
+									onClick: () => void handleStartBrowserLogin(),
+								}, loadingAction === 'pool:startBrowserLogin' ? [renderSpinner(), '启动中...'] : [uiIcon('externalLink', 12, '#ffffff'), ` ${t('web.startCapture')}`]),
+								h('button', {
+									type: 'button',
+									className: 'agy-btn',
+									style: S.btn,
+									onClick: () => handleCancelAddAccount(),
+								}, t('cancel')),
+							),
+					)
 			)
 			: null;
 
 		if (status === null) {
 			return h('div', { style: { ...S.container, minHeight: '120px', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
-				h('style', null, GLOBAL_CSS),
 				h('span', { style: S.muted }, [renderSpinner(), t('status.loading')]),
 			);
 		}
 
 		return h('div', { style: S.container },
-			h('style', null, GLOBAL_CSS),
 			h('div', { style: S.headerCard },
 				h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
 					agyIcon(16),
@@ -1549,7 +1975,26 @@ export function apply(ctx: ClientContext): void {
 				),
 			),
 			renderToastBanner(),
+			browserLoginState?.active && !addingAccount
+				? h('div', { key: 'browser-login-running', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', marginBottom: '10px', background: 'var(--agy-bg-subbox)', border: '1px solid var(--agy-border-subbox)', borderRadius: '6px' } },
+					h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--agy-text-primary)', fontSize: '12px' } },
+						renderSpinner(),
+						h('span', null, browserLoginState.message || t('web.loginRunning')),
+					),
+					h('button', {
+						type: 'button',
+						className: 'agy-btn',
+						style: { ...S.btnDanger, padding: '3px 8px', fontSize: '11px' },
+						onClick: () => void handleCancelBrowserLogin(),
+					}, t('web.cancelLogin')),
+				)
+				: null,
 			addAccountSection,
+			h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px', padding: '0 2px' } },
+				h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+					h('span', { style: { fontWeight: 700, fontSize: '12.5px', color: 'var(--agy-text-primary)' } }, `账号池 (${accounts.length})`),
+				),
+			),
 			renderedAccountCards,
 			h('div', { style: { marginTop: '16px', paddingTop: '12px', borderTop: '1px solid var(--agy-border-divider)' } },
 				h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
@@ -1639,10 +2084,24 @@ export function apply(ctx: ClientContext): void {
 
 	/** Modal dialog container rendered into document.body */
 	const AgyModalDialog = (): unknown => {
+		const instanceIdRef = useRef<string | null>(null);
+		if (instanceIdRef.current === null) {
+			instanceIdRef.current = 'modal_' + Math.random().toString(36).slice(2);
+		}
+		const isPrimary = registerModalInstance(instanceIdRef.current);
+
+		useEffect(() => {
+			const id = instanceIdRef.current!;
+			return () => {
+				unregisterModalInstance(id);
+			};
+		}, []);
+
 		const t = useAgyTranslation();
 		const [isOpen, setIsOpen] = useState(agyModalStore.open);
 
 		useEffect(() => {
+			injectGlobalStyles();
 			const unsubscribe = agyModalStore.subscribe(() => {
 				setIsOpen(agyModalStore.open);
 			});
@@ -1661,7 +2120,7 @@ export function apply(ctx: ClientContext): void {
 			return () => win.removeEventListener?.('keydown', onKey, true);
 		}, [isOpen]);
 
-		if (!isOpen) return null;
+		if (!isOpen || !isPrimary) return null;
 
 		return h('div', {
 			className: 'agy-modal-backdrop',

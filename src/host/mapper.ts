@@ -20,7 +20,7 @@ import type { AgyEvent, RawUsage } from '../common/types.ts'
 import { mirrorCallId } from './recording.ts'
 import { buildMirrorRunCode, MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME, toolStepBrief } from './mirror-tool.ts'
 
-const toToolCallId: (id: string) => ToolCallId =
+export const toToolCallId: (id: string) => ToolCallId =
   (dshLlm as { ToolCallId?: (id: string) => ToolCallId; CallId?: (id: string) => ToolCallId }).ToolCallId ??
   (dshLlm as { ToolCallId?: (id: string) => ToolCallId; CallId?: (id: string) => ToolCallId }).CallId ??
   ((id: string) => id as unknown as ToolCallId)

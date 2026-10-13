@@ -30,6 +30,8 @@ import { homedir } from 'node:os'
 import { StreamJsonParser } from './host/parser.ts'
 import { defaultMediaDir, sweepDir, type ImageRefLike } from './host/media.ts'
 import { startMcpBridge, writeMcpConfig, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
+import { extractSnlm0e } from './host/gemini-web.ts'
+import { captureGeminiWebLogin, findInstalledBrowsers, type BrowserType } from './host/web-login-browser.ts'
 import { fileURLToPath } from 'node:url'
 import { handleMediaRequest, handleAssetRequest, type HttpRequestLike, type HttpResponseLike } from './host/media-route.ts'
 
@@ -107,6 +109,13 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     tokenSpeed: { lastTps: number | null; avgTps: number | null; outputTokens: number; measuredSteps: number; generatingMs: number }
   } | null = null
   let lastParser = new StreamJsonParser()
+  let browserLoginAbort: AbortController | null = null
+  let browserLoginProgress = {
+    active: false,
+    status: 'idle',
+    message: '',
+    error: undefined as string | undefined,
+  }
 
   const getConfig = (): PluginConfig => resolveConfig(entryConfig)
   // The webview model picker caches its catalog snapshot and only re-reads
@@ -180,6 +189,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     },
     getConfig().fallbackModels,
     300_000,
+    notifyPicker,
   )
   const auth = new AuthHelper(bin)
   const poolAuth = new PoolAuthFlow(pool, quota, log)
@@ -236,6 +246,38 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     sessionCwd: (sessionId) => {
       const sessions = ctx.get('sessions') as { get(id: unknown): { header?: { cwd?: string } } | undefined } | undefined
       return sessions?.get(sessionId)?.header?.cwd
+    },
+    syncSessionModel: (sessionId, model, effort) => {
+      if (!sessionId) return
+      try {
+        const sessions = (ctx.get('sessions') as { get(id: unknown): { append?: (type: string, data: unknown) => unknown } } | undefined)
+          ?? (ctx as unknown as { sessions?: { get(id: unknown): { append?: (type: string, data: unknown) => unknown } } }).sessions
+        const session = sessions?.get(sessionId)
+        if (session && typeof session.append === 'function') {
+          session.append('model/selection', {
+            provider: PROVIDER_ID,
+            model,
+            ...(effort ? { reasoningEffort: effort } : {}),
+          })
+        }
+      } catch {
+        // safe containment
+      }
+
+      try {
+        const agents = (ctx.get('agents') as { get(id: unknown): unknown; selectForNextRequest?: (a: unknown, s: unknown) => void } | undefined)
+          ?? (ctx as unknown as { agents?: { get(id: unknown): unknown; selectForNextRequest?: (a: unknown, s: unknown) => void } }).agents
+        const agent = agents?.get(sessionId)
+        if (agent && agents && typeof agents.selectForNextRequest === 'function') {
+          agents.selectForNextRequest(agent, {
+            provider: PROVIDER_ID,
+            model,
+            ...(effort ? { reasoningEffort: effort } : {}),
+          })
+        }
+      } catch {
+        // safe containment
+      }
     },
     onRun: (info) => {
       lastRun = info
@@ -490,6 +532,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           catalogModels: sanitizeCatalogEntries(cat.models).entries,
           hiddenModels: cfg.hiddenModels,
           bindings: Object.keys(store.all()).length,
+          installedBrowsers: findInstalledBrowsers().map((b) => ({ id: b.id, name: b.name })),
           lastRun,
         })
       })()
@@ -757,6 +800,202 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         sendJson(res as RawRes, 200, { ok: true, pool: pool.getPoolData() })
       })()
     }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/reorder', handler: (req, res) => {
+      void (async () => {
+        if (methodOf(req) !== 'POST') {
+          sendJson(res as RawRes, 405, { error: 'POST only' })
+          return
+        }
+        const body = await readBody(req)
+        const ids = Array.isArray(body.ids) ? (body.ids as unknown[]).filter((x): x is string => typeof x === 'string') : []
+        pool.reorderAccounts(ids)
+        sendJson(res as RawRes, 200, { ok: true, pool: pool.getPoolData() })
+      })()
+    }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/add-gemini-web', handler: (req, res) => {
+      void (async () => {
+        if (methodOf(req) !== 'POST') {
+          sendJson(res as RawRes, 405, { error: 'POST only' })
+          return
+        }
+        const body = await readBody(req)
+        const alias = typeof body.alias === 'string' ? body.alias : ''
+        const cookies = typeof body.cookies === 'string' ? body.cookies.trim() : ''
+        const proxyUrl = typeof body.proxyUrl === 'string' ? body.proxyUrl.trim() : undefined
+        let snlm0e = typeof body.snlm0e === 'string' ? body.snlm0e.trim() : undefined
+        let email = typeof body.email === 'string' ? body.email.trim() : undefined
+
+        if (!cookies) {
+          sendJson(res as RawRes, 400, { ok: false, error: 'Cookie 字符串不能为空' })
+          return
+        }
+
+        // Always test connection and extract SNlM0e & email
+        const testRes = await extractSnlm0e(cookies, proxyUrl || getConfig().proxyUrl)
+        if (!testRes.ok || !testRes.snlm0e) {
+          sendJson(res as RawRes, 400, { ok: false, error: testRes.error || '无法从 Cookie 提取 SNlM0e，请检查 Cookie 是否有效并确保网络/代理畅通' })
+          return
+        }
+        snlm0e = testRes.snlm0e
+        if (!email && testRes.email) email = testRes.email
+
+        const acc = pool.addGeminiWebAccount(
+          alias,
+          {
+            cookies,
+            snlm0e,
+            bl: testRes.bl,
+            accountEmail: email,
+            capturedAt: Date.now(),
+          },
+          proxyUrl,
+        )
+        void catalog.forceRefresh().then(() => notifyPicker()).catch(() => undefined)
+        sendJson(res as RawRes, 200, { ok: true, account: acc, pool: pool.getPoolData() })
+      })()
+    }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/start-browser-login', handler: (req, res) => {
+      void (async () => {
+        if (methodOf(req) !== 'POST') {
+          sendJson(res as RawRes, 405, { error: 'POST only' })
+          return
+        }
+        const body = await readBody(req)
+        const alias = typeof body.alias === 'string' ? body.alias : ''
+        const proxyUrl = typeof body.proxyUrl === 'string' ? body.proxyUrl.trim() : undefined
+        const accountId = typeof body.accountId === 'string' && body.accountId ? body.accountId : undefined
+        const existingAcc = accountId ? pool.getAccount(accountId) : undefined
+        const browserType: BrowserType | undefined =
+          body.browser === 'edge' ? 'edge' : body.browser === 'chrome' ? 'chrome' : undefined
+
+        if (browserLoginProgress.active) {
+          sendJson(res as RawRes, 400, { ok: false, error: '浏览器登录正在进行中' })
+          return
+        }
+
+        browserLoginAbort = new AbortController()
+        browserLoginProgress = {
+          active: true,
+          status: 'launching',
+          message: '正在准备浏览器独立 Profile 运行环境...',
+          error: undefined,
+        }
+
+        // Dedicated isolated browser profile per account
+        const targetAccountId = accountId || `acc_web_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+        const profileDir = join(dshHome(), 'agy-accounts', targetAccountId, 'browser-profile')
+        const hasExistingWeb = pool.getAccounts().some((a) => a.type === 'gemini-web')
+        const inheritCookies =
+          typeof body.inheritCookies === 'boolean'
+            ? body.inheritCookies
+            : (!accountId && !hasExistingWeb)
+
+        void captureGeminiWebLogin({
+          browserType,
+          profileDir,
+          inheritCookies,
+          proxyUrl: proxyUrl || getConfig().proxyUrl,
+          signal: browserLoginAbort.signal,
+          onProgress: (p) => {
+            browserLoginProgress = {
+              active: p.status !== 'success' && p.status !== 'failed',
+              status: p.status,
+              message: p.message || '',
+              error: p.status === 'failed' ? p.message : undefined,
+            }
+          },
+        })
+          .then(async (webAuth) => {
+            // Verify connection and ensure SNlM0e / email / bl are captured
+            if (!webAuth.accountEmail || !webAuth.snlm0e || !webAuth.bl) {
+              const probe = await extractSnlm0e(webAuth.cookies, proxyUrl || getConfig().proxyUrl).catch(() => null)
+              if (probe?.ok) {
+                if (probe.snlm0e) webAuth.snlm0e = probe.snlm0e
+                if (probe.email) webAuth.accountEmail = probe.email
+                if (probe.bl) webAuth.bl = probe.bl
+              }
+            }
+            let acc: ManagedAccount
+            if (existingAcc) {
+              acc = pool.updateGeminiWebAccount(existingAcc.id, webAuth, alias, proxyUrl)!
+            } else {
+              acc = pool.addGeminiWebAccount(alias, webAuth, proxyUrl, targetAccountId)
+            }
+            browserLoginProgress = {
+              active: false,
+              status: 'success',
+              message: `成功${existingAcc ? '刷新' : '添加'}账号：${acc.alias}${acc.email ? ` (${acc.email})` : ''}，连接验证畅通！`,
+              error: undefined,
+            }
+            void catalog.forceRefresh().then(() => notifyPicker()).catch(() => undefined)
+          })
+          .catch((err) => {
+            browserLoginProgress = {
+              active: false,
+              status: 'failed',
+              message: err instanceof Error ? err.message : String(err),
+              error: err instanceof Error ? err.message : String(err),
+            }
+          })
+          .finally(() => {
+            browserLoginAbort = null
+          })
+
+        sendJson(res as RawRes, 200, { ok: true, progress: browserLoginProgress })
+      })()
+    }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/installed-browsers', handler: (_req, res) => {
+      sendJson(res as RawRes, 200, {
+        ok: true,
+        browsers: findInstalledBrowsers().map((b) => ({ id: b.id, name: b.name })),
+      })
+    }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/browser-login-status', handler: (_req, res) => {
+      sendJson(res as RawRes, 200, { ok: true, progress: browserLoginProgress, pool: pool.getPoolData() })
+    }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/cancel-browser-login', handler: (_req, res) => {
+      void (async () => {
+        if (browserLoginAbort) {
+          browserLoginAbort.abort()
+          browserLoginAbort = null
+        }
+        browserLoginProgress = {
+          active: false,
+          status: 'idle',
+          message: '登录已取消',
+          error: undefined,
+        }
+        sendJson(res as RawRes, 200, { ok: true })
+      })()
+    }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/test-web-account', handler: (req, res) => {
+      void (async () => {
+        if (methodOf(req) !== 'POST') {
+          sendJson(res as RawRes, 405, { error: 'POST only' })
+          return
+        }
+        const body = await readBody(req)
+        const id = typeof body.id === 'string' ? body.id : ''
+        const acc = pool.getAccount(id)
+        if (!acc || acc.type !== 'gemini-web' || !acc.webAuth?.cookies) {
+          sendJson(res as RawRes, 400, { ok: false, error: '账号不是有效的 Gemini 网页端账号' })
+          return
+        }
+        const testRes = await extractSnlm0e(acc.webAuth.cookies, acc.proxyUrl || getConfig().proxyUrl)
+        if (!testRes.ok || !testRes.snlm0e) {
+          pool.markAuthRequired(acc.id, testRes.error || '网页端凭据已过期')
+          sendJson(res as RawRes, 200, { ok: false, error: testRes.error || '验证失败' })
+          return
+        }
+        const updated = pool.updateGeminiWebAccount(acc.id, {
+          ...(testRes.snlm0e ? { snlm0e: testRes.snlm0e } : {}),
+          ...(testRes.email ? { accountEmail: testRes.email } : {}),
+          ...(testRes.bl ? { bl: testRes.bl } : {}),
+        })
+        void catalog.forceRefresh().then(() => notifyPicker()).catch(() => undefined)
+        sendJson(res as RawRes, 200, { ok: true, email: updated?.email || acc.email, pool: pool.getPoolData() })
+      })()
+    }})
     reg({ kind: 'exact', path: '/plugins/agy-link/config', handler: (req, res) => {
       void (async () => {
         if (methodOf(req) !== 'POST') {
@@ -855,6 +1094,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     if (!getConfig().enabled) return () => undefined
     const refresh = (): void => {
       void quota.refreshAllQuotas().catch(() => undefined)
+      void catalog.refreshIfNeeded().catch(() => undefined)
     }
     const boot = setTimeout(refresh, 5_000)
     boot.unref?.()

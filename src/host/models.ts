@@ -212,6 +212,7 @@ export class ModelCatalog {
     private readonly discover: DiscoverFn,
     fallbackDefs: readonly FallbackModelDef[],
     private readonly ttlMs: number,
+    private readonly onUpdate?: () => void,
   ) {
     this.current = {
       source: 'fallback',
@@ -240,6 +241,7 @@ export class ModelCatalog {
 
   async forceRefresh(): Promise<Catalog> {
     await this.refresh();
+    this.onUpdate?.();
     return this.current;
   }
 
@@ -251,7 +253,15 @@ export class ModelCatalog {
         const { stdout } = await this.discover(ac.signal);
         const raw = parseModelsOutput(stdout);
         if (raw.length > 0) {
-          this.current = { source: 'discovered', models: foldEfforts(raw), discoveredAt: Date.now() };
+          const newModels = foldEfforts(raw);
+          const changed =
+            this.current.source !== 'discovered' ||
+            this.current.models.length !== newModels.length ||
+            this.current.models.some((m, i) => m.id !== newModels[i]?.id);
+          this.current = { source: 'discovered', models: newModels, discoveredAt: Date.now() };
+          if (changed) {
+            this.onUpdate?.();
+          }
           return;
         }
         this.current = { ...this.current, lastError: 'agy models returned no entries' };

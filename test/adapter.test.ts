@@ -874,6 +874,22 @@ test('region eligibility refusal maps to a clear ELIGIBILITY error (issue #32)',
   assert.ok(finish.reason.failure?.message.includes('location'), finish.reason.failure?.message)
 })
 
+test('"Eligibility check failed" wrapping a TLS handshake timeout is NETWORK, not ELIGIBILITY', async () => {
+  // Observed live: every first turn failed with "Eligibility check failed:
+  // failed to get profile picture: … TLS handshake timeout" and the retry
+  // succeeded — a transport blip (proxy cold start), not a region refusal.
+  const prevMode = process.env.FAKE_AGY_MODE
+  const { adapter } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'exit-eligible-network'
+  const chunks = await collect(adapter.stream(opts([msg('user', '测试')], { sessionId: 'sess-elig-net' as never })))
+  process.env.FAKE_AGY_MODE = prevMode
+  const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string; message: string } } }
+  assert.equal(finish.type, 'finish')
+  assert.equal(finish.reason.kind, 'error')
+  assert.equal(finish.reason.failure?.code, Err.NETWORK)
+  assert.ok(!finish.reason.failure?.message.includes('not eligible'), 'must not show the region hint: ' + finish.reason.failure?.message)
+})
+
 test('live location refusal rotates the refused account away (retry can serve another)', async () => {
   const prevMode = process.env.FAKE_AGY_MODE
   process.env.FAKE_AGY_MODE = 'location-denied'
@@ -1703,6 +1719,49 @@ test('steered prompt carries interrupted notice so agy switches tasks immediatel
   } finally {
     delete process.env.FAKE_AGY_DELAY_MS
   }
+})
+
+test('session sticks to current account across multiple turns and only switches when quota is exhausted', async () => {
+  const pool = new AccountPoolManager(join(workDir, `pool-session-sticky-${Date.now()}`))
+  const first = pool.getAccounts()[0]!
+  const second = pool.createAccountSlot('Account B')
+
+  const { adapter } = makeAdapter({}, { pool })
+  const sessionId = 'sess-sticky-account-turns' as never
+
+  // Turn 1 on first account
+  const res1 = await runTurn(adapter, [msg('user', 'Hello turn 1')], { sessionId })
+  assert.equal(res1.chunks[res1.chunks.length - 1]!.type, 'finish')
+  assert.equal(pool.getPoolData().lastActiveAccountId, first.id)
+
+  // Even if another account exists or was marked active by background or another session,
+  // Turn 2 MUST stay on the first account because its quota is not exhausted!
+  pool.markAccountActive(second.id)
+  const res2 = await runTurn(
+    adapter,
+    [msg('user', 'Hello turn 1'), msg('assistant', 'Reply 1'), msg('user', 'Hello turn 2')],
+    { sessionId },
+  )
+  assert.equal(res2.chunks[res2.chunks.length - 1]!.type, 'finish')
+  assert.equal(pool.getPoolData().lastActiveAccountId, first.id, 'session must stick to first account while quota is healthy')
+
+  // Now first account quota is exhausted (hits 429)
+  pool.recordFailure(first.id, 'google', 'RESOURCE_EXHAUSTED (code 429): Individual quota reached.')
+
+  // Turn 3 must now switch to second account because first account quota is exhausted
+  const res3 = await runTurn(
+    adapter,
+    [
+      msg('user', 'Hello turn 1'),
+      msg('assistant', 'Reply 1'),
+      msg('user', 'Hello turn 2'),
+      msg('assistant', 'Reply 2'),
+      msg('user', 'Hello turn 3'),
+    ],
+    { sessionId },
+  )
+  assert.equal(res3.chunks[res3.chunks.length - 1]!.type, 'finish')
+  assert.equal(pool.getPoolData().lastActiveAccountId, second.id, 'session must switch to second account once quota is exhausted')
 })
 
 test.after(() => {

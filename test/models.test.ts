@@ -138,7 +138,7 @@ test('bare gemini base without siblings gets no efforts', () => {
 
 test('buildFallbackCatalog carries configurable efforts', () => {
   const cat = buildFallbackCatalog(DEFAULT_FALLBACK_MODELS)
-  assert.equal(cat.length, 8)
+  assert.equal(cat.length, 7)
   const flash38 = cat.find((e) => e.id === 'gemini-3.8-flash')
   assert.deepEqual(flash38?.efforts, ['low', 'medium', 'high'])
   const flash = cat.find((e) => e.id === 'gemini-3.7-flash')
@@ -155,9 +155,9 @@ test('defaultEffortFor prefers config override then high first', () => {
   // No config override: default is the highest available effort.
   const cfg2: PluginConfig = { ...defaultConfig(), defaultEffort: '' }
   assert.equal(flash && defaultEffortFor(flash, cfg2), 'high')
-  // pro line-up has no medium; high still wins.
-  const pro = findEntry({ source: 'discovered', models: cat, discoveredAt: 0 }, 'gemini-3.1-pro')
-  assert.equal(pro && defaultEffortFor(pro, cfg2), 'high')
+  // Flash line-up defaults to high
+  const flash38 = findEntry({ source: 'discovered', models: cat, discoveredAt: 0 }, 'gemini-3.8-flash')
+  assert.equal(flash38 && defaultEffortFor(flash38, cfg2), 'high')
 })
 
 test('effort suffix ids still resolve to their base entry', () => {

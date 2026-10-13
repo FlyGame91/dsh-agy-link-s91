@@ -45,9 +45,25 @@ export interface FamilyCooldownState {
   consecutiveFailures: number
 }
 
+export type AccountType = 'agy' | 'gemini-web'
+
+export interface GeminiWebAuth {
+  cookies: string
+  snlm0e?: string
+  userAgent?: string
+  accountEmail?: string
+  capturedAt?: number
+  /** Google Bard/Gemini frontend build label sniffed from gemini.google.com */
+  bl?: string
+}
+
 export interface ManagedAccount {
   id: string
   alias: string
+  /** Account login type: official Google Antigravity CLI ('agy') or Gemini Web session ('gemini-web'). Defaults to 'agy'. */
+  type?: AccountType
+  /** Gemini Web session credentials (used when type === 'gemini-web'). */
+  webAuth?: GeminiWebAuth
   /** True only when `alias` is the server-owned canonical built-in default. */
   defaultAlias?: boolean
   email?: string
@@ -129,6 +145,9 @@ export function needsAuthReverify(account: ManagedAccount, now = Date.now()): bo
 export function getAccountHealth(account: ManagedAccount, family: ModelFamily = 'google'): AccountHealthInfo {
   if (!account.enabled) return { status: 'disabled', message: 'Account disabled' }
   if (account.authRequired) return { status: 'auth_required', message: account.authError || 'Authentication required' }
+  if (account.type === 'gemini-web' && family !== 'google') {
+    return { status: 'disabled', message: 'Gemini Web only supports Google models' }
+  }
   const cd = account.cooldowns?.[family]
   if (cd && cd.cooldownUntil > Date.now()) {
     return {

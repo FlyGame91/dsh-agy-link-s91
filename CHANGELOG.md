@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.48 (2026-10-13)
+
+### English
+
+- **Feature: Google Account email retrieval & verification.** Enhanced browser login CDP extraction and `extractSnlm0e` regex across multi-language Google interfaces (including Chinese `Google 账号 / 帐号`, `WIZ_global_data`, and custom workspace domains). Verified emails are automatically saved and displayed as an email badge on account cards upon addition and connection testing.
+- **Feature: Isolated per-account browser profiles.** Each Gemini Web account now runs in a dedicated, isolated browser profile directory (`~/.dsh/agy-accounts/<accountId>/browser-profile`). Multiple accounts maintain independent cookie jars, session stores, and locks, eliminating session cross-contamination and allowing seamless multi-account management.
+- **Feature: Dynamic Gemini Web build (`bl`) & update sniffing.** Live sniffing of Google's frontend build label (`bl`, e.g. `boq_assistant-bard-web-server_...`) directly from HTML during login, connection tests, and periodic probes, dynamically passed to `StreamGenerate` RPC. Stale sessions, cookie expirations, and token rotations are automatically detected, with immediate UI alerts and a dedicated re-login button.
+- **Feature: Dedicated proxy URL for Antigravity OAuth login.** Added a per-account proxy URL configuration input to the Google Antigravity OAuth tab, consistent with Gemini Web accounts, ensuring reliable authentication in domestic network environments.
+- **Feature: Direct model mapping & removed `gemini-3.1-pro` fallback.** Removed the fictional `gemini-3.1-pro` fallback and purged it from `DEFAULT_FALLBACK_MODELS`. Requests directly preserve and map to the exact model selected by the user.
+- **Feature: Real-time dynamic model catalog.** Wired `ModelCatalog` updates to notify DSH via `notifyPicker()` (`llm/adapters-updated`), and integrated automatic background refreshes so newly discovered `agy` models immediately appear in the DSH model picker without restarting DSH.
+- **Feature: Active model synchronization with DSH composer picker.** When model auto-failover, default resolution, or Gemini Web mapping switches the active model, the new model is synchronized back to the active DSH session (`model/selection`), updating the model chip in the bottom-right corner of the composer.
+- **Fix: Eliminated modal screen flickering and refresh loop.** Implemented singleton portal mounting (`registerModalInstance` / `unregisterModalInstance`), moved global modal styles out of the React render tree into a one-time `<head>` injection, and added payload equality guards (`isStatusEqual`) on polling intervals to eliminate duplicate renders and flickering.
+
+### 中文 (Chinese)
+
+- **新增特性：Google 账号邮箱回显与连通性验证。** 全面强化 CDP 浏览器捕获与 `extractSnlm0e` 正则解析，支持中文界面（`Google 账号 / 帐号`）、`WIZ_global_data` 及任意域名 Google 邮箱；添加与测试连接时均自动保存并回显邮箱徽章于卡片上。
+- **新增特性：每个账号完全独立的浏览器隔离 Profile。** 每个 Gemini 网页端账号分配并持久化独占的 profile 目录（`~/.dsh/agy-accounts/<accountId>/browser-profile`）；多账号各自拥有独立 Cookie、会话与锁文件，多账号并行登录或切换互不干扰、互不污染。
+- **新增特性：动态嗅探 Gemini 官方最新构建版本（`bl`）与状态。** 实时从页面嗅探 Google 最新前端构建版本号（`bl`，如 `boq_assistant-bard-web-server_...`）并动态传递至 `StreamGenerate` RPC；自动捕获 Session 状态变化与凭据失效，卡片提供一键「重新登录」按钮。
+- **新增特性：Google Antigravity（OAuth 授权）独立代理配置。** 在 Google Antigravity 添加弹窗中新增独立代理 URL 输入框，与网页端账号保持一致，国内网络环境下直连或代理灵活切换。
+- **新增特性：模型精准直接映射与彻底移除 `gemini-3.1-pro`。** 彻底移除虚构的 `gemini-3.1-pro` 强制降级逻辑，并从系统默认候选模型中删除；用户选择什么模型就直接映射到什么模型，原汁原味。
+- **新增特性：模型列表无需重启 DSH 实时刷新。** 将 `ModelCatalog` 更新与 `notifyPicker()` (`llm/adapters-updated`) 连通，并引入定期检测与触发式刷新；agy 本地更新模型后，DSH 输入框模型选择器即时自动呈现最新列表，无需重启应用。
+- **新增特性：自动切模型实时回显到 DSH 输入框右下角。** 当额度耗尽自动切模型、默认模型解析或网页端模型映射发生时，自动向当前会话广播同步 `model/selection`，使 DSH 右下角模型选框即时同步回显当前真实运行的模型。
+- **优化与修复：彻底解决控制台频繁刷新与闪屏问题。** 引入弹窗单例守卫（`registerModalInstance` / `unregisterModalInstance`）防止多头部重复挂载，将全局样式抽离至 `<head>` 单次注入避免全页重排，并在轮询时加入状态深比较（`isStatusEqual`）杜绝无效渲染。
+
 ## 0.4.47 (2026-10-13)
 
 ### English
@@ -29,7 +53,6 @@
 - **新增：以 OAuth 授权为锚的身份比较。** `sameCredentialGrant()` 要求双方都有 refresh token（「无法证明」即视为「不同」）；主账号凭据的采纳会跳过没有 refresh token 的候选，持久化存储因此不会再被降级。
 - **新增：串号诊断与修复工具。** `findDuplicateCredentialIdentities()` 报告共享同一登录的账号，启动日志会明确告警。`scripts/repair-pool.mts`（默认 dry-run，加 `--apply` 才写入）恢复主账号槽并隔离被覆盖的账号；`scripts/verify-credential-store.mts` 校验存储的真实身份。`pnpm test` 不再触碰真实账号池——凭据处理改为锚定 `AccountPoolManager.dir` 而非进程级全局路径。
 - **修复：语法错误的 `mermaid` 代码块不再把 Mermaid 自带的「Syntax error in text」炸弹图渲染到页面上。** Mermaid 独立版渲染器会向 `document.body` 追加一个临时 `<div id="d<id>">`，图表解析失败时它把内置错误图**画进这个容器而不是抛异常**——失败因此永远到不了我们的 `catch`，炸弹图逃出消息卡片、孤立地漂在页面末尾。现在运行时以 `suppressErrorRendering: true` 初始化，每个代码块在 `render()` 之前先用 `mermaid.parse(text, { suppressErrors: true })` 预校验，并会清理旧客户端版本遗留在 body 层的错误图。语法错误或仍在流式输出的图表只保留原始代码块，同一份失败代码也不再因每次 DOM 变更而反复解析。
-
 
 ## 0.4.46 (2026-10-12)
 

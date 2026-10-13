@@ -102,7 +102,6 @@ export const DEFAULT_FALLBACK_MODELS: readonly FallbackModelDef[] = [
   { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', efforts: ['low', 'medium', 'high'] },
   { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', efforts: ['low', 'medium', 'high'] },
   { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', efforts: ['low', 'medium', 'high'] },
-  { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', efforts: ['low', 'high'] },
   { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (Thinking)' },
   { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (Thinking)' },
   { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
@@ -325,7 +324,7 @@ export function extractAuthUrl(text: string): string | undefined {
  */
 export function looksLikeHardRateLimit(text?: string): boolean {
   if (!text) return false
-  return /RESOURCE_EXHAUSTED|code[ :]?429\b|status[ :]?429\b|HTTP[ :]?429\b|too many requests|individual quota reached|quota (?:exceeded|reached|exhausted)|rate[ -]?limit(?:ed)? (?:exceeded|reached|hit)|exceeded (?:your |the )?quota|has been exhausted|exhausted your quota|out of quota|check quota|insufficient quota/i.test(
+  return /RESOURCE_EXHAUSTED|code[ :]?429\b|status[ :]?429\b|HTTP[ :]?429\b|too many requests|individual quota reached|quota (?:exceeded|reached|exhausted|limit)|rate[ -]?limit(?:ed)? (?:exceeded|reached|hit)?|exceeded (?:your |the )?quota|has been exhausted|exhausted your (?:quota|capacity)|out of quota|check quota|insufficient quota|usage limit reached/i.test(
     text,
   )
 }

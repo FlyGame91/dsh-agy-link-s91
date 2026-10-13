@@ -110,6 +110,25 @@ if (mode === 'exit-eligible') {
   process.exit(1)
 }
 
+// "Eligibility check failed:" wrapping a pure TRANSPORT error (observed live:
+// "failed to get profile picture: … net/http: TLS handshake timeout"). Not a
+// region refusal — must classify as NETWORK, not ELIGIBILITY.
+if (mode === 'exit-eligible-network') {
+  emit({
+    event: 'result',
+    result: {
+      conversation_id: '',
+      status: 'ERROR',
+      response: '',
+      error: 'Eligibility check failed: failed to get profile picture: Get "https://lh3.googleusercontent.com/a/ACg8ocMec37sVbokmmQmoQfiAxrgAt_t2vTgleK30Fa8qMMWfA=s96-c": net/http: TLS handshake timeout',
+      duration_seconds: 0.4,
+      num_turns: 0,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  })
+  process.exit(1)
+}
+
 // Real failure shape seen in the wild (silent server-side errors): agy
 // writes ONLY a result envelope with a human-readable error to stdout and
 // exits 1 with empty stderr. Used to regress the bare "exited with code 1"

@@ -11,6 +11,7 @@ import {
   type FamilyQuotaInfo,
   type ManagedAccount,
   type ModelFamily,
+  type GeminiWebAuth,
 } from '../common/pool-types.ts'
 import { parseResetDurationMs } from '../common/types.ts'
 
@@ -520,8 +521,76 @@ export class AccountPoolManager {
       reordered.push(remaining)
     }
     this.data.accounts = reordered
+    // Clear stale sticky pointers so the user-prioritized 1st account immediately takes primary effect
+    this.data.activeAccountIds = {}
+    this.data.lastActiveAccountId = undefined
     this.persist()
     return true
+  }
+
+  /**
+   * Add a new Gemini Web account to the pool.
+   */
+  addGeminiWebAccount(alias: string, webAuth: GeminiWebAuth, proxyUrl?: string, customId?: string): ManagedAccount {
+    const id = customId || `acc_web_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    const count = this.data.accounts.filter((a) => a.type === 'gemini-web').length + 1
+    const dir = join(this.baseDir, id)
+    mkdirSync(dir, { recursive: true })
+
+    const newAccount: ManagedAccount = {
+      id,
+      type: 'gemini-web',
+      alias: alias.trim() || `Gemini 网页端账号 ${count}`,
+      defaultAlias: !alias.trim(),
+      email: webAuth.accountEmail,
+      dir,
+      webAuth,
+      proxyUrl: proxyUrl?.trim() ? proxyUrl.trim() : undefined,
+      enabled: true,
+      createdAt: Date.now(),
+      cooldowns: {},
+      quotas: {
+        google: {
+          remainingFraction: 1.0,
+          description: 'Gemini 网页端免费通道 (chat.gemini.google.com)',
+          updatedAt: Date.now(),
+        },
+      },
+    }
+
+    this.data.accounts.push(newAccount)
+    this.knownIds.add(newAccount.id)
+    this.persist()
+    return newAccount
+  }
+
+  updateGeminiWebAccount(
+    id: string,
+    webAuth: Partial<GeminiWebAuth>,
+    alias?: string,
+    proxyUrl?: string,
+  ): ManagedAccount | null {
+    const acc = this.getAccount(id)
+    if (!acc || acc.type !== 'gemini-web') return null
+    acc.webAuth = {
+      ...acc.webAuth,
+      ...webAuth,
+      cookies: webAuth.cookies ?? acc.webAuth?.cookies ?? '',
+    }
+    if (alias !== undefined && alias.trim()) {
+      acc.alias = alias.trim()
+      acc.defaultAlias = false
+    }
+    if (proxyUrl !== undefined) {
+      acc.proxyUrl = proxyUrl.trim() ? proxyUrl.trim() : undefined
+    }
+    if (webAuth.accountEmail) {
+      acc.email = webAuth.accountEmail
+    }
+    delete acc.authRequired
+    delete acc.authError
+    this.persist()
+    return acc
   }
 
   setMode(mode: 'sequential' | 'round-robin'): void {
@@ -534,25 +603,30 @@ export class AccountPoolManager {
    */
   isAccountEligible(acc: ManagedAccount, family: ModelFamily, now = Date.now()): boolean {
     if (!acc.enabled || acc.authRequired) return false
+    // Gemini Web accounts only serve the Google model family (Gemini models)
+    if (acc.type === 'gemini-web') {
+      if (family !== 'google') return false
+      if (!acc.webAuth?.cookies?.trim()) return false
+    }
     const cd = acc.cooldowns?.[family]
     if (cd && cd.cooldownUntil > now) return false
-    // If 5h quota remaining is <= 2% and reset time is in future, treat as in cooldown
+    // If 5h quota remaining is <= 2% and reset time is in future (or missing), treat as in cooldown
     const quota = acc.quotas?.[family]
     if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= 0.02) {
       if (quota.resetTime) {
         const resetMs = Date.parse(quota.resetTime)
-        // An UNPARSEABLE reset behaves like a pending one: the fraction says
-        // the window is drained, so treating the garbage stamp as "already
-        // reset" kept a dead window sticky (same semantics as
-        // updateAccountQuotas' exhaustion check).
         if (Number.isNaN(resetMs) || resetMs > now) return false
+      } else {
+        return false
       }
     }
-    // If weekly quota remaining is <= 1% and weekly reset time is in future, treat as in cooldown
+    // If weekly quota remaining is <= 1% and weekly reset time is in future (or missing), treat as in cooldown
     if (quota && typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= 0.01) {
       if (quota.weeklyResetTime) {
         const resetMs = Date.parse(quota.weeklyResetTime)
         if (!Number.isNaN(resetMs) && resetMs > now) return false
+      } else {
+        return false
       }
     }
     return true
@@ -660,20 +734,15 @@ export class AccountPoolManager {
 
     // If an updated family has exhausted its quota, proactively advance to the next account
     const now = Date.now()
-    // An INVALID resetTime must behave like an absent one: Date.parse(NaN) >
-    // now is false, which used to mark a drained window "already reset" and
-    // kept the drained account sticky.
-    const futureReset = (iso: string | undefined): boolean =>
-      typeof iso === 'string' && iso !== '' && !Number.isNaN(Date.parse(iso)) && Date.parse(iso) > now
     for (const [famKey, info] of Object.entries(quotas) as [ModelFamily, FamilyQuotaInfo][]) {
       if (!info) continue
       const isExhausted5h = typeof info.remainingFraction === 'number' && info.remainingFraction <= 0.02 &&
-        !futureReset(info.resetTime)
+        (!info.resetTime || Number.isNaN(Date.parse(info.resetTime)) || Date.parse(info.resetTime) > now)
       const isExhaustedWeekly = typeof info.weeklyFraction === 'number' && info.weeklyFraction <= 0.01 &&
-        !futureReset(info.weeklyResetTime)
+        (!info.weeklyResetTime || Number.isNaN(Date.parse(info.weeklyResetTime)) || Date.parse(info.weeklyResetTime) > now)
       if (isExhausted5h || isExhaustedWeekly) {
         if (this.data.activeAccountIds?.[famKey] === id || this.data.lastActiveAccountId === id) {
-          this.selectAccount(famKey)
+          this.advanceAccount(id, famKey)
         }
       }
     }
@@ -716,7 +785,7 @@ export class AccountPoolManager {
     }
     // If the failed account was the active one, advance to the next candidate immediately
     if (this.data.activeAccountIds?.[family] === id || this.data.lastActiveAccountId === id) {
-      this.selectAccount(family)
+      this.advanceAccount(id, family)
     }
     this.persist()
   }
@@ -798,7 +867,11 @@ export class AccountPoolManager {
     //    account whose quota expires SOONEST (use-it-or-lose-it: residual
     //    quota is discarded at the window reset). With no quota metadata yet
     //    this degrades to the previous cyclic order.
-    const nextAccount: ManagedAccount = this.orderByExpiry(candidates, family, activeId)[0]!
+    //    When no active account existed (initial pick or after reordering),
+    //    honor user pool priority directly (candidates[0]).
+    const nextAccount: ManagedAccount = activeId !== undefined
+      ? this.orderByExpiry(candidates, family, activeId)[0]!
+      : candidates[0]!
 
     if (!this.data.activeAccountIds) this.data.activeAccountIds = {}
     this.data.activeAccountIds[family] = nextAccount.id

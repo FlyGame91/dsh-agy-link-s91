@@ -8,10 +8,10 @@
 import { join } from 'node:path'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { Err, isAccountScopedFailure, looksLikeAuthFailure, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeNetworkError, looksLikeRateLimit, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
-import { modelFamilyOf, type ModelFamily } from '../common/pool-types.ts'
+import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { conversationsDirFor, diffConversations, snapshotConversations } from './discovery.ts'
-import { EventMapper } from './mapper.ts'
+import { EventMapper, toToolCallId } from './mapper.ts'
 import { parseMirrorCallId, type RunRecording, type RunRegistry } from './recording.ts'
 import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug, sanitizeCatalogEntries } from './models.ts'
 import { StreamJsonParser } from './parser.ts'
@@ -23,6 +23,7 @@ import { stateDir } from '../common/config.ts'
 import { SENT_IMAGE_IDS_MAX, type SessionStore } from './sessions.ts'
 import { readFullToolArgs, readStepThoughts, clearAgyDbCache } from './agy-db.ts'
 import { getGitHeadContent } from './mirror-tool.ts'
+import { streamGeminiWeb } from './gemini-web.ts'
 
 type ForeignSource = { source?: { kind?: string; provider?: string; callId?: string; replayState?: unknown } }
 
@@ -371,6 +372,8 @@ export interface AgyAdapterDeps {
   onParser?: (parser: StreamJsonParser) => void
   /** Base URL of the media route, e.g. http://127.0.0.1:PORT/plugins/agy-link/media */
   getMediaBaseUrl?: () => string | null
+  /** Synchronizes active model selection back to DSH input box / session */
+  syncSessionModel?: (sessionId: string, model: string, effort?: string) => void
 }
 
 // ---- stream() -------------------------------------------------------------
@@ -827,7 +830,42 @@ export class AgyAdapter extends LlmAdapter {
 
     let activeModel = model === '' ? cfg.defaultModel : model
     let family = modelFamilyOf(activeModel)
-    let account = this.deps.pool ? this.deps.pool.selectAccount(family) : undefined
+    if (model === '' && activeModel !== '' && !isAux && sessionKey !== '') {
+      this.deps.syncSessionModel?.(sessionKey, activeModel, options.reasoningEffort ? String(options.reasoningEffort) : undefined)
+    }
+
+    // Sticky session account affinity:
+    // If this session is already communicating on an account and that account's quota
+    // has NOT run out (still eligible for this model family), stick to it!
+    // Only switch accounts when the current account's quota is exhausted.
+    // Switching accounts mid-session throws away native agy conversation history
+    // and forces re-sending the entire multi-turn context (buildDigest),
+    // which wastes huge amounts of token quota.
+    let account: ManagedAccount | undefined
+    if (this.deps.pool && !isAux && sessionKey !== '') {
+      const prefix = `${sessionKey}:`
+      let mostRecentAccount: ManagedAccount | undefined
+      let latestUpdated = -1
+
+      for (const [k, b] of Object.entries(this.deps.store.all())) {
+        if (k.startsWith(prefix) && b.updatedAt > latestUpdated) {
+          const boundId = k.slice(prefix.length)
+          const boundAcc = this.deps.pool.getAccount(boundId)
+          if (boundAcc) {
+            mostRecentAccount = boundAcc
+            latestUpdated = b.updatedAt
+          }
+        }
+      }
+
+      if (mostRecentAccount && this.deps.pool.isAccountEligible(mostRecentAccount, family)) {
+        account = mostRecentAccount
+      }
+    }
+
+    if (!account && this.deps.pool) {
+      account = this.deps.pool.selectAccount(family) ?? undefined
+    }
     if (this.deps.pool && this.deps.pool.getAccounts().length > 0 && !account) {
       if (cfg.autoFallbackModel) {
         // Quota pools are per FAMILY (Gemini / Claude / GPT-OSS). Downgrading
@@ -847,6 +885,9 @@ export class AgyAdapter extends LlmAdapter {
             account = fbAcc
             family = fbFam
             activeModel = familyModel[fbFam] ?? activeModel
+            if (!isAux && sessionKey !== '') {
+              this.deps.syncSessionModel?.(sessionKey, activeModel)
+            }
             break
           }
         }
@@ -867,7 +908,7 @@ export class AgyAdapter extends LlmAdapter {
         // user resend. Longer waits still fail fast with an accurate ETA.
         if (countdown !== null && countdown > 0 && countdown <= 20_000) {
           await new Promise((r) => setTimeout(r, countdown + 250))
-          account = pool.selectAccount(family)
+          account = pool.selectAccount(family) ?? undefined
         }
         if (!account) {
           const why = signedOut > 0 && signedOut === accounts.length
@@ -1205,6 +1246,112 @@ export class AgyAdapter extends LlmAdapter {
         }
       }
       this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
+    }
+
+    // ---- Gemini Web execution branch ----
+    if (account?.type === 'gemini-web' && account.webAuth?.cookies) {
+      try {
+        const stream = streamGeminiWeb({
+          auth: account.webAuth,
+          prompt,
+          system: typeof options.system === 'string' ? options.system : undefined,
+          tools: options.tools,
+          model: activeModel,
+          reasoningEffort: options.reasoningEffort ? String(options.reasoningEffort) : undefined,
+          proxyUrl: account.proxyUrl || cfg.proxyUrl || undefined,
+          signal: options.signal,
+          onContextUpdate: (newCtx) => {
+            if (sessionAccountKey !== '' && newCtx.conversationId) {
+              this.deps.store.set(sessionAccountKey, {
+                conversationId: newCtx.conversationId,
+                lastMessageCount: messages.length,
+                updatedAt: Date.now(),
+                model: currentModel,
+              })
+            }
+          },
+        })
+
+        let blockIdx = 0
+        let currentBlock: 'text' | 'reasoning' | null = null
+        let accText = ''
+        let accReasoning = ''
+        let sawToolCall = false
+
+        const closeCurrentBlock = (): StreamChunk | null => {
+          if (currentBlock === null) return null
+          const block = currentBlock === 'text'
+            ? { type: 'text' as const, text: accText }
+            : { type: 'reasoning' as const, text: accReasoning }
+          const chunk: StreamChunk = { type: 'block-end', index: blockIdx, block }
+          blockIdx++
+          currentBlock = null
+          return chunk
+        }
+
+        for await (const chunk of stream) {
+          if (chunk.type === 'reasoning' && chunk.text) {
+            if (currentBlock !== 'reasoning') {
+              const close = closeCurrentBlock()
+              if (close) yield close
+              currentBlock = 'reasoning'
+              accReasoning = ''
+              yield { type: 'block-start', index: blockIdx, blockType: 'reasoning' }
+            }
+            accReasoning += chunk.text
+            yield { type: 'reasoning-delta', index: blockIdx, text: chunk.text }
+          } else if (chunk.type === 'content' && chunk.text) {
+            if (currentBlock !== 'text') {
+              const close = closeCurrentBlock()
+              if (close) yield close
+              currentBlock = 'text'
+              accText = ''
+              yield { type: 'block-start', index: blockIdx, blockType: 'text' }
+            }
+            accText += chunk.text
+            yield { type: 'text-delta', index: blockIdx, text: chunk.text }
+          } else if (chunk.type === 'tool-call' && chunk.toolCall) {
+            const close = closeCurrentBlock()
+            if (close) yield close
+            const toolIdx = blockIdx
+            yield { type: 'block-start', index: toolIdx, blockType: 'tool-call' }
+            yield {
+              type: 'block-end',
+              index: toolIdx,
+              block: {
+                type: 'tool-call',
+                id: toToolCallId(chunk.toolCall.id),
+                name: chunk.toolCall.name,
+                arguments: JSON.stringify(chunk.toolCall.arguments),
+              },
+            }
+            blockIdx++
+            sawToolCall = true
+          }
+        }
+        const finalClose = closeCurrentBlock()
+        if (finalClose) yield finalClose
+        yield {
+          type: 'finish',
+          reason: sawToolCall ? { kind: 'tool-calls' } : { kind: 'stop' },
+        }
+        if (sessionKey !== '') {
+          this.activeSessionPrompts.delete(sessionKey)
+        }
+        this.deps.pool?.recordSuccess(account.id, 'google')
+        return
+      } catch (err) {
+        if (sessionKey !== '') {
+          this.activeSessionPrompts.delete(sessionKey)
+        }
+        const msg = err instanceof Error ? err.message : String(err)
+        if (looksLikeRateLimit(msg) || msg.includes('429')) {
+          this.deps.pool?.recordFailure(account.id, 'google', msg)
+        } else if (msg.includes('401') || msg.includes('403') || msg.includes('unauthorized') || msg.includes('re-login')) {
+          this.deps.pool?.markAuthRequired(account.id, msg)
+        }
+        throw new LlmError(`Gemini Web error (${account.alias}): ${msg}`, Err.AGY_ERROR)
+      }
     }
 
     // ---- spawn + record (v0.3: spans consume a shared recording) ----
@@ -1567,13 +1714,25 @@ export class AgyAdapter extends LlmAdapter {
           code: hard ? Err.RATE_LIMIT : Err.OVERLOADED,
           message: 'Google Antigravity quota / rate limit reached: ' + bestMsg,
         }
-      } else if (looksLikeEligibilityFailure(rawErrText) || looksLikeEligibilityFailure(parser.stats.lastResultError ?? '')) {
+      } else if (
+        !transportFailure
+        && (looksLikeEligibilityFailure(rawErrText) || looksLikeEligibilityFailure(parser.stats.lastResultError ?? ''))
+      ) {
         // Region/account eligibility refusal (issue #32): a clear cause, not a
         // generic PROCESS_EXIT. It is ACCOUNT-level (each account can have its
         // own proxy/egress region), so the failing pointer is rotated before
         // the error surfaces and the code is retryable — an account that IS
         // eligible can then serve the retry instead of the same refused one
         // failing again and again.
+        //
+        // BUT agy wraps EVERY startup check in "Eligibility check failed:" —
+        // including pure transport errors like "failed to get profile picture:
+        // Get https://lh3.googleusercontent.com/...: net/http: TLS handshake
+        // timeout". That is a network blip (observed live: it fails on the
+        // first turn and succeeds on the retry), not a region refusal, so when
+        // transport evidence is present it wins and we fall through to the
+        // NETWORK classification instead of showing a misleading
+        // "not eligible for this account/region" hint.
         const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : '')
         failure = {
           kind: 'error',
@@ -1581,13 +1740,29 @@ export class AgyAdapter extends LlmAdapter {
           message: ELIGIBILITY_ERROR_HINT + (detail !== '' ? ' (' + detail + ')' : ''),
         }
       } else if (!consumable) {
+        // Network evidence (TLS handshake timeout, EOF, …) beats a generic
+        // "exited with code 1": the retry policy already treats NETWORK as
+        // retryable, and the message names the transport problem instead of
+        // implying a deterministic agy crash.
         if (outcome.code !== 0) {
           // agy reports its failure on STDOUT as a result envelope and often
           // exits 1 with EMPTY stderr; dropping the envelope here used to
           // leave users with a bare "agy exited with code 1" and no cause.
           // Prefer the envelope's error text, then the stderr tail.
           const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : '')
-          failure = { kind: 'error', code: Err.PROCESS_EXIT, message: 'agy exited with code ' + outcome.code + (detail !== '' ? ': ' + detail : '') }
+          failure = transportFailure
+            ? {
+                kind: 'error',
+                code: Err.NETWORK,
+                message: 'agy hit a network error while talking to Google — the automatic retry usually succeeds. ' + (detail !== '' ? detail : brief(rawErrText)),
+              }
+            : { kind: 'error', code: Err.PROCESS_EXIT, message: 'agy exited with code ' + outcome.code + (detail !== '' ? ': ' + detail : '') }
+        } else if (transportFailure) {
+          failure = {
+            kind: 'error',
+            code: Err.NETWORK,
+            message: 'agy hit a network error while talking to Google — the automatic retry usually succeeds. ' + brief(rawErrText),
+          }
         } else if (parser.stats.lastResultError) {
           failure = { kind: 'error', code: Err.AGY_ERROR, message: 'agy reported an error: ' + parser.stats.lastResultError }
         } else {
@@ -1648,18 +1823,14 @@ export class AgyAdapter extends LlmAdapter {
         //  - AUTH: the account is marked authRequired below, which already
         //    excludes it from rotation; rotating here makes the intent explicit.
         //  - any other non-consumable refusal that came back with a nonzero
-        //    exit (quota phrasings the hard regex does not know, agy crashes):
-        //    the account is the only thing we can change, so try the next one.
-        //    Rotating costs nothing and is what keeps the session alive instead
-        //    of surfacing "run /agy auth"/"exited 1" while another account is
-        //    idle. RATE_LIMIT is excluded: recordFailure already cooled the
-        //    account, which is stronger than a bare pointer move.
+        // Account-scoped failures (network, capacity overload, auth) rotate
+        // away so the automatic retry can try another account.
+        // Generic process exit (code !== 0) or tool errors do NOT indicate quota
+        // exhaustion, so we MUST NOT rotate accounts and discard conversation history.
         const rotateAway = !outcome.aborted && failure.code !== Err.RATE_LIMIT
           && (failure.code === Err.NETWORK
             || failure.code === Err.OVERLOADED
-            || failure.code === Err.AUTH
-            || outcome.code !== 0
-            || parser.stats.lastResultError !== undefined)
+            || failure.code === Err.AUTH)
         if (rotateAway && account) this.deps.pool?.advanceAccount(account.id, family)
         // Only authoritative auth states may flag an account: the old
         // /auth/i substring matched "oauth2.googleapis.com … i/o timeout"
