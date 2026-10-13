@@ -149,7 +149,11 @@ export function normalizeStoredToken(raw: Record<string, unknown>): StoredToken 
 interface DiscoveredModelEntry {
   quotaInfo?: {
     remainingFraction?: number
+    /** snake_case spelling used by the live API. */
+    remaining_fraction?: number
     resetTime?: string
+    /** snake_case spelling used by the live API. */
+    reset_time?: string
   }
   displayName?: string
   modelName?: string
@@ -159,17 +163,34 @@ interface DiscoveredModelsResponse {
   models?: Record<string, DiscoveredModelEntry>
 }
 
+/**
+ * Quota buckets come back from `v1internal:retrieveUserQuotaSummary` in snake_case
+ * (`remaining_fraction` / `reset_time`) with groups named via `name`, but older
+ * surfaces used camelCase and `displayName`. Accept BOTH spellings and normalize
+ * at read time: reading only one silently degrades every bucket to "unknown",
+ * which the client's `?? 1` fallback renders as a confident 100%.
+ * Verified live against agy 1.2.4 / 1.3.x: the wire format is snake_case.
+ */
 interface QuotaSummaryBucket {
   bucketId?: string
+  /** snake_case id used by the live API (e.g. "gemini-5h"). */
+  id?: string
   displayName?: string
+  name?: string
   window?: string
   resetTime?: string
+  /** snake_case reset timestamp used by the live API. */
+  reset_time?: string
   description?: string
   remainingFraction?: number
+  /** snake_case fraction used by the live API. */
+  remaining_fraction?: number
 }
 
 interface QuotaSummaryGroup {
   displayName?: string
+  /** snake_case group name used by the live API (e.g. "Gemini Models"). */
+  name?: string
   description?: string
   buckets?: QuotaSummaryBucket[]
 }
@@ -776,7 +797,10 @@ export class QuotaService {
     // 1. Ingest official weekly & 5h limits from retrieveUserQuotaSummary
     if (summary && Array.isArray(summary.groups)) {
       for (const group of summary.groups) {
-        const dName = (group.displayName || '').toLowerCase()
+        // The live API names this field `name`; older payloads used `displayName`.
+        // Reading only one makes every group fall through to targetFamilies=[],
+        // silently dropping all quota buckets.
+        const dName = (group.displayName || group.name || '').toLowerCase()
         const desc = (group.description || '').toLowerCase()
         const isGoogle = dName.includes('gemini') || desc.includes('gemini')
         const is3P = dName.includes('claude') || dName.includes('gpt') || desc.includes('claude') || desc.includes('gpt')
@@ -793,19 +817,25 @@ export class QuotaService {
         let weeklyReset: string | undefined
 
         for (const b of group.buckets || []) {
-          const w = (b.window || b.bucketId || '').toLowerCase()
+          const w = (b.window || b.bucketId || b.id || '').toLowerCase()
+          // Normalize BOTH spellings: the live API is snake_case
+          // (remaining_fraction / reset_time). Reading only camelCase yielded
+          // undefined for every bucket, which the UI's `?? 1` fallback rendered
+          // as a permanent 100%.
+          const rawFrac = b.remainingFraction ?? b.remaining_fraction
+          const reset = b.resetTime ?? b.reset_time
           // Server fractions are clamped to [0,1] and NaN rejected: a bogus
           // remainingFraction (NaN/negative/>1) used to flow straight into
           // isAccountEligible and the UI ("NaN%" rows, permanently ineligible).
-          const frac = typeof b.remainingFraction === 'number' && Number.isFinite(b.remainingFraction)
-            ? Math.min(1, Math.max(0, b.remainingFraction))
+          const frac = typeof rawFrac === 'number' && Number.isFinite(rawFrac)
+            ? Math.min(1, Math.max(0, rawFrac))
             : undefined
           if (w.includes('5h') || w.includes('five_hour') || w.includes('5-hour')) {
             fiveHourFrac = frac
-            fiveHourReset = b.resetTime
+            fiveHourReset = reset
           } else if (w.includes('weekly') || w.includes('week')) {
             weeklyFrac = frac
-            weeklyReset = b.resetTime
+            weeklyReset = reset
           }
         }
 
@@ -828,13 +858,14 @@ export class QuotaService {
       for (const [modelId, entry] of Object.entries(discovered.models)) {
         const fam = modelFamilyOf(modelId)
         if (fam === 'unknown') continue
-        const rawRemaining = entry.quotaInfo?.remainingFraction
+        // Same dual-casing normalization as the family buckets above.
+        const rawRemaining = entry.quotaInfo?.remainingFraction ?? entry.quotaInfo?.remaining_fraction
         // Clamp to [0,1]; non-numeric entries are skipped (same contract as
         // the summary path above).
         const remaining = typeof rawRemaining === 'number' && Number.isFinite(rawRemaining)
           ? Math.min(1, Math.max(0, rawRemaining))
           : undefined
-        const resetTime = entry.quotaInfo?.resetTime
+        const resetTime = entry.quotaInfo?.resetTime ?? entry.quotaInfo?.reset_time
 
         if (remaining === undefined) continue
 

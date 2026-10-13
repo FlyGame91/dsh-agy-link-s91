@@ -3,7 +3,7 @@
 #   dsh plugin --profile web add dsh-agy-link
 - insert:
     - id: agy-link
-      name: 'dsh-agy-link'
+      name: 'dsh-agy-link-s91'
       config:
         enabled: !!js "process.env.DSH_AGY_ENABLED ?? 'true'"
         agyBin: !!js "process.env.DSH_AGY_BIN ?? ''"

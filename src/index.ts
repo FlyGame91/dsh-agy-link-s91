@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { dshHome, overridesPath, readOverrides, resolveConfig, stateDir } from './common/config.ts'
-import { PLUGIN_ID, PROVIDER_ID, type PluginConfig } from './common/types.ts'
+import { PKG_NAME, PLUGIN_ID, PROVIDER_ID, type PluginConfig } from './common/types.ts'
 import type { ManagedAccount } from './common/pool-types.ts'
 import { AgyAdapter } from './host/adapter.ts'
 import { defineAgyAskTool } from './host/ask-tool.ts'
@@ -33,7 +33,7 @@ import { startMcpBridge, writeMcpConfig, type McpBridge, type ToolsServiceLike }
 import { fileURLToPath } from 'node:url'
 import { handleMediaRequest, handleAssetRequest, type HttpRequestLike, type HttpResponseLike } from './host/media-route.ts'
 
-export const name = 'dsh-agy-link'
+export const name = PKG_NAME
 // webServer and tools are optional: the plugin loads headless too.
 export const inject = ['llm', 'commands']
 

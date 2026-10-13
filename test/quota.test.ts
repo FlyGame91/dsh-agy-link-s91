@@ -231,14 +231,16 @@ test('manual force refresh re-anchors slot identity from the token, not the labe
       return { email: 'elegantmanco@gmail.com' }
     }
     override async fetchQuotaSummary() {
+      // Wire shape captured live from v1internal:retrieveUserQuotaSummary:
+      // groups use `name` and buckets use snake_case `remaining_fraction` / `reset_time`.
       return {
         groups: [
           {
-            displayName: 'Gemini Models',
+            name: 'Gemini Models',
             description: 'Models within this group: Gemini Flash, Gemini Pro',
             buckets: [
-              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.7, resetTime: '2026-08-27T12:00:00Z' },
-              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.42, resetTime: '2026-08-29T12:00:00Z' },
+              { id: 'gemini-5h', window: '5h', remaining_fraction: 0.7, reset_time: '2026-08-27T12:00:00Z' },
+              { id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.42, reset_time: '2026-08-29T12:00:00Z' },
             ],
           },
         ],
@@ -282,7 +284,8 @@ test('background refresh keeps the zero-network identity path (no userinfo when 
       return null
     }
     override async fetchQuotaSummary() {
-      return { groups: [{ displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.9, resetTime: '2026-08-27T12:00:00Z' }] }] } as never
+      // Real wire shape (snake_case) — see the note in the force-refresh test above.
+      return { groups: [{ name: 'Gemini Models', buckets: [{ id: 'gemini-5h', window: '5h', remaining_fraction: 0.9, reset_time: '2026-08-27T12:00:00Z' }] }] } as never
     }
     override async fetchAvailableModels() {
       return { models: {} } as never
@@ -473,4 +476,79 @@ test('readSystemKeychainToken dispatches per platform (GH #8 / GH #30)', async (
   const svc = new DispatchProbe(pool)
   const tok = await svc.getStoredToken(primary)
   assert.ok(tok === null || typeof tok.accessToken === 'string', 'dispatch resolves without throwing')
+})
+
+/**
+ * REGRESSION: the dashboard showed a permanent 100% for every quota family.
+ *
+ * Root cause: the parser read camelCase `remainingFraction` / `resetTime` and
+ * `group.displayName`, while the live wire format of
+ * v1internal:retrieveUserQuotaSummary is snake_case (`remaining_fraction` /
+ * `reset_time`) with `group.name`. Every bucket resolved to undefined, and the
+ * UI's `?? 1` fallback then rendered undefined as a confident 100%.
+ *
+ * Why the suite missed it: the old mocks returned camelCase, i.e. they encoded
+ * the same wrong assumption as the code. This test pins the REAL wire shape
+ * (captured live from agy 1.3.x) and asserts the camelCase shape keeps working.
+ */
+test('refreshAccountQuota normalizes snake_case AND camelCase quota buckets (regression: permanent 100%)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-casing-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('casing-test')
+
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.casing', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  const shapeFor = (snake: boolean) => ({
+    groups: [
+      {
+        ...(snake ? { name: 'Gemini Models' } : { displayName: 'Gemini Models' }),
+        description: 'Models within this group: Gemini Flash, Gemini Pro',
+        buckets: [
+          snake
+            ? { id: 'gemini-5h', window: '5h', remaining_fraction: 0.55, reset_time: '2026-09-21T15:29:00Z' }
+            : { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.55, resetTime: '2026-09-21T15:29:00Z' },
+          snake
+            ? { id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.9, reset_time: '2026-09-23T17:03:40Z' }
+            : { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.9, resetTime: '2026-09-23T17:03:40Z' },
+        ],
+      },
+      {
+        ...(snake ? { name: 'Claude and GPT models' } : { displayName: 'Claude and GPT models' }),
+        description: 'Models within this group: Claude Opus, Claude Sonnet, GPT-OSS',
+        buckets: [
+          snake
+            ? { id: '3p-weekly', window: 'weekly', remaining_fraction: 1, reset_time: '2026-09-28T13:15:12Z' }
+            : { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 1, resetTime: '2026-09-28T13:15:12Z' },
+        ],
+      },
+    ],
+  })
+
+  for (const snake of [true, false]) {
+    const label = snake ? 'snake_case (live wire format)' : 'camelCase (legacy)'
+    class CasingService extends QuotaService {
+      override async fetchQuotaSummary() {
+        return shapeFor(snake) as never
+      }
+      override async fetchAvailableModels() {
+        return { models: {} } as never
+      }
+    }
+    const svc = new CasingService(pool)
+    await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+    const q = pool.getAccount(acc.id)!.quotas
+
+    assert.equal(q.google?.remainingFraction, 0.55, label + ': 5h fraction must parse (undefined renders as 100%)')
+    assert.equal(q.google?.resetTime, '2026-09-21T15:29:00Z', label + ': 5h reset time')
+    assert.equal(q.google?.weeklyFraction, 0.9, label + ': weekly fraction must parse')
+    assert.equal(q.google?.weeklyResetTime, '2026-09-23T17:03:40Z', label + ': weekly reset time')
+    assert.equal(q.anthropic?.weeklyFraction, 1, label + ': 3P group recognized via name/displayName')
+    assert.equal(q.openai?.weeklyFraction, 1, label + ': 3P group maps to both anthropic and openai')
+  }
 })
