@@ -2004,13 +2004,17 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 		const pool = status?.pool;
 		const accounts = pool?.accounts ?? [];
 		const rawActiveId = pool?.activeAccountId ?? pool?.lastActiveAccountId ?? pool?.activeAccountIds?.google ?? pool?.primaryAccountId;
-		const activeAcc = accounts.find((a) => a.id === rawActiveId && a.enabled && !a.authRequired)
-			?? accounts.find((a) => a.enabled && !a.authRequired)
-			?? accounts[0];
+		// Display EXACTLY the server-scheduled account — same semantics as the
+		// console's per-card "当前使用" badge. The old eligibility fallback
+		// (any enabled account, else accounts[0]) made the header name a
+		// DIFFERENT account than the console whenever the scheduled slot was
+		// cooling down or auth-flagged: the header is a readout, not a picker.
+		const activeAcc = rawActiveId !== undefined ? accounts.find((a) => a.id === rawActiveId) : undefined;
+		const activeAuthRequired = activeAcc?.authRequired === true;
 		const activeHasCooldown = activeAcc ? Object.entries(activeAcc.cooldowns ?? {}).some(([, cd]) => cd && cd.cooldownUntil > Date.now()) : false;
 		const allInCooldown = accounts.length > 0 && accounts.every((a) => !a.enabled || a.authRequired || Object.entries(a.cooldowns ?? {}).some(([, cd]) => cd && cd.cooldownUntil > Date.now()));
 		const isAuthed = status?.auth?.phase === 'ok' || accounts.length > 0;
-		const color = status === null ? '#64748b' : status.dormantReason ? '#f59e0b' : allInCooldown ? '#f59e0b' : activeHasCooldown ? '#f59e0b' : isAuthed ? '#10b981' : '#f59e0b';
+		const color = status === null ? '#64748b' : status.dormantReason ? '#f59e0b' : allInCooldown ? '#f59e0b' : activeAuthRequired ? '#ef4444' : activeHasCooldown ? '#f59e0b' : isAuthed ? '#10b981' : '#f59e0b';
 
 		const legacyDefault = activeAcc && activeAcc.defaultAlias === undefined && activeAcc.systemHome && activeAcc.alias === '主账号 (系统登录)';
 		const displayAlias = activeAcc ? (activeAcc.defaultAlias || legacyDefault
