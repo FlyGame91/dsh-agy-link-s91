@@ -23,7 +23,6 @@ import { stateDir } from '../common/config.ts'
 import { SENT_IMAGE_IDS_MAX, type SessionStore } from './sessions.ts'
 import { readFullToolArgs, readStepThoughts, clearAgyDbCache } from './agy-db.ts'
 import { getGitHeadContent } from './mirror-tool.ts'
-import { streamGeminiWeb } from './gemini-web.ts'
 
 type ForeignSource = { source?: { kind?: string; provider?: string; callId?: string; replayState?: unknown } }
 
@@ -1246,112 +1245,6 @@ export class AgyAdapter extends LlmAdapter {
         }
       }
       this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
-    }
-
-    // ---- Gemini Web execution branch ----
-    if (account?.type === 'gemini-web' && account.webAuth?.cookies) {
-      try {
-        const stream = streamGeminiWeb({
-          auth: account.webAuth,
-          prompt,
-          system: typeof options.system === 'string' ? options.system : undefined,
-          tools: options.tools,
-          model: activeModel,
-          reasoningEffort: options.reasoningEffort ? String(options.reasoningEffort) : undefined,
-          proxyUrl: account.proxyUrl || cfg.proxyUrl || undefined,
-          signal: options.signal,
-          onContextUpdate: (newCtx) => {
-            if (sessionAccountKey !== '' && newCtx.conversationId) {
-              this.deps.store.set(sessionAccountKey, {
-                conversationId: newCtx.conversationId,
-                lastMessageCount: messages.length,
-                updatedAt: Date.now(),
-                model: currentModel,
-              })
-            }
-          },
-        })
-
-        let blockIdx = 0
-        let currentBlock: 'text' | 'reasoning' | null = null
-        let accText = ''
-        let accReasoning = ''
-        let sawToolCall = false
-
-        const closeCurrentBlock = (): StreamChunk | null => {
-          if (currentBlock === null) return null
-          const block = currentBlock === 'text'
-            ? { type: 'text' as const, text: accText }
-            : { type: 'reasoning' as const, text: accReasoning }
-          const chunk: StreamChunk = { type: 'block-end', index: blockIdx, block }
-          blockIdx++
-          currentBlock = null
-          return chunk
-        }
-
-        for await (const chunk of stream) {
-          if (chunk.type === 'reasoning' && chunk.text) {
-            if (currentBlock !== 'reasoning') {
-              const close = closeCurrentBlock()
-              if (close) yield close
-              currentBlock = 'reasoning'
-              accReasoning = ''
-              yield { type: 'block-start', index: blockIdx, blockType: 'reasoning' }
-            }
-            accReasoning += chunk.text
-            yield { type: 'reasoning-delta', index: blockIdx, text: chunk.text }
-          } else if (chunk.type === 'content' && chunk.text) {
-            if (currentBlock !== 'text') {
-              const close = closeCurrentBlock()
-              if (close) yield close
-              currentBlock = 'text'
-              accText = ''
-              yield { type: 'block-start', index: blockIdx, blockType: 'text' }
-            }
-            accText += chunk.text
-            yield { type: 'text-delta', index: blockIdx, text: chunk.text }
-          } else if (chunk.type === 'tool-call' && chunk.toolCall) {
-            const close = closeCurrentBlock()
-            if (close) yield close
-            const toolIdx = blockIdx
-            yield { type: 'block-start', index: toolIdx, blockType: 'tool-call' }
-            yield {
-              type: 'block-end',
-              index: toolIdx,
-              block: {
-                type: 'tool-call',
-                id: toToolCallId(chunk.toolCall.id),
-                name: chunk.toolCall.name,
-                arguments: JSON.stringify(chunk.toolCall.arguments),
-              },
-            }
-            blockIdx++
-            sawToolCall = true
-          }
-        }
-        const finalClose = closeCurrentBlock()
-        if (finalClose) yield finalClose
-        yield {
-          type: 'finish',
-          reason: sawToolCall ? { kind: 'tool-calls' } : { kind: 'stop' },
-        }
-        if (sessionKey !== '') {
-          this.activeSessionPrompts.delete(sessionKey)
-        }
-        this.deps.pool?.recordSuccess(account.id, 'google')
-        return
-      } catch (err) {
-        if (sessionKey !== '') {
-          this.activeSessionPrompts.delete(sessionKey)
-        }
-        const msg = err instanceof Error ? err.message : String(err)
-        if (looksLikeRateLimit(msg) || msg.includes('429')) {
-          this.deps.pool?.recordFailure(account.id, 'google', msg)
-        } else if (msg.includes('401') || msg.includes('403') || msg.includes('unauthorized') || msg.includes('re-login')) {
-          this.deps.pool?.markAuthRequired(account.id, msg)
-        }
-        throw new LlmError(`Gemini Web error (${account.alias}): ${msg}`, Err.AGY_ERROR)
-      }
     }
 
     // ---- spawn + record (v0.3: spans consume a shared recording) ----

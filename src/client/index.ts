@@ -29,6 +29,11 @@ const win = globalThis as unknown as {
 	fetch?: (url: string, init?: Record<string, unknown>) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 	open?: (url: string, target?: string) => void;
 	document?: { body?: unknown } | null;
+	localStorage?: {
+		getItem(key: string): string | null;
+		setItem(key: string, value: string): void;
+		removeItem(key: string): void;
+	};
 	addEventListener?: (type: string, listener: (ev: any) => void, useCapture?: boolean) => void;
 	removeEventListener?: (type: string, listener: (ev: any) => void, useCapture?: boolean) => void;
 };
@@ -100,8 +105,23 @@ interface ToastNotice {
 
 const base = win.location?.origin ?? '';
 
-// Module-level cache for instant remount rendering
-let statusCache: StatusPayload | null = null;
+const STATUS_CACHE_KEY = 'dsh_agy_status_cache';
+
+function loadInitialStatusCache(): StatusPayload | null {
+	try {
+		const raw = win.localStorage?.getItem(STATUS_CACHE_KEY);
+		if (raw) {
+			const parsed = JSON.parse(raw);
+			if (parsed && typeof parsed === 'object') return parsed as StatusPayload;
+		}
+	} catch {
+		// Ignore storage quota / parsing errors
+	}
+	return null;
+}
+
+// Module-level cache for instant remount rendering (preloaded from localStorage for zero-flicker startup)
+let statusCache: StatusPayload | null = loadInitialStatusCache();
 
 async function getStatus(): Promise<StatusPayload | null> {
 	try {
@@ -176,6 +196,11 @@ function isStatusEqual(a: StatusPayload | null, b: StatusPayload | null): boolea
 
 function notifyStatus(st: StatusPayload): void {
 	statusCache = st;
+	try {
+		win.localStorage?.setItem(STATUS_CACHE_KEY, JSON.stringify(st));
+	} catch {
+		// Ignore storage quota / parsing errors
+	}
 	for (const fn of [...statusListeners]) {
 		try { fn(st); } catch { /* a dead consumer must not kill the loop */ }
 	}
@@ -964,11 +989,8 @@ export function apply(ctx: ClientContext): void {
 		const [loadingAction, setLoadingAction] = useState<string | null>(null);
 		const [toast, setToast] = useState<ToastNotice | null>(null);
 		const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
-		const [addType, setAddType] = useState<'agy' | 'gemini-web'>('agy');
-		const [selectedBrowser, setSelectedBrowser] = useState<'chrome' | 'edge'>('chrome');
 		const [addProxyInput, setAddProxyInput] = useState('');
 
-		const [browserLoginState, setBrowserLoginState] = useState<{ active?: boolean; status?: string; message?: string } | null>(null);
 
 		// Cooldown expiry and quota countdowns are Date.now()-derived while the
 		// payload itself does NOT change when they lapse — without a wall-clock
@@ -1065,10 +1087,6 @@ export function apply(ctx: ClientContext): void {
 		const handleCancelAddAccount = async (): Promise<void> => {
 			flowStartedRef.current = false;
 			await postJson('/plugins/agy-link/pool/cancel-add', {});
-			if (browserLoginState?.active) {
-				await postJson('/plugins/agy-link/pool/cancel-browser-login', {});
-				setBrowserLoginState(null);
-			}
 			setAuthCodeInput('');
 			setAliasInput('');
 			setAddProxyInput('');
@@ -1098,69 +1116,6 @@ export function apply(ctx: ClientContext): void {
 			if (moved) ids.splice(newIdx, 0, moved);
 			await reorderAccounts(ids);
 		};
-
-		const handleStartBrowserLogin = async (browser?: 'chrome' | 'edge', accountId?: string): Promise<void> => {
-			setLoadingAction(accountId ? `relogin:${accountId}` : 'pool:startBrowserLogin');
-			const targetBrowser = browser || selectedBrowser;
-			const res = await postJson('/plugins/agy-link/pool/start-browser-login', {
-				alias: accountId ? '' : aliasInput.trim(),
-				proxyUrl: (accountId ? undefined : addProxyInput.trim()) || undefined,
-				browser: targetBrowser,
-				accountId,
-			});
-			setLoadingAction(null);
-			if (res && res.ok) {
-				setBrowserLoginState({ active: true, status: 'launching', message: '正在启动独立 Profile 浏览器环境...' });
-				showToast(`已启动 ${targetBrowser === 'edge' ? 'Microsoft Edge' : 'Google Chrome'}（独立隔离 Profile）...`, 'info');
-			} else {
-				showToast(res?.error || '启动浏览器登录失败', 'error');
-			}
-		};
-
-		const handleCancelBrowserLogin = async (): Promise<void> => {
-			await postJson('/plugins/agy-link/pool/cancel-browser-login', {});
-			setBrowserLoginState(null);
-		};
-
-		const testWebAccount = async (id: string): Promise<void> => {
-			setLoadingAction(`testWeb:${id}`);
-			const res = await postJson('/plugins/agy-link/pool/test-web-account', { id });
-			setLoadingAction(null);
-			if (res && res.ok) {
-				await refresh();
-				const emailSuffix = res.email ? ` (${res.email})` : '';
-				showToast(`${t('web.testSuccess')}${emailSuffix}`, 'success');
-			} else {
-				showToast(res?.error || t('web.testFailed'), 'error');
-			}
-		};
-
-		useEffect(() => {
-			if (!browserLoginState?.active) return;
-			const timer = setInterval(async () => {
-				const res = await getJson<{ ok?: boolean; progress?: { active?: boolean; status?: string; message?: string } }>('/plugins/agy-link/pool/browser-login-status');
-				if (res && res.progress) {
-					setBrowserLoginState((prev) => {
-						if (prev && prev.active === res.progress?.active && prev.status === res.progress?.status && prev.message === res.progress?.message) {
-							return prev;
-						}
-						return res.progress!;
-					});
-					if (res.progress.status === 'success') {
-						setBrowserLoginState(null);
-						setAddingAccount(false);
-						setAliasInput('');
-						setAddProxyInput('');
-						await refresh();
-						showToast(res.progress.message || 'Gemini 网页端账号添加成功', 'success');
-					} else if (res.progress.status === 'failed') {
-						setBrowserLoginState(null);
-						showToast(res.progress.message || '浏览器登录捕获失败', 'error');
-					}
-				}
-			}, 1500);
-			return () => clearInterval(timer);
-		}, [browserLoginState?.active]);
 
 		const setCfg = async (key: string, value: unknown): Promise<void> => {
 			setLoadingAction(`config:${key}`);
@@ -1413,7 +1368,6 @@ export function apply(ctx: ClientContext): void {
 			const dotColor = !acc.enabled ? '#64748b' : isAuthRequired ? '#ef4444' : hasCooldown ? '#f59e0b' : '#10b981';
 			const isEditingProxy = editingProxyId === acc.id;
 			const isExpanded = expandedModels[acc.id] ?? false;
-			const isWeb = acc.type === 'gemini-web';
 			const accIndex = accounts.indexOf(acc);
 
 			const cardStyle = {
@@ -1497,18 +1451,7 @@ export function apply(ctx: ClientContext): void {
 							},
 							title: displayAlias,
 						}, displayAlias),
-						isWeb ? h('span', {
-							style: {
-								...S.badgeTag,
-								background: 'rgba(142, 117, 178, 0.15)',
-								color: '#8e75b2',
-								borderColor: 'rgba(142, 117, 178, 0.4)',
-								gap: '3px',
-								fontSize: '10px',
-								padding: '1px 5px',
-								fontWeight: 700,
-							},
-						}, brandIcon('gemini', 10), 'Web') : h('span', {
+						h('span', {
 							style: {
 								...S.badgeTag,
 								background: 'rgba(59, 130, 246, 0.12)',
@@ -1588,36 +1531,20 @@ export function apply(ctx: ClientContext): void {
 					h('div', {
 						style: { display: 'flex', gap: '4px', alignItems: 'center', flexShrink: 0 },
 					},
-						isWeb ? [
-							h('button', {
-								type: 'button',
-								className: 'agy-btn',
-								style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
-								disabled: isBusy,
-								onClick: () => void testWebAccount(acc.id),
-							}, loadingAction === `testWeb:${acc.id}` ? [renderSpinner(), t('web.testing')] : [uiIcon('zap', 10), ' 测试连接']),
-							isAuthRequired ? h('button', {
-								type: 'button',
-								className: 'agy-btn',
-								style: { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' },
-								disabled: isBusy,
-								onClick: () => void handleStartBrowserLogin(undefined, acc.id),
-							}, loadingAction === `relogin:${acc.id}` ? [renderSpinner(), '登录中...'] : [uiIcon('externalLink', 10), ` ${t('web.relogin')}`]) : null,
-						] : null,
-						!isWeb ? h('button', {
+						h('button', {
 							type: 'button',
 							className: 'agy-btn',
 							style: isExpanded ? { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' } : { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							onClick: () => toggleExpand(acc.id),
-						}, isExpanded ? [uiIcon('chevronUp', 10), ` ${t('account.collapse')}`] : [uiIcon('chevronDown', 10), ` ${t('account.otherModels')}`]) : null,
-						!isWeb ? h('button', {
+						}, isExpanded ? [uiIcon('chevronUp', 10), ` ${t('account.collapse')}`] : [uiIcon('chevronDown', 10), ` ${t('account.otherModels')}`]),
+						h('button', {
 							type: 'button',
 							className: 'agy-btn',
 							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							title: t('account.syncTitle'),
 							disabled: isBusy,
 							onClick: () => void refreshQuota(acc.id),
-						}, loadingAction === `refresh:${acc.id}` ? [renderSpinner(), t('account.syncing')] : [uiIcon('refresh', 10), ` ${t('account.sync')}`]) : null,
+						}, loadingAction === `refresh:${acc.id}` ? [renderSpinner(), t('account.syncing')] : [uiIcon('refresh', 10), ` ${t('account.sync')}`]),
 						!isPrimary ? h('button', {
 							type: 'button',
 							className: 'agy-btn',
@@ -1643,21 +1570,8 @@ export function apply(ctx: ClientContext): void {
 						}, loadingAction === `remove:${acc.id}` ? renderSpinner() : uiIcon('trash', 11, 'var(--agy-danger-text)')) : null,
 					),
 				),
-				// Body: Always directly visible, showing Gemini quota
-				isWeb
-					? h('div', { key: 'web-body', style: S.quotaBox },
-						h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 8px', background: 'var(--agy-bg-subbox)', borderRadius: '6px' } },
-							h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, fontSize: '12px' } },
-								brandIcon('gemini', 14),
-								h('span', null, 'Gemini 网页端免额度通道 (chat.gemini.google.com)'),
-							),
-							h('span', { style: { fontSize: '11px', color: '#10b981', fontWeight: 700 } }, '✓ 正常就绪'),
-						),
-						h('div', { style: { fontSize: '11px', color: 'var(--agy-text-secondary)', marginTop: '6px', padding: '0 4px', lineHeight: 1.4 } },
-							'仅服务 Google 模型家族（直接映射用户选中的模型）；非 Google 家族请求将自动顺延调度至 agy 账号。'
-						),
-					)
-					: h('div', { key: 'agy-body', style: S.quotaBox },
+				// Body: Always directly visible, showing quota
+h('div', { key: 'agy-body', style: S.quotaBox },
 						renderQuotaBar('Gemini', 'google', acc),
 						h('button', {
 							type: 'button',
@@ -1785,21 +1699,8 @@ export function apply(ctx: ClientContext): void {
 						uiIcon('plus', 13, 'var(--agy-btn-primary-bg)'),
 						t('account.add'),
 					),
-					h('div', { style: S.segGroup },
-						h('button', {
-							type: 'button',
-							style: addType === 'agy' ? S.segBtnActive : S.segBtn,
-							onClick: () => setAddType('agy'),
-						}, t('account.type.agy')),
-						h('button', {
-							type: 'button',
-							style: addType === 'gemini-web' ? S.segBtnActive : S.segBtn,
-							onClick: () => setAddType('gemini-web'),
-						}, t('account.type.web')),
 					),
-				),
-				addType === 'agy'
-					? (!flowActive
+				(!flowActive
 						? h('div', null,
 							h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' } },
 								h('input', {
@@ -1812,7 +1713,7 @@ export function apply(ctx: ClientContext): void {
 								h('input', {
 									style: S.input,
 									value: addProxyInput,
-									placeholder: t('web.proxyPlaceholder'),
+									placeholder: t('account.proxyPlaceholder'),
 									'aria-label': t('aria.proxyInput'),
 									onChange: (e: { target: { value: string } }) => setAddProxyInput(e.target.value),
 								}),
@@ -1876,73 +1777,7 @@ export function apply(ctx: ClientContext): void {
 								}, t('cancel')),
 							),
 						))
-					: h('div', null,
-						h('div', { style: { color: 'var(--agy-text-secondary)', fontSize: '12px', marginBottom: '12px', lineHeight: 1.5 } },
-							t('web.browserLoginDesc'),
-						),
-						h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' } },
-							h('span', { style: { fontSize: '12px', fontWeight: 600, color: 'var(--agy-text-secondary)' } }, t('web.browserSelect')),
-							h('div', { style: S.segGroup },
-								h('button', {
-									type: 'button',
-									className: 'agy-btn',
-									style: selectedBrowser === 'chrome' ? S.segBtnActive : S.segBtn,
-									onClick: () => setSelectedBrowser('chrome'),
-								}, [brandIcon('chrome', 13), ' ', t('web.browserChrome')]),
-								h('button', {
-									type: 'button',
-									className: 'agy-btn',
-									style: selectedBrowser === 'edge' ? S.segBtnActive : S.segBtn,
-									onClick: () => setSelectedBrowser('edge'),
-								}, [brandIcon('edge', 13), ' ', t('web.browserEdge')]),
-							),
-						),
-						h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' } },
-							h('input', {
-								style: S.input,
-								value: aliasInput,
-								placeholder: t('account.aliasPlaceholder'),
-								'aria-label': t('aria.aliasInput'),
-								onChange: (e: { target: { value: string } }) => setAliasInput(e.target.value),
-							}),
-							h('input', {
-								style: S.input,
-								value: addProxyInput,
-								placeholder: t('web.proxyPlaceholder'),
-								'aria-label': t('aria.proxyInput'),
-								onChange: (e: { target: { value: string } }) => setAddProxyInput(e.target.value),
-							}),
-						),
-						browserLoginState?.active
-							? h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--agy-bg-subbox)', borderRadius: '6px' } },
-								h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--agy-text-primary)', fontSize: '12px' } },
-									renderSpinner(),
-									h('span', null, browserLoginState.message || t('web.loginRunning')),
-								),
-								h('button', {
-									type: 'button',
-									className: 'agy-btn',
-									style: { ...S.btnDanger, padding: '3px 8px' },
-									onClick: () => void handleCancelBrowserLogin(),
-								}, t('web.cancelLogin')),
-							)
-							: h('div', { style: { display: 'flex', gap: '8px' } },
-								h('button', {
-									type: 'button',
-									className: 'agy-btn',
-									style: { ...S.btnPrimary, gap: '4px' },
-									disabled: isBusy,
-									onClick: () => void handleStartBrowserLogin(),
-								}, loadingAction === 'pool:startBrowserLogin' ? [renderSpinner(), '启动中...'] : [uiIcon('externalLink', 12, '#ffffff'), ` ${t('web.startCapture')}`]),
-								h('button', {
-									type: 'button',
-									className: 'agy-btn',
-									style: S.btn,
-									onClick: () => handleCancelAddAccount(),
-								}, t('cancel')),
-							),
-					)
-			)
+)
 			: null;
 
 		if (status === null) {
@@ -1975,20 +1810,6 @@ export function apply(ctx: ClientContext): void {
 				),
 			),
 			renderToastBanner(),
-			browserLoginState?.active && !addingAccount
-				? h('div', { key: 'browser-login-running', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', marginBottom: '10px', background: 'var(--agy-bg-subbox)', border: '1px solid var(--agy-border-subbox)', borderRadius: '6px' } },
-					h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--agy-text-primary)', fontSize: '12px' } },
-						renderSpinner(),
-						h('span', null, browserLoginState.message || t('web.loginRunning')),
-					),
-					h('button', {
-						type: 'button',
-						className: 'agy-btn',
-						style: { ...S.btnDanger, padding: '3px 8px', fontSize: '11px' },
-						onClick: () => void handleCancelBrowserLogin(),
-					}, t('web.cancelLogin')),
-				)
-				: null,
 			addAccountSection,
 			h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px', padding: '0 2px' } },
 				h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
@@ -2200,8 +2021,12 @@ export function apply(ctx: ClientContext): void {
 		// claimed a dead account was serving traffic next to an amber dot.
 		const activeEligible = activeAcc !== undefined && activeAcc.enabled && !activeAcc.authRequired;
 		const activeDetail = activeAcc !== undefined && activeEligible ? ` · ${t('status.inUse')}: ${displayAlias}${activeAcc.email ? ` (${activeAcc.email})` : ''}` : '';
-		const badgeTitle = `${t('header.badgeTitle', { count: accounts.length })}${activeDetail}`;
-		const buttonLabel = displayAlias ? `AGY · ${displayAlias}` : `AGY (${accounts.length})`;
+		const badgeTitle = status === null
+			? t('header.badgeLoading')
+			: `${t('header.badgeTitle', { count: accounts.length })}${activeDetail}`;
+		const buttonLabel = status === null
+			? 'AGY'
+			: displayAlias ? `AGY · ${displayAlias}` : `AGY (${accounts.length})`;
 
 		const badge = h('button',
 			{

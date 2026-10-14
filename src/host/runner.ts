@@ -168,8 +168,8 @@ export function proxyEnvFor(proxyUrl: string | undefined | null): Record<string,
  * macOS: an isolated HOME has no login keychain, so the first keyring write
  * makes the Security framework pop the "create login keychain" password
  * dialog (right system.keychain.create.loginkc) on every token refresh.
- * Provisioning a throwaway per-account keychain and making it the default
- * under that HOME keeps keyring writes silent and fully per-account.
+ * Provisioning a throwaway per-account keychain under that HOME keeps keyring
+ * writes silent. Never modifies the user's global default-keychain.
  * No-op on other platforms or when already provisioned. Never throws.
  * Exported for tests.
  */
@@ -187,7 +187,6 @@ export function ensureIsolatedKeychain(
     const env = { ...process.env, HOME: dir }
     mkdirSync(join(dir, 'Library', 'Keychains'), { recursive: true })
     run('security', ['create-keychain', '-p', '', kc], env)
-    run('security', ['default-keychain', '-s', kc], env)
     run('security', ['set-keychain-settings', kc], env)
     run('security', ['unlock-keychain', '-p', '', kc], env)
     return true
@@ -468,6 +467,13 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
   let timedOut = false;
   let aborted = false;
   let settled = false;
+
+  // EPIPE on stdin arrives ASYNC as an 'error' event (the try/catch around
+  // write/end only guards sync throws). Without a listener Node turns it into
+  // an uncaughtException and kills the whole DSH host
+  // (crash: WriteWrap.onWriteComplete write EPIPE). Swallow it — a dead child
+  // is handled by the exit/close handlers below.
+  child.stdin?.on('error', () => {});
 
   // agy reads stdin when it is a pipe and never sees EOF (observed on
   // 1.1.15: `agy models` hangs forever with an open pipe stdin, which is

@@ -273,7 +273,15 @@ export async function readLinuxSecretToken(): Promise<StoredToken | null> {
 export async function readMacKeychainToken(): Promise<StoredToken | null> {
   if (process.platform !== 'darwin') return null
   try {
-    const raw = (await execFileT('security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'], 3000)).trim()
+    const home = homedir()
+    const candidates = [
+      join(home, 'Library', 'Keychains', 'login.keychain-db'),
+      join(home, 'Library', 'Keychains', 'login.keychain'),
+    ]
+    const targetKc = candidates.find((p) => existsSync(p))
+    const args = ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w']
+    if (targetKc) args.push(targetKc)
+    const raw = (await execFileT('security', args, 3000)).trim()
     if (!raw) return null
     return parseGoKeyringPayload(raw)
   } catch {

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.49 (2026-10-14)
+
+### English
+
+- **Removal: Gemini Web (chat.gemini.google.com) account support is gone.** The whole web-login feature was removed per user request: the reverse-engineered web client, isolated-profile browser capture, the five `/plugins/agy-link/pool/*` web routes, the web execution branch in the adapter, web quota handling, all `web.*` UI (type switcher, browser picker, capture progress, test/re-login buttons, Web badge) and locale strings. Legacy `gemini-web` entries in `pool.json` are dropped automatically on load, with dangling active/primary pointers cleaned up. Existing AGY accounts are untouched.
+- **Fix (macOS): keychain password popups are gone for good.** `ensureIsolatedKeychain` never touches the user's global `default-keychain` / search list anymore (the per-account isolated keychain under the account HOME is enough), and `readMacKeychainToken` now targets the real `~/Library/Keychains/login.keychain-db` explicitly instead of whatever the hijacked default pointed at. Stale locked keychains from the pre-0.4.45 random-password era should be deleted once — they are unanswerable prompts by construction.
+- **Fix: a dead agy child can no longer crash the whole DSH host.** EPIPE on child stdin arrives asynchronously as an `error` event (the old `try/catch` only guarded sync throws); `startAgyProcess` now attaches a no-op error handler so a `WriteWrap.onWriteComplete write EPIPE` uncaughtException — and the crash dialog — cannot happen from our spawns.
+- **Fix: "needs re-login" no longer shows for healthy accounts.** The Gemini-Web error path flagged accounts on bare `401`/`403`/`unauthorized` substrings, quarantining healthy slots whenever transport noise happened to contain those digits; flagged accounts skip background polling, so only a manual sync could disprove the flag. The web branch is gone entirely, and the auth-flag classifier keeps its transport-noise exemptions.
+- **Fix: the header badge no longer flashes "AGY (0)" with a grey dot.** The status snapshot is now persisted in `localStorage` and preloaded on mount (stale-while-revalidate), so session switches render the last known account immediately; the truly-cold first render shows a neutral `AGY` placeholder instead of a misleading zero count.
+
+### 中文 (Chinese)
+
+- **移除：Gemini 网页端（chat.gemini.google.com）账号支持。** 应用户要求整体移除网页登录功能：逆向网页客户端、独立 Profile 浏览器捕获、5 个 `/plugins/agy-link/pool/*` 网页路由、adapter 中的网页执行分支、网页配额处理、全部 `web.*` 界面（类型切换、浏览器选择、捕获进度、测试连接/重新登录按钮、Web 徽章）与语言串。`pool.json` 中遗留的 `gemini-web` 账号会在加载时自动剔除，悬空的 active/primary 指针同步清理；现有 AGY 账号不受影响。
+- **修复（macOS）：钥匙串密码弹窗彻底消失。** `ensureIsolatedKeychain` 不再触碰用户全局的 `default-keychain` / 搜索列表（账号 HOME 下的隔离钥匙串已足够）；`readMacKeychainToken` 显式指向真实的 `~/Library/Keychains/login.keychain-db`，不再受被篡改默认值影响。0.4.45 之前随机密码时代遗留的锁定钥匙串需手动删除一次——它们天然是无法回答的弹窗。
+- **修复：agy 子进程死亡不再拖垮整个 DSH 宿主。** 子进程 stdin 上的 EPIPE 以异步 `error` 事件到达（旧的 `try/catch` 只能挡同步异常）；`startAgyProcess` 现在挂载 no-op 错误监听，`WriteWrap.onWriteComplete write EPIPE` 不可捕获异常与崩溃弹窗不会再由我们的拉起触发。
+- **修复：健康账号不再显示"需重新登录"。** 网页版错误路径曾用裸 `401`/`403`/`unauthorized` 子串拉黑账号，传输噪音消息里碰巧带这些数字就隔离健康槽位；被标记账号会被后台轮询跳过，只有手动同步能翻案。该分支已整体移除，拉黑分类器保留传输噪音豁免。
+- **修复：顶部徽章不再闪烁灰色 `AGY (0)`。** 状态快照现在持久化到 `localStorage` 并在挂载时预加载（stale-while-revalidate），切换会话立即显示上次的账号；真正冷启动的首帧显示中性 `AGY` 占位，而不是误导性的 0 计数。
+
 ## 0.4.48 (2026-10-13)
 
 ### English

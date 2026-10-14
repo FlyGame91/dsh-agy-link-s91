@@ -184,6 +184,7 @@ export function shouldMarkAuthRequired(code: string | undefined, message: string
   return isAuthoritativeAuthError(message)
 }
 
+
 // Stable LlmError codes surfaced by the adapter (spec error table).
 export const Err = {
   AUTH: 'AUTH',

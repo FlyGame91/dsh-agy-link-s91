@@ -11,7 +11,6 @@ import {
   type FamilyQuotaInfo,
   type ManagedAccount,
   type ModelFamily,
-  type GeminiWebAuth,
 } from '../common/pool-types.ts'
 import { parseResetDurationMs } from '../common/types.ts'
 
@@ -59,6 +58,18 @@ export class AccountPoolManager {
         const raw = readFileSync(this.file, 'utf8')
         const parsed = JSON.parse(raw) as AccountPoolData
         if (parsed && Array.isArray(parsed.accounts)) {
+          // Migration: the Gemini Web login feature was removed — drop any
+          // legacy web-session accounts entirely (and purge dangling active
+          // pointers to them) on next persist.
+          parsed.accounts = parsed.accounts.filter((acc) => acc && typeof acc === 'object' && (acc as { type?: string }).type !== 'gemini-web')
+          const liveIds = new Set(parsed.accounts.map((a) => a.id))
+          if (parsed.lastActiveAccountId && !liveIds.has(parsed.lastActiveAccountId)) parsed.lastActiveAccountId = undefined
+          if (parsed.primaryAccountId && !liveIds.has(parsed.primaryAccountId)) parsed.primaryAccountId = undefined
+          if (parsed.activeAccountIds) {
+            for (const [fam, id] of Object.entries(parsed.activeAccountIds)) {
+              if (!id || !liveIds.has(id)) delete parsed.activeAccountIds[fam as ModelFamily]
+            }
+          }
           for (const acc of parsed.accounts) {
             // Normalize PARTIAL records: a hand-edited or older pool.json whose
             // account lacks cooldowns/quotas used to throw a TypeError inside
@@ -528,71 +539,6 @@ export class AccountPoolManager {
     return true
   }
 
-  /**
-   * Add a new Gemini Web account to the pool.
-   */
-  addGeminiWebAccount(alias: string, webAuth: GeminiWebAuth, proxyUrl?: string, customId?: string): ManagedAccount {
-    const id = customId || `acc_web_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-    const count = this.data.accounts.filter((a) => a.type === 'gemini-web').length + 1
-    const dir = join(this.baseDir, id)
-    mkdirSync(dir, { recursive: true })
-
-    const newAccount: ManagedAccount = {
-      id,
-      type: 'gemini-web',
-      alias: alias.trim() || `Gemini 网页端账号 ${count}`,
-      defaultAlias: !alias.trim(),
-      email: webAuth.accountEmail,
-      dir,
-      webAuth,
-      proxyUrl: proxyUrl?.trim() ? proxyUrl.trim() : undefined,
-      enabled: true,
-      createdAt: Date.now(),
-      cooldowns: {},
-      quotas: {
-        google: {
-          remainingFraction: 1.0,
-          description: 'Gemini 网页端免费通道 (chat.gemini.google.com)',
-          updatedAt: Date.now(),
-        },
-      },
-    }
-
-    this.data.accounts.push(newAccount)
-    this.knownIds.add(newAccount.id)
-    this.persist()
-    return newAccount
-  }
-
-  updateGeminiWebAccount(
-    id: string,
-    webAuth: Partial<GeminiWebAuth>,
-    alias?: string,
-    proxyUrl?: string,
-  ): ManagedAccount | null {
-    const acc = this.getAccount(id)
-    if (!acc || acc.type !== 'gemini-web') return null
-    acc.webAuth = {
-      ...acc.webAuth,
-      ...webAuth,
-      cookies: webAuth.cookies ?? acc.webAuth?.cookies ?? '',
-    }
-    if (alias !== undefined && alias.trim()) {
-      acc.alias = alias.trim()
-      acc.defaultAlias = false
-    }
-    if (proxyUrl !== undefined) {
-      acc.proxyUrl = proxyUrl.trim() ? proxyUrl.trim() : undefined
-    }
-    if (webAuth.accountEmail) {
-      acc.email = webAuth.accountEmail
-    }
-    delete acc.authRequired
-    delete acc.authError
-    this.persist()
-    return acc
-  }
-
   setMode(mode: 'sequential' | 'round-robin'): void {
     this.data.mode = mode
     this.persist()
@@ -603,11 +549,6 @@ export class AccountPoolManager {
    */
   isAccountEligible(acc: ManagedAccount, family: ModelFamily, now = Date.now()): boolean {
     if (!acc.enabled || acc.authRequired) return false
-    // Gemini Web accounts only serve the Google model family (Gemini models)
-    if (acc.type === 'gemini-web') {
-      if (family !== 'google') return false
-      if (!acc.webAuth?.cookies?.trim()) return false
-    }
     const cd = acc.cooldowns?.[family]
     if (cd && cd.cooldownUntil > now) return false
     // If 5h quota remaining is <= 2% and reset time is in future (or missing), treat as in cooldown
