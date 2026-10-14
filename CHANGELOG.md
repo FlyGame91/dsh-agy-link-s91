@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.50 (2026-10-14)
+
+### English
+
+- **Fix: the header badge now names the same account as the console.** The session header applied an eligibility fallback chain (any enabled account, else `accounts[0]`) when the server-scheduled slot was cooling down or auth-flagged, so it displayed a DIFFERENT account than the console modal's "in use" badge. The header is a readout, not a picker: it now displays exactly `pool.activeAccountId`, with the dot turning red/amber for auth-required/cooldown states.
+
+### 中文 (Chinese)
+
+- **修复：顶栏徽章与控制台显示同一个账号。** 当服务端调度的账号处于冷却或被标记时，会话顶栏会走降级链（任选其他合格账号，再不行取第 1 个），导致与控制台弹窗的"当前使用"徽章显示不同的账号。顶栏是状态显示器而不是选择器：现在严格显示 `pool.activeAccountId`，账号需重新登录/冷却中时圆点相应变红/变黄。
+
 ## 0.4.49 (2026-10-14)
 
 ### English
