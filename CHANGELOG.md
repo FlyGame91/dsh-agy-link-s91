@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.53 (2026-10-15)
+
+### English
+
+- **Fix: a NUL byte in a tool result can no longer kill the turn before agy starts.** Tool output that quoted binary content (an agent listing or reading a `.git` directory, a packed object, an image) carried U+0000 into the assembled prompt; because the prompt travels as an `-p` argv element, `spawn()` rejected it with `TypeError [ERR_INVALID_ARG_VALUE]: The argument 'args[16]' must be a string without null bytes` and the turn failed as "failed to spawn agy" before agy was ever launched — the retry re-sent the same history and failed identically, so the session could not make progress. `stripNulBytes()` now removes U+0000 from the rolling digest (per message text), from the final prompt on its single path into `buildArgs` — covering both the argv transport and the `--input-format stream-json` stdin transport — and from the one-shot/compaction prompt after file inlining. Every other control character is legal in argv and is left untouched.
+
+### 中文 (Chinese)
+
+- **修复：工具结果里的 NUL 字节不再让整个轮次在 agy 启动前就崩溃。** 当工具输出引用了二进制内容（agent 列出或读取 `.git` 目录、packed object、图片等）时，U+0000 会被带进拼装好的提示词；提示词以 `-p` 参数进入 argv，`spawn()` 因此抛 `TypeError [ERR_INVALID_ARG_VALUE]: The argument 'args[16]' must be a string without null bytes`，整轮以「failed to spawn agy」失败——重试会重发同一段历史，于是同样失败，会话彻底卡死。现在 `stripNulBytes()` 会从三处移除 U+0000：滚动摘要中每条消息的文本、进入 `buildArgs` 前的最终提示词（同时覆盖 argv 与 `--input-format stream-json` 的 stdin 两种传输）、以及一次性/压缩任务内联文件后的提示词。其余控制字符在 argv 中合法，保持原样。
+
 ## 0.4.52 (2026-10-15)
 
 ### English
