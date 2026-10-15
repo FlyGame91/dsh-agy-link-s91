@@ -84,7 +84,7 @@ function tryExpandThinkRow(root: HTMLElement): void {
 	if (!body) return
 	const text = (body.textContent ?? '').trim()
 	if (text === '') return
-	const bannerOnly = /^\[agy thinking turn(?: · \d+ thinking tokens)?\]\s*$/.test(text)
+	const bannerOnly = /^\[agy(?: thinking turn)?(?: · \d+ (?:thinking )?tokens)?\]\s*$/.test(text)
 	if (bannerOnly) return
 	// Already expanded if body is visible with height.
 	const style = typeof getComputedStyle === 'function' ? getComputedStyle(body) : null

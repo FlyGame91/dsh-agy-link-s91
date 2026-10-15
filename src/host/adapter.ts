@@ -23,6 +23,7 @@ import { stateDir } from '../common/config.ts'
 import { SENT_IMAGE_IDS_MAX, type SessionStore } from './sessions.ts'
 import { readFullToolArgs, readStepThoughts, clearAgyDbCache } from './agy-db.ts'
 import { getGitHeadContent } from './mirror-tool.ts'
+import { detectGoalContext, isGoalToolContinuation, isPlanToolContinuation, isPlanMode, type GoalContext } from './dsh-goal.ts'
 
 type ForeignSource = { source?: { kind?: string; provider?: string; callId?: string; replayState?: unknown } }
 
@@ -355,6 +356,10 @@ export interface AgyAdapterDeps {
    * Explicit config `workspaceRoot` still wins over this value.
    */
   sessionCwd?: (sessionId: string) => string | undefined
+  /**
+   * Resolve active goal info (goalId, revision) from session history if not present on messages.
+   */
+  sessionGoal?: (sessionId: string) => { goalId: string; revision: number } | null
   /** Last-run telemetry surfaced by /agy status. Process completion and tool failures are distinct. */
   onRun?: (info: {
     processOk: boolean
@@ -413,9 +418,11 @@ function brief(s: string): string {
   return flat.length > 300 ? flat.slice(0, 300) + '...' : flat
 }
 
-function sawAuthFailure(parser: StreamJsonParser, outcome: { stderrTail: string; stdout: string }): boolean {
+function sawAuthFailure(parser: StreamJsonParser, outcome: { stderrTail: string }): boolean {
   if (parser.stats.sawAuthFailure) return true
-  return looksLikeAuthFailure(outcome.stderrTail) || looksLikeAuthFailure(outcome.stdout.slice(0, 4000))
+  if (looksLikeAuthFailure(outcome.stderrTail)) return true
+  if (parser.stats.lastResultError && looksLikeAuthFailure(parser.stats.lastResultError)) return true
+  return false
 }
 
 /**
@@ -727,6 +734,26 @@ export class AgyAdapter extends LlmAdapter {
       }
     }
 
+    // DSH synthetic lifecycle tool continuation: if the trailing message is
+    // the tool-result of an update_goal or exit_plan_mode bridge call, the
+    // DSH state machine has accepted the transition. Finish cleanly without
+    // re-spawning an agy process.
+    if (isGoalToolContinuation(options.messages) || isPlanToolContinuation(options.messages)) {
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+
+    const goalContext = detectGoalContext(options.messages)
+    if (goalContext && (!goalContext.goalId || goalContext.revision === undefined) && sessionKey && this.deps.sessionGoal) {
+      const sg = this.deps.sessionGoal(sessionKey)
+      if (sg) {
+        if (!goalContext.goalId) goalContext.goalId = sg.goalId
+        if (goalContext.revision === undefined) goalContext.revision = sg.revision
+      }
+    }
+    const supportsGoalUpdate = Boolean(options.tools?.some((t) => t.name === 'update_goal'))
+    const supportsPlanExit = Boolean(options.tools?.some((t) => t.name === 'exit_plan_mode')) && isPlanMode(options.messages)
+
     // ---- native tool mirroring: continuation spans (v0.3) ----
     // When the previous span cut on a completed agy tool step, DSH dispatched
     // the agy_tool mirror (which replayed the recorded output) and is now
@@ -749,7 +776,7 @@ export class AgyAdapter extends LlmAdapter {
       // forever on rotating accounts.
       const deadFailure = rec !== undefined && rec.isSettled ? rec.failureInfo : null
       if (rec !== undefined && !(deadFailure !== null && this.claimFailover(sessionKey, deadFailure.code))) {
-        yield* this.driveSpan(rec, continuation.eventIndex + 1, hasToolSupport, isCodeMode)
+        yield* this.driveSpan(rec, continuation.eventIndex + 1, hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit)
         return
       }
       if (rec !== undefined) {
@@ -898,7 +925,9 @@ export class AgyAdapter extends LlmAdapter {
         // time lives in quotas, not cooldowns, so the ETA was silently
         // dropped) — leaving the user with no idea when the turn can run again.
         const pool = this.deps.pool
-        const accounts = pool.getAccounts().filter((a) => a.enabled)
+        const allAccounts = pool.getAccounts()
+        const accounts = allAccounts.filter((a) => a.enabled)
+        const disabled = allAccounts.length - accounts.length
         const cooling = accounts.filter((a) => pool.isAccountEligible(a, family) === false && !a.authRequired).length
         const signedOut = accounts.filter((a) => a.authRequired === true).length
         const countdown = pool.getEarliestAvailableCountdown?.(family) ?? pool.getEarliestResetCountdown(family)
@@ -910,9 +939,19 @@ export class AgyAdapter extends LlmAdapter {
           account = pool.selectAccount(family) ?? undefined
         }
         if (!account) {
-          const why = signedOut > 0 && signedOut === accounts.length
-            ? 'every account needs a re-login (run /agy auth)'
-            : `no account can serve ${family} right now (${cooling} in cooldown, ${signedOut} signed out)`
+          let why: string
+          if (accounts.length === 0 && allAccounts.length > 0) {
+            why = 'all accounts are disabled (enable an account in the console or run /agy enable-account)'
+          } else if (signedOut > 0 && signedOut === accounts.length) {
+            why = 'every account needs a re-login (run /agy auth)'
+          } else {
+            const details: string[] = []
+            if (cooling > 0) details.push(`${cooling} in cooldown`)
+            if (signedOut > 0) details.push(`${signedOut} signed out`)
+            if (disabled > 0) details.push(`${disabled} disabled`)
+            const detailStr = details.length > 0 ? ` (${details.join(', ')})` : ''
+            why = `no account can serve ${family} right now${detailStr}`
+          }
           const waitStr = countdown !== null && countdown > 0
             ? ` (earliest reset in ${Math.ceil(countdown / 1000)}s)`
             : ''
@@ -1170,7 +1209,7 @@ export class AgyAdapter extends LlmAdapter {
             'duplicate-debounce rescue: identical prompt for a live agy run ' + liveRun.runId + ' — re-driving from event ' + rescueFrom + ' instead of throwing BUSY',
           )
           this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
-          yield* this.driveSpan(liveRun, rescueFrom, hasToolSupport, isCodeMode)
+          yield* this.driveSpan(liveRun, rescueFrom, hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit)
           return
         }
         throw new LlmError(
@@ -1572,72 +1611,68 @@ export class AgyAdapter extends LlmAdapter {
           + (silentTimeout
             ? ' — agy never emitted a single event; it is likely unable to reach Google (check proxy/network). 无法连接 Google，请检查代理或网络配置'
             : '') }
-      } else if (sawAuthFailure(parser, outcome)) {
-        // agy says "not logged in" both for a real sign-out AND when it cannot
-        // validate a good token over a broken network (observed live: the
-        // retry account had a token that expired 9 minutes earlier, its refresh
-        // died on `Post https://oauth2.googleapis.com/token: EOF`, and agy fell
-        // back to "not logged in and no controlling terminal"). Reporting AUTH
-        // there ends the turn on a healthy account AND DSH renders the AUTH
-        // code as "API key is invalid" — a label that sent users hunting for a
-        // credential that was never the problem.
-        failure = transportFailure
-          ? {
-              kind: 'error',
-              code: Err.NETWORK,
-              message: 'agy could not validate its Google login over the network (transport failure, not a sign-out) — retrying on another account. '
-                + (rawErrText !== '' ? brief(rawErrText) : ''),
-            }
-          : { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — run /agy auth (or run agy once in a terminal) to login' }
-      } else if (isRateLimit) {
-        const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
-        // Two different animals:
-        //  - HARD server refusal (429 / quota reached): the account is spent, so
-        //    it is cooled down and the sticky pointer advances; the retry is
-        //    served by the next account.
-        //  - SOFT capacity signal ("model overloaded" / high traffic): nothing
-        //    was spent, so no cooldown — but the pointer still advances and the
-        //    code is retryable, because dead-ending the turn while another
-        //    account could serve it is exactly the interruption users complain
-        //    about. Worst case the retry hits the same capacity wall and the
-        //    same error surfaces ~2s later.
-        const hard = looksLikeHardRateLimit(rawErrText)
-        failure = {
-          kind: 'error',
-          code: hard ? Err.RATE_LIMIT : Err.OVERLOADED,
-          message: 'Google Antigravity quota / rate limit reached: ' + bestMsg,
-        }
-      } else if (
-        !transportFailure
-        && (looksLikeEligibilityFailure(rawErrText) || looksLikeEligibilityFailure(parser.stats.lastResultError ?? ''))
-      ) {
-        // Region/account eligibility refusal (issue #32): a clear cause, not a
-        // generic PROCESS_EXIT. It is ACCOUNT-level (each account can have its
-        // own proxy/egress region), so the failing pointer is rotated before
-        // the error surfaces and the code is retryable — an account that IS
-        // eligible can then serve the retry instead of the same refused one
-        // failing again and again.
-        //
-        // BUT agy wraps EVERY startup check in "Eligibility check failed:" —
-        // including pure transport errors like "failed to get profile picture:
-        // Get https://lh3.googleusercontent.com/...: net/http: TLS handshake
-        // timeout". That is a network blip (observed live: it fails on the
-        // first turn and succeeds on the retry), not a region refusal, so when
-        // transport evidence is present it wins and we fall through to the
-        // NETWORK classification instead of showing a misleading
-        // "not eligible for this account/region" hint.
-        const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : '')
-        failure = {
-          kind: 'error',
-          code: Err.ELIGIBILITY,
-          message: ELIGIBILITY_ERROR_HINT + (detail !== '' ? ' (' + detail + ')' : ''),
-        }
       } else if (!consumable) {
-        // Network evidence (TLS handshake timeout, EOF, …) beats a generic
-        // "exited with code 1": the retry policy already treats NETWORK as
-        // retryable, and the message names the transport problem instead of
-        // implying a deterministic agy crash.
-        if (outcome.code !== 0) {
+        if (sawAuthFailure(parser, outcome)) {
+          // agy says "not logged in" both for a real sign-out AND when it cannot
+          // validate a good token over a broken network (observed live: the
+          // retry account had a token that expired 9 minutes earlier, its refresh
+          // died on `Post https://oauth2.googleapis.com/token: EOF`, and agy fell
+          // back to "not logged in and no controlling terminal"). Reporting AUTH
+          // there ends the turn on a healthy account AND DSH renders the AUTH
+          // code as "API key is invalid" — a label that sent users hunting for a
+          // credential that was never the problem.
+          failure = transportFailure
+            ? {
+                kind: 'error',
+                code: Err.NETWORK,
+                message: 'agy could not validate its Google login over the network (transport failure, not a sign-out) — retrying on another account. '
+                  + (rawErrText !== '' ? brief(rawErrText) : ''),
+              }
+            : { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — run /agy auth (or run agy once in a terminal) to login' }
+        } else if (isRateLimit) {
+          const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
+          // Two different animals:
+          //  - HARD server refusal (429 / quota reached): the account is spent, so
+          //    it is cooled down and the sticky pointer advances; the retry is
+          //    served by the next account.
+          //  - SOFT capacity signal ("model overloaded" / high traffic): nothing
+          //    was spent, so no cooldown — but the pointer still advances and the
+          //    code is retryable, because dead-ending the turn while another
+          //    account could serve it is exactly the interruption users complain
+          //    about. Worst case the retry hits the same capacity wall and the
+          //    same error surfaces ~2s later.
+          const hard = looksLikeHardRateLimit(rawErrText)
+          failure = {
+            kind: 'error',
+            code: hard ? Err.RATE_LIMIT : Err.OVERLOADED,
+            message: 'Google Antigravity quota / rate limit reached: ' + bestMsg,
+          }
+        } else if (
+          !transportFailure
+          && (looksLikeEligibilityFailure(rawErrText) || looksLikeEligibilityFailure(parser.stats.lastResultError ?? ''))
+        ) {
+          // Region/account eligibility refusal (issue #32): a clear cause, not a
+          // generic PROCESS_EXIT. It is ACCOUNT-level (each account can have its
+          // own proxy/egress region), so the failing pointer is rotated before
+          // the error surfaces and the code is retryable — an account that IS
+          // eligible can then serve the retry instead of the same refused one
+          // failing again and again.
+          //
+          // BUT agy wraps EVERY startup check in "Eligibility check failed:" —
+          // including pure transport errors like "failed to get profile picture:
+          // Get https://lh3.googleusercontent.com/...: net/http: TLS handshake
+          // timeout". That is a network blip (observed live: it fails on the
+          // first turn and succeeds on the retry), not a region refusal, so when
+          // transport evidence is present it wins and we fall through to the
+          // NETWORK classification instead of showing a misleading
+          // "not eligible for this account/region" hint.
+          const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : '')
+          failure = {
+            kind: 'error',
+            code: Err.ELIGIBILITY,
+            message: ELIGIBILITY_ERROR_HINT + (detail !== '' ? ' (' + detail + ')' : ''),
+          }
+        } else if (outcome.code !== 0) {
           // agy reports its failure on STDOUT as a result envelope and often
           // exits 1 with EMPTY stderr; dropping the envelope here used to
           // leave users with a bare "agy exited with code 1" and no cause.
@@ -1799,7 +1834,7 @@ export class AgyAdapter extends LlmAdapter {
 
     // First span of the run: stream recorded events until the first
     // completed tool step cuts it (or the result finishes it).
-    yield* this.driveSpan(rec, 0, !isAux && hasToolSupport, isCodeMode)
+    yield* this.driveSpan(rec, 0, !isAux && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit)
   }
 
   /**
@@ -1814,6 +1849,9 @@ export class AgyAdapter extends LlmAdapter {
     from: number,
     cutOnTool: boolean,
     useCodeWrapper: boolean,
+    goalContext?: GoalContext | null,
+    supportsGoalUpdate?: boolean,
+    supportsPlanExit?: boolean,
   ): AsyncIterable<StreamChunk> {
     // A span can wait hours for a wedged agy tool step. Pin the recording for
     // its whole lifetime so the shared registry can never evict a run whose
@@ -1823,7 +1861,7 @@ export class AgyAdapter extends LlmAdapter {
     this.deps.runs.remember(rec)
     this.deps.runs.pin(rec.runId)
     try {
-      yield* this.driveSpanBody(rec, from, cutOnTool, useCodeWrapper)
+      yield* this.driveSpanBody(rec, from, cutOnTool, useCodeWrapper, goalContext, supportsGoalUpdate, supportsPlanExit)
     } finally {
       this.deps.runs.unpin(rec.runId)
       this.deps.runs.remember(rec)
@@ -1836,6 +1874,9 @@ export class AgyAdapter extends LlmAdapter {
     from: number,
     cutOnTool: boolean,
     useCodeWrapper: boolean,
+    goalContext?: GoalContext | null,
+    supportsGoalUpdate?: boolean,
+    supportsPlanExit?: boolean,
   ): AsyncIterable<StreamChunk> {
     const queue = new ChunkQueue()
     void (async () => {
@@ -1855,6 +1896,9 @@ export class AgyAdapter extends LlmAdapter {
         resolvedFullArgs: resolved,
         resolvedThoughts,
         mediaBaseUrl: this.deps.getMediaBaseUrl?.() ?? undefined,
+        goalContext,
+        supportsGoalUpdate,
+        supportsPlanExit,
       })
       let i = from
       try {

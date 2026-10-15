@@ -19,6 +19,7 @@ import * as dshLlm from '@deepseek-ai/dsh-llm'
 import type { AgyEvent, RawUsage } from '../common/types.ts'
 import { mirrorCallId } from './recording.ts'
 import { buildMirrorRunCode, MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME, toolStepBrief } from './mirror-tool.ts'
+import { type GoalContext, buildGoalCompleteToolCallBlock, buildPlanExitToolCallBlock } from './dsh-goal.ts'
 
 export const toToolCallId: (id: string) => ToolCallId =
   (dshLlm as { ToolCallId?: (id: string) => ToolCallId; CallId?: (id: string) => ToolCallId }).ToolCallId ??
@@ -90,6 +91,12 @@ export interface EventMapperOptions {
   resolvedThoughts?: ReadonlyMap<number, string>
   /** Base URL for the media route, e.g. http://127.0.0.1:5173/plugins/agy-link/media */
   mediaBaseUrl?: string
+  /** Active DSH goal context for the current turn, if running under <goal_round>. */
+  goalContext?: GoalContext | null
+  /** Whether the host provides the `update_goal` tool to mark the goal completed. */
+  supportsGoalUpdate?: boolean
+  /** Whether the host provides the `exit_plan_mode` tool for DSH plan mode. */
+  supportsPlanExit?: boolean
 }
 
 /** Rewrite local image paths and file:// URLs to point to the local media route. */
@@ -125,6 +132,7 @@ export class EventMapper {
   private bannerOnlyThinkingEmitted = false
   private sawTextStep: boolean
   private finished = false
+  private totalTextOutput = ''
 
   constructor(private readonly opts: EventMapperOptions) {
     this.sawTextStep = opts.initialSawText === true
@@ -160,16 +168,17 @@ export class EventMapper {
   private appendDelta(delta: string): StreamChunk | null {
     if (delta === '') return null
     this.openAcc += delta
+    if (this.openType === 'text') this.totalTextOutput += delta
     return this.openType === 'text'
       ? { type: 'text-delta', index: this.blockIdx, text: delta }
       : { type: 'reasoning-delta', index: this.blockIdx, text: delta }
   }
 
   /**
-   * Emit thinking: always retain the [agy thinking turn · ... thinking tokens]
-   * banner. When real thought prose is present, place the banner and thought
+   * Emit thinking: always retain the [agy · ... tokens] banner.
+   * When real thought prose is present, place the banner and thought
    * text on the same initial line so DSH's collapsed summary renders:
-   *   [agy thinking turn · *** thinking tokens] [Chain-of-Thought body]
+   *   [agy · *** tokens] [Chain-of-Thought body]
    *
    * With `allowBannerOnly` the bare banner is emitted when the DB prose never
    * arrived (desktop hosts without any sqlite reader, issue #43): the user
@@ -191,8 +200,8 @@ export class EventMapper {
     yield* this.ensureBlock('reasoning')
     const banner =
       thoughtTokens > 0
-        ? '[agy thinking turn · ' + thoughtTokens + ' thinking tokens]'
-        : '[agy thinking turn]'
+        ? '[agy · ' + thoughtTokens + ' tokens]'
+        : '[agy]'
     const combined = !hasText
       ? `${banner}\n`
       : bannerAlreadyShown
@@ -435,6 +444,34 @@ export class EventMapper {
     const close = this.closeOpen()
     if (close) yield close
     yield { type: 'usage', usage: usageFromRaw(this.opts.usage?.finalUsage(ev.usage) ?? ev.usage) }
+
+    // If running in a DSH goal continuation round and DSH provided the update_goal tool:
+    // Emit a synthetic update_goal call to mark the goal complete and prevent infinite loop continuation rounds.
+    if (this.opts.supportsGoalUpdate && this.opts.goalContext?.goalId) {
+      for (const ch of buildGoalCompleteToolCallBlock(this.opts.goalContext, this.blockIdx)) yield ch
+      this.blockIdx++
+      yield {
+        type: 'finish',
+        reason: { kind: 'tool-calls' },
+        ...(ev.conversationId !== '' ? { replayState: { response: { conversationId: ev.conversationId } } } : {}),
+      }
+      this.finished = true
+      return
+    }
+
+    // If running in DSH plan mode and DSH provided the exit_plan_mode tool:
+    if (this.opts.supportsPlanExit && this.totalTextOutput.trim() !== '') {
+      for (const ch of buildPlanExitToolCallBlock(this.totalTextOutput, this.blockIdx)) yield ch
+      this.blockIdx++
+      yield {
+        type: 'finish',
+        reason: { kind: 'tool-calls' },
+        ...(ev.conversationId !== '' ? { replayState: { response: { conversationId: ev.conversationId } } } : {}),
+      }
+      this.finished = true
+      return
+    }
+
     yield {
       type: 'finish',
       reason: { kind: 'stop' },

@@ -133,9 +133,7 @@ async function getStatus(): Promise<StatusPayload | null> {
 		}
 		const res = await win.fetch?.(base + '/plugins/agy-link/status', init);
 		if (!res || !res.ok) return null;
-		const payload = (await res.json()) as StatusPayload;
-		statusCache = payload;
-		return payload;
+		return (await res.json()) as StatusPayload;
 	} catch {
 		return null;
 	}
@@ -271,26 +269,42 @@ const agyModalStore = {
 };
 
 /**
- * Singleton modal instance manager: ensures at most one modal dialog is
- * rendered into document.body at any time even when multiple session headers mount.
+ * Global modal host manager: ensures exactly one mounted session header
+ * hosts the modal dialog portal reactively. If the primary header unmounts,
+ * the next available header is immediately notified and seamlessly takes over.
  */
-let primaryModalInstanceId: string | null = null;
-const modalInstanceIds = new Set<string>();
+const modalHostManager = {
+	listeners: new Map<string, (isPrimary: boolean) => void>(),
+	activeId: null as string | null,
 
-function registerModalInstance(id: string): boolean {
-	modalInstanceIds.add(id);
-	if (primaryModalInstanceId === null || !modalInstanceIds.has(primaryModalInstanceId)) {
-		primaryModalInstanceId = id;
-	}
-	return primaryModalInstanceId === id;
-}
+	register(id: string, onChange: (isPrimary: boolean) => void) {
+		modalHostManager.listeners.set(id, onChange);
+		if (modalHostManager.activeId === null) {
+			modalHostManager.activeId = id;
+		}
+		onChange(modalHostManager.activeId === id);
 
-function unregisterModalInstance(id: string): void {
-	modalInstanceIds.delete(id);
-	if (primaryModalInstanceId === id) {
-		primaryModalInstanceId = modalInstanceIds.values().next().value ?? null;
-	}
-}
+		return () => {
+			modalHostManager.listeners.delete(id);
+			if (modalHostManager.activeId === id) {
+				const next = modalHostManager.listeners.keys().next().value ?? null;
+				modalHostManager.activeId = next;
+				if (next) {
+					modalHostManager.listeners.get(next)?.(true);
+				}
+			}
+		};
+	},
+
+	claim(id: string) {
+		if (modalHostManager.activeId !== id) {
+			const prev = modalHostManager.activeId;
+			modalHostManager.activeId = id;
+			if (prev) modalHostManager.listeners.get(prev)?.(false);
+			modalHostManager.listeners.get(id)?.(true);
+		}
+	},
+};
 
 /**
  * Format reset timestamp into readable date/time + relative countdown.
@@ -365,11 +379,9 @@ const FAMILY_BRAND: Record<'google' | 'anthropic' | 'openai', BrandKey> = {
 	openai: 'openai',
 };
 
-let agyIconSeq = 0;
-
 /** Antigravity mark: gradient orb with an orbit ring (product has no public simple-icon). */
 function agyIcon(size = 14): unknown {
-	const gid = `agy-g${++agyIconSeq}`;
+	const gid = 'agy-icon-linear-gradient';
 	return h('svg', {
 		viewBox: '0 0 24 24',
 		width: size,
@@ -806,7 +818,7 @@ const S: Record<string, Record<string, unknown>> = {
 		marginBottom: '8px',
 		color: 'var(--agy-text-primary)',
 		boxShadow: 'var(--agy-shadow-card)',
-		transition: 'all 0.18s cubic-bezier(0.16, 1, 0.3, 1)',
+		transition: 'border-color 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease',
 	},
 	cardPrimary: {
 		background: 'var(--agy-bg-card)',
@@ -816,7 +828,7 @@ const S: Record<string, Record<string, unknown>> = {
 		marginBottom: '8px',
 		color: 'var(--agy-text-primary)',
 		boxShadow: 'var(--agy-shadow-card)',
-		transition: 'all 0.18s cubic-bezier(0.16, 1, 0.3, 1)',
+		transition: 'border-color 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease',
 	},
 	quotaBox: {
 		background: 'var(--agy-bg-box)',
@@ -960,6 +972,7 @@ const S: Record<string, Record<string, unknown>> = {
 };
 
 export function apply(ctx: ClientContext): void {
+	injectGlobalStyles();
 	// locale is declared in inject — cordis guarantees ctx.locale (issue #24).
 	const locale = ctx.locale;
 	ctx.effect(() => {
@@ -978,7 +991,6 @@ export function apply(ctx: ClientContext): void {
 		return locale.bind(NS) as (key: AgyLocaleKey, params?: Record<string, unknown>) => string;
 	};
 	const AgySettingsSection = (props?: any): unknown => {
-		injectGlobalStyles();
 		const t = useAgyTranslation();
 		const { status, refresh } = useAgyStatus();
 		const [aliasInput, setAliasInput] = useState('');
@@ -1144,18 +1156,6 @@ export function apply(ctx: ClientContext): void {
 			}
 		};
 
-		const setPrimary = async (id: string): Promise<void> => {
-			setLoadingAction(`primary:${id}`);
-			const res = await postJson('/plugins/agy-link/pool/primary', { id });
-			if (res === null || res?.ok === false) {
-				setLoadingAction(null);
-				actionFailed();
-				return;
-			}
-			await refresh();
-			setLoadingAction(null);
-			showToast(t('account.setPrimary'), 'success');
-		};
 		const setActiveAccount = async (id: string): Promise<void> => {
 			setLoadingAction(`active:${id}`);
 			const res = await postJson('/plugins/agy-link/pool/set-active', { id });
@@ -1179,6 +1179,24 @@ export function apply(ctx: ClientContext): void {
 			await refresh();
 			setLoadingAction(null);
 			showToast(t('account.removed', { alias }), 'info');
+		};
+
+		const toggleAccountEnabled = async (acc: ManagedAccount): Promise<void> => {
+			const nextState = !acc.enabled;
+			setLoadingAction(`enable:${acc.id}`);
+			const res = await postJson('/plugins/agy-link/pool/enable', { id: acc.id, enabled: nextState });
+			if (res === null || res?.ok === false) {
+				setLoadingAction(null);
+				actionFailed();
+				return;
+			}
+			await refresh();
+			setLoadingAction(null);
+			const legacyDefault = acc.defaultAlias === undefined && acc.systemHome && acc.alias === '主账号 (系统登录)';
+			const displayAlias = acc.defaultAlias || legacyDefault
+				? acc.systemHome ? t('account.defaultAlias') : acc.alias
+				: acc.alias;
+			showToast(t(nextState ? 'account.enabledToast' : 'account.disabledToast', { alias: displayAlias }), 'success');
 		};
 
 		const refreshQuota = async (id?: string): Promise<void> => {
@@ -1386,6 +1404,7 @@ export function apply(ctx: ClientContext): void {
 				cursor: 'default',
 				padding: '10px 14px',
 				marginBottom: '8px',
+				...(!acc.enabled ? { opacity: 0.72 } : {}),
 			};
 			// Built-in aliases are canonical server data; translate display only.
 			const legacyDefault = acc.defaultAlias === undefined && acc.systemHome && acc.alias === '主账号 (系统登录)';
@@ -1534,10 +1553,35 @@ export function apply(ctx: ClientContext): void {
 								padding: '1px 5px',
 							},
 						}, uiIcon('globe', 10, 'var(--agy-badge-proxy-text)'), t('status.proxy')) : null,
+						!acc.enabled ? h('span', {
+							style: {
+								...S.badgeTag,
+								background: 'var(--agy-bg-subbox)',
+								color: 'var(--agy-text-secondary)',
+								borderColor: 'var(--agy-border-subbox)',
+								gap: '3px',
+								fontSize: '10px',
+								padding: '1px 5px',
+								fontWeight: 700,
+							},
+							title: t('status.disabled'),
+						}, uiIcon('power', 10, '#64748b'), t('status.disabled')) : null,
 					),
 					h('div', {
 						style: { display: 'flex', gap: '4px', alignItems: 'center', flexShrink: 0 },
 					},
+						h('button', {
+							type: 'button',
+							className: 'agy-btn',
+							style: acc.enabled
+								? { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' }
+								: { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' },
+							title: acc.enabled ? t('account.disableTitle') : t('account.enableTitle'),
+							disabled: isBusy,
+							onClick: () => void toggleAccountEnabled(acc),
+						}, loadingAction === `enable:${acc.id}`
+							? [renderSpinner(), acc.enabled ? t('account.disable') : t('account.enable')]
+							: [uiIcon('power', 10, acc.enabled ? 'var(--agy-text-secondary)' : '#ffffff'), ` ${acc.enabled ? t('account.disable') : t('account.enable')}`]),
 						h('button', {
 							type: 'button',
 							className: 'agy-btn',
@@ -1546,7 +1590,7 @@ export function apply(ctx: ClientContext): void {
 							disabled: isBusy,
 							onClick: () => void refreshQuota(acc.id),
 						}, loadingAction === `refresh:${acc.id}` ? [renderSpinner(), t('account.syncing')] : [uiIcon('refresh', 10), ` ${t('account.sync')}`]),
-						!isInUse ? h('button', {
+						acc.enabled && !isInUse ? h('button', {
 							type: 'button',
 							className: 'agy-btn',
 							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
@@ -1554,13 +1598,7 @@ export function apply(ctx: ClientContext): void {
 							disabled: isBusy,
 							onClick: () => void setActiveAccount(acc.id),
 						}, loadingAction === `active:${acc.id}` ? [renderSpinner(), t('account.settingActive')] : [uiIcon('zap', 10), ` ${t('account.setActive')}`]) : null,
-						!isPrimary ? h('button', {
-							type: 'button',
-							className: 'agy-btn',
-							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
-							disabled: isBusy,
-							onClick: () => void setPrimary(acc.id),
-						}, loadingAction === `primary:${acc.id}` ? [renderSpinner(), t('account.settingPrimary')] : [uiIcon('star', 10), ` ${t('account.setPrimary')}`]) : null,
+
 						h('button', {
 							type: 'button',
 							className: 'agy-btn',
@@ -1914,32 +1952,9 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 
 	/** Modal dialog container rendered into document.body */
 	const AgyModalDialog = (): unknown => {
-		const instanceIdRef = useRef<string | null>(null);
-		if (instanceIdRef.current === null) {
-			instanceIdRef.current = 'modal_' + Math.random().toString(36).slice(2);
-		}
-		const isPrimary = registerModalInstance(instanceIdRef.current);
-
-		useEffect(() => {
-			const id = instanceIdRef.current!;
-			return () => {
-				unregisterModalInstance(id);
-			};
-		}, []);
-
 		const t = useAgyTranslation();
-		const [isOpen, setIsOpen] = useState(agyModalStore.open);
 
 		useEffect(() => {
-			injectGlobalStyles();
-			const unsubscribe = agyModalStore.subscribe(() => {
-				setIsOpen(agyModalStore.open);
-			});
-			return unsubscribe;
-		}, []);
-
-		useEffect(() => {
-			if (!isOpen) return;
 			const onKey = (e: any) => {
 				if (e.key === 'Escape') {
 					e.stopPropagation();
@@ -1948,9 +1963,7 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 			};
 			win.addEventListener?.('keydown', onKey, true);
 			return () => win.removeEventListener?.('keydown', onKey, true);
-		}, [isOpen]);
-
-		if (!isOpen || !isPrimary) return null;
+		}, []);
 
 		return h('div', {
 			className: 'agy-modal-backdrop',
@@ -2000,6 +2013,24 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 
 	/** Session Header badge in chat toolbar */
 	const AgySessionStatus = (): unknown => {
+		const hostIdRef = useRef<string | null>(null);
+		if (hostIdRef.current === null) {
+			hostIdRef.current = 'host_' + Math.random().toString(36).slice(2);
+		}
+		const hostId = hostIdRef.current;
+
+		const [isPrimaryHost, setIsPrimaryHost] = useState(false);
+		useEffect(() => {
+			return modalHostManager.register(hostId, setIsPrimaryHost);
+		}, [hostId]);
+
+		const [isModalOpen, setIsModalOpen] = useState(agyModalStore.open);
+		useEffect(() => {
+			return agyModalStore.subscribe(() => {
+				setIsModalOpen(agyModalStore.open);
+			});
+		}, []);
+
 		const t = useAgyTranslation();
 		const { status } = useAgyStatus();
 		// Wall-clock tick: cooldown dots derive from Date.now() and the payload
@@ -2046,7 +2077,10 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 				type: 'button',
 				title: badgeTitle,
 				className: 'agy-btn',
-				onClick: () => agyModalStore.setOpen(true),
+				onClick: () => {
+					modalHostManager.claim(hostId);
+					agyModalStore.setOpen(true);
+				},
 				style: {
 					background: 'var(--agy-bg-header)',
 					border: '1px solid var(--agy-border-card)',
@@ -2068,7 +2102,7 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 		);
 		return h('div', { style: { display: 'inline-block' } },
 			badge,
-			portalToBody(h(AgyModalDialog, null)),
+			isPrimaryHost && isModalOpen ? portalToBody(h(AgyModalDialog, null)) : null,
 		);
 	};
 

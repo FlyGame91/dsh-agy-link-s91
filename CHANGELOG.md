@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.4.52 (2026-10-15)
+
+### English
+
+- **Fix: DSH `/goal` infinite continuation loop resolved.** In DSH, `/goal` runs a multi-round state machine (up to 256 rounds) that keeps injecting `<goal_round>` until the agent explicitly invokes `update_goal(action='complete')`. Because `agy` CLI uses its own native tools and terminates after finishing, DSH treated the goal as perpetually active (running up to 93+ rounds). The bridge now intercepts the completion event in goal mode and emits a synthetic `update_goal(complete)` tool-call, properly closing the goal state machine.
+- **Feature: DSH `/plan` mode support.** When running in plan mode (prompt containing "You are in plan mode"), the bridge automatically emits the `exit_plan_mode` tool-call carrying the generated plan markdown for user interactive review and approval.
+- **Feature: /agy goal command family.** Added `/agy goal [status|complete|pause|resume|clear]` allowing users to inspect the current goal state (ID, revision, objective, round count) or manually control/complete/clear the active goal.
+- **Feature: /agy session command family.** Added `/agy session [info|clear]` for inspecting session workspace CWD, bound agy conversation ID, event counts, and safely dropping session bindings without guessing. `/agy clear` is also upgraded to prioritize the current session.
+- **Feature: Intelligent quota-expiry-first rotation (Weekly & 5h).** Refactored pool candidate selection: when switching accounts, the pool prioritizes accounts whose weekly quota is expiring soonest (Priority 1: preventing irreversible weekly quota loss), followed by accounts whose 5-hour quota is expiring soonest (Priority 2). Execution maintains seamless sticky sequential drain, continuing on the current account until its quota is exhausted before cleanly advancing to the next optimal candidate.
+- **UI: Simplified thinking turn banner.** Replaced verbose `[agy thinking turn · N thinking tokens]` chip with concise `[agy · N tokens]` (or `[agy]` when no count is present), avoiding long headers crowding out the collapsed reasoning summary in DSH.
+- **UI: Removed redundant "Set as primary" action.** Dropped the confusing "Set as primary" button from the account cards across all locales. Manual account activation is cleanly handled via the existing "Set as in use" action.
+
+### 中文 (Chinese)
+
+- **修复：彻底解决 DSH `/goal` 目标空转死循环问题。** DSH 的 `/goal` 状态机在模型未调用宿主原生 `update_goal(action='complete')` 前，会在每轮结束后自动注入 `<goal_round>` 启动下一轮（最多 256 轮，曾导致 93+ 轮空转）。由于 agy 是自闭环 Agent 引擎，完成任务后正常退出但不会直接调用 DSH 宿主工具。桥接层新增 `dsh-goal` 协议转换模块，在检测到目标轮次执行完毕后，自动向 DSH 发射 `update_goal(complete)` 工具调用块，使 DSH 目标状态机正常流转至完成态并停止重试。
+- **功能：支持 DSH `/plan` 规划模式适配。** 当检测到会话处于规划模式（上下文携带 "You are in plan mode"）时，桥接层在模型生成规划后自动发射 `exit_plan_mode` 工具调用块，将规划 Markdown 提交给 DSH 宿主渲染审核弹窗供用户审批。
+- **功能：新增 `/agy goal` 目标管理命令。** 支持 `/agy goal [status|complete|pause|resume|clear]`，可实时查看当前会话的目标状态（目标 ID、版本号、目标描述、已执行轮次/上限），或手动完成、暂停、恢复、清除卡住的目标。
+- **功能：新增 `/agy session` 会话管理命令。** 支持 `/agy session [info|clear]`，可精确查看当前 DSH 会话绑定的工作区 CWD、agy 会话 ID、事件总数等信息，或一键清除当前会话的 agy 绑定；同时增强 `/agy clear` 优先清理当前活动会话的绑定。
+- **功能：按配额临期优先度智能轮换账号（周额度优先，5小时次优）。** 重构账号轮换调度算法：在切号时，第一优先级优先选取周额度剩余时间最少（最先到期）的账号（避免周硬额度清零浪费），第二优先级选取 5 小时窗口最先到期的账号；同时严格遵循无感黏性消耗原则（只要当前账号的 5 小时或周额度未耗尽绝不切号，耗尽后自动无缝切换下一个最优账号），最大化利用全部账号配额。
+- **体验：精简思考过程标签（thinking banner）。** 将冗长的 `[agy thinking turn · N thinking tokens]` 简化为精炼的 `[agy · N tokens]`（无计数时为 `[agy]`），大幅缩减括号内字符宽度，让 DSH 折叠思考栏能够更完整展现具体的思维链与工具摘要。
+- **体验：移除冗余的“设为主用”按钮。** 从前端控制台卡片操作栏和各语言包中彻底移除“设为主用”按钮，手动切换账号统一由“设为当前使用”负责，简化界面操作。
+
+## 0.4.51 (2026-10-15)
+
+### English
+
+- **Feature: Per-account Enable / Disable toggles.** Added dedicated Enable / Disable buttons and status badges to each account card in the WebUI console and CLI (`/agy enable-account <id>`, `/agy disable-account <id>`). Disabled accounts are dimmed with a gray "Disabled" badge.
+- **Fix: Account rotation and selection strictly skips disabled accounts.** Rotation algorithms (`selectAccount`, `advanceAccount`, sticky sequential drain, round-robin, and fallback model degradation) skip disabled accounts completely.
+- **Fix: Cooldown & quota reset fallback never returns a disabled account.** `getActiveAccountId` previously fell back to `primaryAccountId` or the first account without checking `enabled`, which could surface a disabled slot as active; it now only falls back to eligible enabled accounts (or `undefined` if all accounts are disabled).
+- **Fix: Background auth reverification skips disabled accounts.** `needsAuthReverify` now checks `account.enabled`, preventing the background quota poller from probing disabled slots.
+- **Fix: Detailed error diagnostics when accounts are disabled.** When all or remaining accounts cannot serve a model family, the error message explicitly enumerates disabled slots and informs the user to re-enable them in the console or CLI rather than reporting misleading 0 cooldown/auth counts.
+
+### 中文 (Chinese)
+
+- **功能：每个账号增加启用 / 停用按钮。** 在 WebUI 控制台的每个账号卡片上以及 CLI 命令中增加了启用/停用按钮与操作（`/agy enable-account <id>`、`/agy disable-account <id>`）。停用账号卡片以半透明呈现并标记灰色“已停用”徽章。
+- **修复：切号与调度严格跳过停用账号。** 顺次耗尽（sequential）、轮询（round-robin）、主动切号（advanceAccount）、跨家族自动降级（autoFallbackModel）等调度算法在选号时全部严格跳过已停用账号。
+- **修复：号池活动指针降级不再回退到已停用账号。** 修复了 `getActiveAccountId` 在全部账号限流时无条件 fallback 到主账号或首个账号导致停用账号被当作当前在用账号的缺陷；现在严格仅回退到已启用的账号（若全部账号均被停用则返回 `undefined`）。
+- **修复：后台静默身份复验跳过已停用账号。** `needsAuthReverify` 增加了 `account.enabled` 检查，彻底杜绝后台轮询向 Google 请求复验已停用账号。
+- **修复：账号不可用时清晰提示停用状态。** 当全部或部分账号不可用时，错误提示中会明确指出有几个账号处于“已停用”状态，并提示用户在控制台或通过 CLI 重新启用，不再报出误导性的 0 冷却/0 登录错误。
+
 ## 0.4.50 (2026-10-14)
 
 ### English

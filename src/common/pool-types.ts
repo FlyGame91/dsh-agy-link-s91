@@ -120,6 +120,7 @@ export const AUTH_REVERIFY_DELAY_MS = 10 * 60_000
  * simply re-stamped.
  */
 export function needsAuthReverify(account: ManagedAccount, now = Date.now()): boolean {
+  if (!account.enabled) return false
   if (!account.authRequired) return false
   if (typeof account.authMarkedAt !== 'number') return true
   return now - account.authMarkedAt > AUTH_REVERIFY_DELAY_MS

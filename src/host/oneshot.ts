@@ -161,11 +161,11 @@ export async function runAgyOnce(
   if (outcome.timedOut) {
     return { ok: false, text: '', conversationId, error: 'timed out after ' + timeoutMs + 'ms', durationMs: outcome.durationMs }
   }
-  if (looksLikeAuthFailure(outcome.stderrTail) || looksLikeAuthFailure(outcome.stdout.slice(0, 4000))) {
-    return { ok: false, text: '', conversationId, error: 'agy is not signed in — run /agy auth', durationMs: outcome.durationMs }
-  }
   const joined = textParts.join('\n').trim()
   const text = joined !== '' ? joined : resultText
+  if (text === '' && (looksLikeAuthFailure(outcome.stderrTail) || parser.stats.sawAuthFailure)) {
+    return { ok: false, text: '', conversationId, error: 'agy is not signed in — run /agy auth', durationMs: outcome.durationMs }
+  }
   if (outcome.code !== 0 && text === '') {
     return { ok: false, text: '', conversationId, error: 'agy exited with code ' + outcome.code + ': ' + outcome.stderrTail.slice(-300), durationMs: outcome.durationMs }
   }

@@ -518,10 +518,12 @@ export class AccountPoolManager {
   setPrimaryAccount(id: string): boolean {
     const idx = this.data.accounts.findIndex((a) => a.id === id)
     if (idx === -1) return false
+    const [acc] = this.data.accounts.splice(idx, 1)
+    if (!acc) return false
+    acc.enabled = true
     this.data.primaryAccountId = id
     // Move to front of accounts list
-    const [acc] = this.data.accounts.splice(idx, 1)
-    if (acc) this.data.accounts.unshift(acc)
+    this.data.accounts.unshift(acc)
     // Make primary immediately active for all families
     this.data.activeAccountIds = {
       google: id,
@@ -581,7 +583,7 @@ export class AccountPoolManager {
     if (quota && typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= 0.01) {
       if (quota.weeklyResetTime) {
         const resetMs = Date.parse(quota.weeklyResetTime)
-        if (!Number.isNaN(resetMs) && resetMs > now) return false
+        if (Number.isNaN(resetMs) || resetMs > now) return false
       } else {
         return false
       }
@@ -605,7 +607,8 @@ export class AccountPoolManager {
     }
     const next = this.selectAccount(family)
     if (next) return next.id
-    return this.data.primaryAccountId ?? this.data.accounts[0]?.id
+    return this.data.accounts.find((a) => a.id === this.data.primaryAccountId && a.enabled)?.id
+      ?? this.data.accounts.find((a) => a.enabled)?.id
   }
 
   /**
@@ -633,25 +636,53 @@ export class AccountPoolManager {
   }
 
   /**
-   * "Use it or lose it" rotation order. When the sticky account is drained we
-   * prefer the eligible account whose quota window refreshes SOONEST: residual
-   * quota disappears at that reset, so draining it first is free capacity the
-   * pool would otherwise throw away. Accounts with no quota metadata yet keep
-   * the legacy cyclic order (which also keeps a drained slot from bouncing
-   * straight back to the primary).
+   * "Use it or lose it" rotation order.
+   * Priority 1: Weekly quota expiring soonest (least remaining time until weeklyResetTime).
+   * Priority 2: 5-hour quota expiring soonest (least remaining time until resetTime).
+   * Priority 3: Cyclic distance from `fromId` (or pool order).
    */
   private orderByExpiry(
     candidates: readonly ManagedAccount[],
     family: ModelFamily,
     fromId?: string,
   ): ManagedAccount[] {
+    const now = Date.now()
     return candidates
-      .map((acc, index) => ({ acc, index, at: this.nextQuotaResetAt(acc, family) }))
+      .map((acc, index) => {
+        const q = acc.quotas?.[family]
+        const weeklyMs = q?.weeklyResetTime ? Date.parse(q.weeklyResetTime) : Number.NaN
+        const fiveHourMs = q?.resetTime ? Date.parse(q.resetTime) : Number.NaN
+        const weeklyRemaining = !Number.isNaN(weeklyMs) ? Math.max(0, weeklyMs - now) : Number.POSITIVE_INFINITY
+        const fiveHourRemaining = !Number.isNaN(fiveHourMs) ? Math.max(0, fiveHourMs - now) : Number.POSITIVE_INFINITY
+        return {
+          acc,
+          index,
+          weeklyRemaining,
+          fiveHourRemaining,
+          weeklyKnown: Number.isFinite(weeklyRemaining),
+          fiveHourKnown: Number.isFinite(fiveHourRemaining),
+        }
+      })
       .sort((a, b) => {
-        const aKnown = !Number.isNaN(a.at)
-        const bKnown = !Number.isNaN(b.at)
-        if (aKnown !== bKnown) return aKnown ? -1 : 1
-        if (aKnown && bKnown && a.at !== b.at) return a.at - b.at
+        // Priority 1: Weekly quota reset time (least remaining time until reset first)
+        if (a.weeklyKnown && b.weeklyKnown) {
+          if (a.weeklyRemaining !== b.weeklyRemaining) {
+            return a.weeklyRemaining - b.weeklyRemaining
+          }
+        } else if (a.weeklyKnown !== b.weeklyKnown) {
+          return a.weeklyKnown ? -1 : 1
+        }
+
+        // Priority 2: 5-hour quota reset time (least remaining time until reset first)
+        if (a.fiveHourKnown && b.fiveHourKnown) {
+          if (a.fiveHourRemaining !== b.fiveHourRemaining) {
+            return a.fiveHourRemaining - b.fiveHourRemaining
+          }
+        } else if (a.fiveHourKnown !== b.fiveHourKnown) {
+          return a.fiveHourKnown ? -1 : 1
+        }
+
+        // Priority 3: Fallback to cyclic distance / pool order
         const da = this.cyclicDistance(fromId, a.acc.id)
         const db = this.cyclicDistance(fromId, b.acc.id)
         return da !== db ? da - db : a.index - b.index
@@ -821,14 +852,9 @@ export class AccountPoolManager {
     }
 
     // 2. Active account is drained or unavailable -> rotate to the eligible
-    //    account whose quota expires SOONEST (use-it-or-lose-it: residual
-    //    quota is discarded at the window reset). With no quota metadata yet
-    //    this degrades to the previous cyclic order.
-    //    When no active account existed (initial pick or after reordering),
-    //    honor user pool priority directly (candidates[0]).
-    const nextAccount: ManagedAccount = activeId !== undefined
-      ? this.orderByExpiry(candidates, family, activeId)[0]!
-      : candidates[0]!
+    //    account whose quota expires SOONEST (Priority 1: weekly quota expiry,
+    //    Priority 2: 5h quota expiry, Priority 3: pool order).
+    const nextAccount: ManagedAccount = this.orderByExpiry(candidates, family, activeId)[0]!
 
     if (!this.data.activeAccountIds) this.data.activeAccountIds = {}
     this.data.activeAccountIds[family] = nextAccount.id

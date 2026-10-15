@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { modelFamilyOf, shouldPollAccount } from '../src/common/pool-types.ts'
+import { modelFamilyOf, needsAuthReverify, shouldPollAccount } from '../src/common/pool-types.ts'
 import { AccountPoolManager } from '../src/host/pool.ts'
 
 test('modelFamilyOf correctly categorizes models', () => {
@@ -508,6 +508,117 @@ test('rotation falls back to pool order when no quota metadata exists yet', () =
   assert.equal(pool.getPoolData().lastActiveAccountId, b.id)
 })
 
+test('rotation prioritizes weekly quota expiring soonest over 5h quota window', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-weekly-prio-'))
+  const pool = new AccountPoolManager(dir)
+  const a = pool.getAccounts()[0]!
+  const weeklySooner = pool.createAccountSlot('WeeklySooner')
+  const fiveHourSooner = pool.createAccountSlot('FiveHourSooner')
+  const iso = (ms: number): string => new Date(ms).toISOString()
+  const now = Date.now()
+
+  // weeklySooner: weekly quota resets in 1 day, 5h window resets in 4 hours
+  pool.updateAccountQuotas(weeklySooner.id, {
+    google: {
+      weeklyFraction: 0.7,
+      weeklyResetTime: iso(now + 86_400_000), // 1 day
+      remainingFraction: 0.8,
+      resetTime: iso(now + 4 * 3600_000), // 4 hours
+    },
+  })
+  // fiveHourSooner: weekly quota resets in 6 days, 5h window resets in 15 minutes
+  pool.updateAccountQuotas(fiveHourSooner.id, {
+    google: {
+      weeklyFraction: 0.9,
+      weeklyResetTime: iso(now + 6 * 86_400_000), // 6 days
+      remainingFraction: 0.5,
+      resetTime: iso(now + 15 * 60_000), // 15 mins
+    },
+  })
+  pool.markAccountActive(a.id)
+
+  // a is drained -> rotation must pick weeklySooner because weekly quota is expiring sooner
+  pool.recordFailure(a.id, 'google', '429 Rate Limit')
+  assert.equal(pool.getPoolData().lastActiveAccountId, weeklySooner.id, 'weekly expiry must take precedence over 5h window')
+})
+
+test('rotation compares 5h quota window when weekly quota expiry is equal', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-5h-tie-'))
+  const pool = new AccountPoolManager(dir)
+  const a = pool.getAccounts()[0]!
+  const acc1 = pool.createAccountSlot('Acc1')
+  const acc2 = pool.createAccountSlot('Acc2')
+  const iso = (ms: number): string => new Date(ms).toISOString()
+  const now = Date.now()
+
+  // Both have identical weekly reset (2 days), but acc2 has 5h reset sooner (30 mins vs 3 hours)
+  pool.updateAccountQuotas(acc1.id, {
+    google: {
+      weeklyFraction: 0.6,
+      weeklyResetTime: iso(now + 2 * 86_400_000),
+      remainingFraction: 0.8,
+      resetTime: iso(now + 3 * 3600_000),
+    },
+  })
+  pool.updateAccountQuotas(acc2.id, {
+    google: {
+      weeklyFraction: 0.6,
+      weeklyResetTime: iso(now + 2 * 86_400_000),
+      remainingFraction: 0.5,
+      resetTime: iso(now + 30 * 60_000),
+    },
+  })
+  pool.markAccountActive(a.id)
+
+  pool.recordFailure(a.id, 'google', '429 Rate Limit')
+  assert.equal(pool.getPoolData().lastActiveAccountId, acc2.id, 'sooner 5h reset wins when weekly reset is tied')
+})
+
+test('rotation remains sticky to active account while 5h and weekly quota remain', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-sticky-drain-'))
+  const pool = new AccountPoolManager(dir)
+  const active = pool.getAccounts()[0]!
+  const other = pool.createAccountSlot('OtherSooner')
+  const iso = (ms: number): string => new Date(ms).toISOString()
+  const now = Date.now()
+
+  // active account has plenty of quota left
+  pool.updateAccountQuotas(active.id, {
+    google: {
+      weeklyFraction: 0.6,
+      weeklyResetTime: iso(now + 5 * 86_400_000),
+      remainingFraction: 0.5,
+      resetTime: iso(now + 3 * 3600_000),
+    },
+  })
+  // other account has quota expiring much sooner
+  pool.updateAccountQuotas(other.id, {
+    google: {
+      weeklyFraction: 0.3,
+      weeklyResetTime: iso(now + 86_400_000),
+      remainingFraction: 0.2,
+      resetTime: iso(now + 20 * 60_000),
+    },
+  })
+  pool.setActiveAccount(active.id, 'google')
+
+  // selectAccount must stay sticky to active account as long as its quota is not exhausted
+  const selected = pool.selectAccount('google')
+  assert.equal(selected?.id, active.id, 'must not switch away from active account while quota remains')
+
+  // Now active account exhausts its 5h quota (<= 2%)
+  pool.updateAccountQuotas(active.id, {
+    google: {
+      weeklyFraction: 0.6,
+      weeklyResetTime: iso(now + 5 * 86_400_000),
+      remainingFraction: 0.01,
+      resetTime: iso(now + 2 * 3600_000),
+    },
+  })
+  const rotated = pool.selectAccount('google')
+  assert.equal(rotated?.id, other.id, 'must automatically advance to next account once active account is exhausted')
+})
+
 test('getEarliestAvailableCountdown reports quota-window resets, not just cooldowns', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-pool-eta-'))
   const pool = new AccountPoolManager(dir)
@@ -547,4 +658,35 @@ test('a partial pool.json (missing cooldowns/quotas) is normalized instead of th
   assert.deepEqual(pool.getAccount('acc_partial')?.cooldowns, {})
   assert.deepEqual(pool.getAccount('acc_partial')?.quotas, {})
 })
+
+test('disabled account handling: needsAuthReverify skips disabled, getActiveAccountId never falls back to disabled', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-disabled-'))
+  const pool = new AccountPoolManager(dir)
+  const primary = pool.getAccounts()[0]!
+  const secondary = pool.createAccountSlot('Secondary')
+
+  // needsAuthReverify returns false when account is disabled
+  primary.authRequired = true
+  primary.authMarkedAt = Date.now() - 20 * 60_000
+  primary.enabled = false
+  assert.equal(needsAuthReverify(primary), false, 'disabled account must never be polled for reverification')
+  primary.enabled = true
+  assert.equal(needsAuthReverify(primary), true, 'enabled account is eligible for reverification')
+
+  // Primary disabled -> getActiveAccountId falls back to secondary (enabled)
+  pool.setAccountEnabled(primary.id, false)
+  assert.equal(pool.getActiveAccountId('google'), secondary.id)
+
+  // Both disabled -> getActiveAccountId returns undefined, does not throw or return disabled account
+  pool.setAccountEnabled(secondary.id, false)
+  assert.equal(pool.getActiveAccountId('google'), undefined)
+  assert.equal(pool.selectAccount('google'), null)
+  assert.equal(pool.advanceAccount(primary.id, 'google'), null)
+
+  // setPrimaryAccount re-enables a disabled account
+  pool.setPrimaryAccount(secondary.id)
+  assert.equal(pool.getAccount(secondary.id)?.enabled, true)
+  assert.equal(pool.getActiveAccountId('google'), secondary.id)
+})
+
 

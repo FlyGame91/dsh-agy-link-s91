@@ -266,8 +266,8 @@ test('agy 1.1.15 stream maps onto spans: thinking turn, tool cuts, fragments, re
   const s1 = newSpan('run15')
   const c1 = mapAll(s1, events, 0)
   const reasoning1 = c1.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning1, '[agy thinking turn · 80 thinking tokens]\n[agy tool running: run_command — the result card streams when it finishes]\n')
-  assert.ok(!reasoning1.includes('Chain-of-Thought') && !/thinking turn\].+thinking turn/s.test(reasoning1), 'no invented prose, no duplicate banner')
+  assert.equal(reasoning1, '[agy · 80 tokens]\n[agy tool running: run_command — the result card streams when it finishes]\n')
+  assert.ok(!reasoning1.includes('Chain-of-Thought') && !/tokens\].+tokens/s.test(reasoning1), 'no invented prose, no duplicate banner')
   assert.equal(toolCallEnd(c1).block.id, mirrorCallId('run15', 3))
   assert.equal(asFinish(lastChunk(c1)).reason.kind, 'tool-calls')
   // Span 2: second tool cut (the errored one)
@@ -290,7 +290,7 @@ test('one-shot answer step without DB prose shows the banner-only chip, never in
     { kind: 'result', conversationId: 'c9', ok: true, response: '1 + 1 等于 2。', usage: {} },
   ])
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning, '[agy thinking turn · 154 thinking tokens]\n', 'issue #43: thinking stays visible without a sqlite reader')
+  assert.equal(reasoning, '[agy · 154 tokens]\n', 'issue #43: thinking stays visible without a sqlite reader')
   assert.ok(!reasoning.includes('等于'), 'no invented thought prose')
   const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
   assert.equal(text, '1 + 1 等于 2。')
@@ -339,7 +339,7 @@ test('thinking turn with resolvedThoughts emits real thought text into reasoning
     { kind: 'step', stepKey: '3', stepKind: 'tool', state: 'DONE', text: '', tool: { name: 'run_command', args: { command: 'ls' }, output: 'ok' } },
   ])
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning, '[agy thinking turn · 42 thinking tokens] Plan: check file status first, then decide whether to edit.\n')
+  assert.equal(reasoning, '[agy · 42 tokens] Plan: check file status first, then decide whether to edit.\n')
   // Block types order: reasoning start/delta/end, then tool-call
   const blockStarts = chunks.filter((c) => c.type === 'block-start').map((c) => (c as { blockType: string }).blockType)
   assert.deepEqual(blockStarts, ['reasoning', 'tool-call'])
@@ -361,7 +361,7 @@ test('streamed answer with deferred resolvedThoughts emits real thought text in 
     { kind: 'result', conversationId: 'c9', ok: true, response: 'Result is 2.', usage: {} },
   ])
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning, '[agy thinking turn · 15 thinking tokens] Double-checked 1+1=2, calculation is sound.\n')
+  assert.equal(reasoning, '[agy · 15 tokens] Double-checked 1+1=2, calculation is sound.\n')
   const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
   assert.equal(text, 'Result is 2.')
 })
@@ -389,7 +389,7 @@ test('streamed answer with eager resolvedThoughts emits leading reasoning block 
   assert.deepEqual(blockStarts, ['reasoning', 'text'])
 
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning, '[agy thinking turn] Analyzing problem constraints and deciding algorithm.\n')
+  assert.equal(reasoning, '[agy] Analyzing problem constraints and deciding algorithm.\n')
 
   const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
   assert.equal(text, 'Hello world!')
@@ -412,7 +412,7 @@ test('DB thought arriving on DONE tail is not dropped due to premature thinkingA
   const reasoning = allChunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
   // The banner-only chip streamed first (no prose yet); when the DB prose
   // resolves it is APPENDED without a second banner, and never dropped.
-  assert.equal(reasoning, '[agy thinking turn · 438 thinking tokens]\nCritical analysis of constraints.\n')
+  assert.equal(reasoning, '[agy · 438 tokens]\nCritical analysis of constraints.\n')
 })
 
 test('stepKind === thinking uses resolvedThoughts when available', () => {
@@ -503,7 +503,7 @@ test('thinking-only turn without DB prose still surfaces the banner (issue #43)'
     { kind: 'result', conversationId: 'c43', ok: true, response: 'Answer.', usage: {} },
   ])
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.ok(reasoning.includes('[agy thinking turn · 320 thinking tokens]'), 'banner-only chip emitted for thinking-only turns')
+  assert.ok(reasoning.includes('[agy · 320 tokens]'), 'banner-only chip emitted for thinking-only turns')
 })
 
 test('banner-only chip precedes the first visible text and never repeats (issue #43)', () => {
@@ -513,7 +513,7 @@ test('banner-only chip precedes the first visible text and never repeats (issue 
     { kind: 'step', stepKey: '3', stepKind: 'text', text: ' world', fragment: true, usage: { thinking_tokens: 60 } },
   ])
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.equal(reasoning, '[agy thinking turn · 45 thinking tokens]\n', 'exactly one banner before the answer')
+  assert.equal(reasoning, '[agy · 45 tokens]\n', 'exactly one banner before the answer')
   const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
   assert.equal(text, 'Hello world')
 })
@@ -525,7 +525,7 @@ test('token-only steps AFTER visible text stay suppressed (no clutter regression
     { kind: 'step', stepKey: '2', stepKind: 'text', text: 'more', fragment: true, usage: { thinking_tokens: 99 } },
   ])
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-  assert.ok(reasoning.includes('[agy thinking turn · 10 thinking tokens]'), 'first banner present')
+  assert.ok(reasoning.includes('[agy · 10 tokens]'), 'first banner present')
   assert.ok(!reasoning.includes('99'), 'later token-only steps are not chatty')
 })
 
@@ -569,3 +569,55 @@ test('EventMapper with mediaBaseUrl streams rewritten image markdown in text ste
   assert.ok(textChunk.text.includes(baseUrl))
   assert.ok(textChunk.text.includes('test.png'))
 })
+
+test('EventMapper emits update_goal tool-call when in goal continuation round', () => {
+  const m = new EventMapper({
+    runId: 'r_goal',
+    cutOnTool: true,
+    supportsGoalUpdate: true,
+    goalContext: {
+      goalId: 'goal-999',
+      revision: 2,
+      round: 1,
+    },
+  })
+
+  const chunks = mapAll(m, [
+    { kind: 'init', conversationId: 'c1' },
+    { kind: 'step', stepKey: '1', stepKind: 'text', text: 'All tasks completed successfully!' },
+    { kind: 'result', conversationId: 'c1', ok: true, response: 'All tasks completed successfully!', usage: {} },
+  ])
+
+  const tc = chunks.find((c) => c.type === 'block-end' && (c as { block?: { type: string; name: string } }).block?.name === 'update_goal') as any
+  assert.ok(tc, 'Should emit update_goal tool-call')
+  const args = JSON.parse(tc.block.arguments)
+  assert.equal(args.goal_id, 'goal-999')
+  assert.equal(args.revision, 2)
+  assert.equal(args.action, 'complete')
+
+  const fin = chunks.find((c) => c.type === 'finish') as any
+  assert.equal(fin.reason.kind, 'tool-calls')
+})
+
+test('EventMapper emits exit_plan_mode tool-call when in plan mode', () => {
+  const m = new EventMapper({
+    runId: 'r_plan',
+    cutOnTool: true,
+    supportsPlanExit: true,
+  })
+
+  const chunks = mapAll(m, [
+    { kind: 'init', conversationId: 'c1' },
+    { kind: 'step', stepKey: '1', stepKind: 'text', text: '# Architecture Plan\n\n1. Phase one' },
+    { kind: 'result', conversationId: 'c1', ok: true, response: '# Architecture Plan\n\n1. Phase one', usage: {} },
+  ])
+
+  const tc = chunks.find((c) => c.type === 'block-end' && (c as { block?: { type: string; name: string } }).block?.name === 'exit_plan_mode') as any
+  assert.ok(tc, 'Should emit exit_plan_mode tool-call')
+  const args = JSON.parse(tc.block.arguments)
+  assert.match(args.plan, /# Architecture Plan/)
+
+  const fin = chunks.find((c) => c.type === 'finish') as any
+  assert.equal(fin.reason.kind, 'tool-calls')
+})
+

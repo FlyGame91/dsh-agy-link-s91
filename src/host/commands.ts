@@ -1,7 +1,7 @@
 // /agy command family (spec section 6). One registered command dispatches
 // on its first token; every handler answers with GUI-renderable markdown.
 import { isAbsolute } from 'node:path'
-import type { CommandDefinition, CommandResult } from '@deepseek-ai/dsh-commands'
+import type { CommandDefinition, CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import type { PluginConfig } from '../common/types.ts'
 import type { AuthHelper } from './auth.ts'
 import type { ModelCatalog } from './models.ts'
@@ -32,13 +32,18 @@ export interface CommandDeps {
   } | null
   setOverride: (key: string, value: unknown) => void
   runDoctor: () => Promise<string>
+  sessions?: () => { get(id: unknown): unknown } | undefined
 }
 
 const HELP = [
   '**/agy** — Antigravity (agy CLI) bridge',
   '- `/agy status` — binary, version, auth, mode, catalog, bindings',
   '- `/agy pool` / `/agy accounts` — account pool, live quota %, cooldowns',
+  '- `/agy goal [status|complete|clear|pause]` — inspect or control the current DSH goal',
+  '- `/agy session [info|clear]` — view or drop the current session agy binding',
   '- `/agy add-account [alias]` — start OAuth login for a new account slot',
+  '- `/agy enable-account <id>` — enable an account slot',
+  '- `/agy disable-account <id>` — disable an account slot (skips in rotation)',
   '- `/agy refresh-quota` — query Google backend for fresh quota %',
   '- `/agy clear-cooldown` — reset cooldown timers across all accounts',
   '- `/agy remove-account <id>` — delete an account slot',
@@ -56,15 +61,15 @@ const HELP = [
 export function agyCommandDefinition(deps: CommandDeps): CommandDefinition {
   return {
     name: 'agy',
-    description: 'Antigravity (agy CLI) bridge: status, login, models, mode, diagnostics',
+    description: 'Antigravity (agy CLI) bridge: status, login, models, mode, diagnostics, goal',
     // Without `input`, DSH's composer treats `/agy <sub>` as an illegal bare
     // command and silently falls back to a normal chat message (issue #27).
-    input: { hint: '<status|pool|models|mode|effort|workspace|clear|doctor|help>' },
-    handler: (invocation) => handle(deps, invocation.rawInput),
+    input: { hint: '<status|pool|goal|session|enable-account|disable-account|models|mode|effort|workspace|clear|doctor|help>' },
+    handler: (invocation) => handle(deps, invocation.rawInput, invocation),
   }
 }
 
-async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
+async function handle(deps: CommandDeps, raw: string, invocation?: CommandInvocation): Promise<CommandResult> {
   const parts = raw.trim().split(/\s+/).filter(Boolean)
   const sub = parts[0] ?? 'help'
   const arg = parts[1] ?? ''
@@ -92,52 +97,270 @@ async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
             cds.push(`${fam} cooldown: ${sec}s left (${cd.reason})`)
           }
         }
-        lines.push(
-          `${i + 1}. **${a.alias}** (${a.email || a.id})${isPrimary ? ' ⭐ primary' : ''}`,
-          // Proxy URLs can embed user:pass — never print them raw into the GUI.
-          `   - Proxy: ${a.proxyUrl ? redactProxyUrl(a.proxyUrl) : deps.cfg().proxyUrl ? redactProxyUrl(deps.cfg().proxyUrl) : 'system default'}`,
-          `   - Quota: Gemini ${qG} | Claude ${qC} | GPT-OSS ${qO}`,
-          cds.length > 0 ? `   - ⚠️ ${cds.join('; ')}` : '   - Status: 🟢 Ready'
-        )
+          let statusText = '   - Status: 🟢 Ready'
+          if (!a.enabled) {
+            statusText = '   - Status: ⏸️ Disabled'
+          } else if (a.authRequired) {
+            statusText = `   - Status: 🔴 Auth required (${a.authError || 'sign in again'})`
+          } else if (cds.length > 0) {
+            statusText = `   - ⚠️ ${cds.join('; ')}`
+          }
+          lines.push(
+            `${i + 1}. **${a.alias}** (${a.email || a.id})${isPrimary ? ' ⭐ primary' : ''}`,
+            // Proxy URLs can embed user:pass — never print them raw into the GUI.
+            `   - Proxy: ${a.proxyUrl ? redactProxyUrl(a.proxyUrl) : deps.cfg().proxyUrl ? redactProxyUrl(deps.cfg().proxyUrl) : 'system default'}`,
+            `   - Quota: Gemini ${qG} | Claude ${qC} | GPT-OSS ${qO}`,
+            statusText,
+          )
+        }
+        return ok(lines.join('\n'))
       }
-      return ok(lines.join('\n'))
-    }
-    if (sub === 'add-account') {
-      const pool = deps.pool?.()
-      if (!pool) return err('Account pool not available')
-      const acc = pool.createAccountSlot(arg || undefined)
-      // Quarantine until the terminal login completes: without the flag the
-      // scheduler immediately routed real runs to the empty slot — a
-      // guaranteed failure plus cooldown noise. The first successful run or
-      // quota refresh clears it (recordSuccess / clearAuthRequired).
-      pool.markAuthRequired(acc.id, 'not signed in yet — complete the terminal login')
-      return ok([
-        `**Account slot created: [${acc.alias}]** (id: \`${acc.id}\`)`,
-        `- Isolated directory: \`${acc.dir}\``,
-        `- Run in terminal: \`HOME="${acc.dir}" agy\` to authenticate this Google account.`,
-        `- The slot stays OUT of rotation (authRequired) until the login completes and a quota refresh verifies it.`,
-        `- Once logged in, run: \`/agy pool\` or click 🔄 刷新额度 in WebUI.`,
-      ].join('\n'))
-    }
-    if (sub === 'refresh-quota') {
-      const quota = deps.quota?.()
-      if (!quota) return err('Quota service not available')
-      await quota.refreshAllQuotas()
-      return ok('Refreshed quota statistics for all accounts in pool.')
-    }
-    if (sub === 'clear-cooldown') {
-      const pool = deps.pool?.()
-      if (!pool) return err('Account pool not available')
-      pool.clearCooldown(arg || undefined)
-      return ok('Cleared cooldown timers.')
-    }
-    if (sub === 'remove-account') {
-      if (!arg) return err('usage: /agy remove-account <id>')
-      const pool = deps.pool?.()
-      if (!pool) return err('Account pool not available')
-      const success = pool.deleteAccount(arg)
-      return success ? ok(`Removed account ${arg}`) : err(`Account ${arg} not found`)
-    }
+      if (sub === 'enable-account' || sub === 'disable-account') {
+        if (!arg) return err(`usage: /agy ${sub} <id>`)
+        const pool = deps.pool?.()
+        if (!pool) return err('Account pool not available')
+        const enabled = sub === 'enable-account'
+        const success = pool.setAccountEnabled(arg, enabled)
+        return success ? ok(`${enabled ? 'Enabled' : 'Disabled'} account ${arg}`) : err(`Account ${arg} not found`)
+      }
+      if (sub === 'add-account') {
+        const pool = deps.pool?.()
+        if (!pool) return err('Account pool not available')
+        const acc = pool.createAccountSlot(arg || undefined)
+        // Quarantine until the terminal login completes: without the flag the
+        // scheduler immediately routed real runs to the empty slot — a
+        // guaranteed failure plus cooldown noise. The first successful run or
+        // quota refresh clears it (recordSuccess / clearAuthRequired).
+        pool.markAuthRequired(acc.id, 'not signed in yet — complete the terminal login')
+        return ok([
+          `**Account slot created: [${acc.alias}]** (id: \`${acc.id}\`)`,
+          `- Isolated directory: \`${acc.dir}\``,
+          `- Run in terminal: \`HOME="${acc.dir}" agy\` to authenticate this Google account.`,
+          `- The slot stays OUT of rotation (authRequired) until the login completes and a quota refresh verifies it.`,
+          `- Once logged in, run: \`/agy pool\` or click 🔄 刷新额度 in WebUI.`,
+        ].join('\n'))
+      }
+      if (sub === 'refresh-quota') {
+        const quota = deps.quota?.()
+        if (!quota) return err('Quota service not available')
+        await quota.refreshAllQuotas()
+        return ok('Refreshed quota statistics for all accounts in pool.')
+      }
+      if (sub === 'clear-cooldown') {
+        const pool = deps.pool?.()
+        if (!pool) return err('Account pool not available')
+        pool.clearCooldown(arg || undefined)
+        return ok('Cleared cooldown timers.')
+      }
+      if (sub === 'remove-account') {
+        if (!arg) return err('usage: /agy remove-account <id>')
+        const pool = deps.pool?.()
+        if (!pool) return err('Account pool not available')
+        const success = pool.deleteAccount(arg)
+        return success ? ok(`Removed account ${arg}`) : err(`Account ${arg} not found`)
+      }
+
+      if (sub === 'goal') {
+        const action = arg || 'status'
+        const session = (invocation?.agent?.session as { events?: readonly { type: string; data?: unknown }[]; append?: (t: string, d: unknown) => unknown } | undefined)
+          ?? (deps.sessions?.() && invocation?.agent?.id ? (deps.sessions()!.get(invocation.agent.id) as { events?: readonly { type: string; data?: unknown }[]; append?: (t: string, d: unknown) => unknown }) : undefined)
+
+        if (!session) {
+          return err('No active DSH session available for goal command.')
+        }
+
+        const events = session.events
+        type GoalChangeData = {
+          operation?: string
+          goal?: { id: string; revision: number; objective: string; phase: string; maxGoalRounds?: number; blockedReason?: { message: string } }
+          roundsStarted?: number
+          createdAt?: number
+        }
+        let latestGoalChange: GoalChangeData | null = null
+
+        if (events) {
+          for (let i = events.length - 1; i >= 0; i--) {
+            const ev = events[i]
+            if (ev?.type === 'goal/change' && ev.data && typeof ev.data === 'object') {
+              const d = ev.data as { kind?: string; operation?: string; goal?: unknown; roundsStarted?: number; createdAt?: number }
+              if (d.kind === 'goal/change') {
+                latestGoalChange = d as GoalChangeData
+                break
+              }
+            }
+          }
+        }
+
+        const activeGoal = latestGoalChange && latestGoalChange.operation !== 'clear' ? latestGoalChange.goal : null
+
+        if (action === 'status') {
+          if (!activeGoal || !latestGoalChange) {
+            return ok('**DSH Goal Status**: No active goal in this session.')
+          }
+          const phaseEmoji: Record<string, string> = {
+            active: '🟢',
+            paused: '⏸️',
+            blocked: '🚫',
+            complete: '✅',
+          }
+          return ok([
+            `**DSH Goal Status** (${phaseEmoji[activeGoal.phase] ?? '⚪'} \`${activeGoal.phase}\`)`,
+            `- **Goal ID**: \`${activeGoal.id}\` (rev ${activeGoal.revision})`,
+            `- **Objective**: ${activeGoal.objective}`,
+            `- **Rounds**: ${latestGoalChange.roundsStarted ?? 1} / ${activeGoal.maxGoalRounds ?? 256}`,
+            ...(activeGoal.blockedReason ? [`- **Blocked Reason**: ${activeGoal.blockedReason.message}`] : []),
+          ].join('\n'))
+        }
+
+        if (action === 'complete') {
+          if (!activeGoal || !latestGoalChange) return err('No active goal to complete.')
+          if (typeof session.append === 'function') {
+            session.append('goal/change', {
+              kind: 'goal/change',
+              version: 1,
+              operation: 'complete',
+              goal: {
+                id: activeGoal.id,
+                revision: activeGoal.revision + 1,
+                objective: activeGoal.objective,
+                phase: 'complete',
+                maxGoalRounds: activeGoal.maxGoalRounds,
+              },
+              roundsStarted: latestGoalChange.roundsStarted ?? 1,
+              createdAt: latestGoalChange.createdAt ?? Date.now(),
+              updatedAt: Date.now(),
+            })
+            return ok(`✅ Marked goal \`${activeGoal.id}\` as complete. Automatic continuation rounds stopped.`)
+          }
+          return err('Session cannot append events.')
+        }
+
+        if (action === 'pause') {
+          if (!activeGoal || !latestGoalChange) return err('No active goal to pause.')
+          if (typeof session.append === 'function') {
+            session.append('goal/change', {
+              kind: 'goal/change',
+              version: 1,
+              operation: 'pause',
+              goal: {
+                id: activeGoal.id,
+                revision: activeGoal.revision + 1,
+                objective: activeGoal.objective,
+                phase: 'paused',
+                maxGoalRounds: activeGoal.maxGoalRounds,
+              },
+              roundsStarted: latestGoalChange.roundsStarted ?? 1,
+              createdAt: latestGoalChange.createdAt ?? Date.now(),
+              updatedAt: Date.now(),
+            })
+            return ok(`⏸️ Paused goal \`${activeGoal.id}\`.`)
+          }
+          return err('Session cannot append events.')
+        }
+
+        if (action === 'resume') {
+          if (!activeGoal || !latestGoalChange) return err('No active goal to resume.')
+          if (typeof session.append === 'function') {
+            session.append('goal/change', {
+              kind: 'goal/change',
+              version: 1,
+              operation: 'resume',
+              goal: {
+                id: activeGoal.id,
+                revision: activeGoal.revision + 1,
+                objective: activeGoal.objective,
+                phase: 'active',
+                maxGoalRounds: activeGoal.maxGoalRounds,
+              },
+              roundsStarted: latestGoalChange.roundsStarted ?? 1,
+              createdAt: latestGoalChange.createdAt ?? Date.now(),
+              updatedAt: Date.now(),
+            })
+            return ok(`▶️ Resumed goal \`${activeGoal.id}\`.`)
+          }
+          return err('Session cannot append events.')
+        }
+
+        if (action === 'clear') {
+          if (!activeGoal) return ok('No active goal to clear.')
+          if (typeof session.append === 'function') {
+            session.append('goal/change', {
+              kind: 'goal/change',
+              version: 1,
+              operation: 'clear',
+              cleared: {
+                id: activeGoal.id,
+                revision: activeGoal.revision + 1,
+              },
+              clearedAt: Date.now(),
+            })
+            return ok(`Cleared goal \`${activeGoal.id}\`.`)
+          }
+          return err('Session cannot append events.')
+        }
+
+        return err(`Unknown goal action \`${action}\`. Usage: /agy goal [status|complete|pause|resume|clear]`)
+      }
+
+      if (sub === 'session') {
+        const action = arg || 'info'
+        const sessionId = invocation?.agent?.id ? String(invocation.agent.id) : undefined
+        const session = (invocation?.agent?.session as { header?: { cwd?: string }; events?: readonly unknown[] } | undefined)
+          ?? (deps.sessions?.() && sessionId ? (deps.sessions()!.get(sessionId) as { header?: { cwd?: string }; events?: readonly unknown[] }) : undefined)
+
+        if (action === 'info') {
+          const lines: string[] = ['**DSH Session & agy Bridge Info**']
+          if (sessionId) {
+            lines.push(`- **Session ID**: \`${sessionId}\``)
+            const cwd = session?.header?.cwd
+            if (cwd) lines.push(`- **Workspace CWD**: \`${cwd}\``)
+            const bindings = deps.store().all()
+            const matchedKey = Object.keys(bindings).find((k) => k === sessionId || k.startsWith(`${sessionId}:`))
+            if (matchedKey && bindings[matchedKey]) {
+              const b = bindings[matchedKey]
+              lines.push(
+                `- **Bound agy Conversation**: \`${b.conversationId}\``,
+                `- **Bound Model**: \`${b.model || 'default'}\``,
+                `- **Last Message Count**: ${b.lastMessageCount}`,
+                `- **Last Updated**: ${new Date(b.updatedAt).toLocaleTimeString()}`,
+              )
+            } else {
+              lines.push('- **Bound agy Conversation**: *(none - next turn starts fresh)*')
+            }
+            if (session?.events) {
+              lines.push(`- **Total Session Events**: ${session.events.length}`)
+            }
+          } else {
+            lines.push('- Current session ID could not be identified from invocation context.')
+          }
+          return ok(lines.join('\n'))
+        }
+
+        if (action === 'clear') {
+          if (!sessionId) {
+            const all = deps.store().all()
+            const keys = Object.keys(all)
+            if (keys.length === 0) return ok('No conversation bindings yet.')
+            const key = keys.reduce((a, b) => ((all[a]?.updatedAt ?? 0) >= (all[b]?.updatedAt ?? 0) ? a : b))
+            const dropped = all[key]
+            if (dropped === undefined) return ok('No conversation bindings yet.')
+            deps.store().delete(key)
+            return ok(`Dropped binding for session \`${key}\` (agy conversation \`${dropped.conversationId}\`). Next turn starts fresh.`)
+          }
+
+          const bindings = deps.store().all()
+          let count = 0
+          for (const k of Object.keys(bindings)) {
+            if (k === sessionId || k.startsWith(`${sessionId}:`)) {
+              deps.store().delete(k)
+              count++
+            }
+          }
+          return ok(`Dropped ${count > 0 ? count : 'any'} agy conversation binding(s) for session \`${sessionId}\`. Next turn will start a fresh agy conversation.`)
+        }
+
+        return err(`Unknown session action \`${action}\`. Usage: /agy session [info|clear]`)
+      }
 
     if (sub === 'auth') {
       const flow = deps.poolAuth?.()
@@ -202,6 +425,15 @@ async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
       return ok('Workspace set to **' + arg + '** — effective next turn.')
     }
     if (sub === 'clear') {
+      const sessionId = invocation?.agent?.id ? String(invocation.agent.id) : undefined
+      if (sessionId) {
+        const bindings = deps.store().all()
+        const keys = Object.keys(bindings).filter((k) => k === sessionId || k.startsWith(`${sessionId}:`))
+        if (keys.length > 0) {
+          for (const k of keys) deps.store().delete(k)
+          return ok(`Dropped binding for session \`${sessionId}\`. The next turn starts a fresh agy conversation.`)
+        }
+      }
       const all = deps.store().all()
       const keys = Object.keys(all)
       if (keys.length === 0) return ok('No conversation bindings yet.')

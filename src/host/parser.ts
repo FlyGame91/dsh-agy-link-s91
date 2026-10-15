@@ -259,26 +259,32 @@ export class StreamJsonParser {
     return ev ? [ev] : []
   }
 
+  private recordAuthFailure(text: string): void {
+    this.stats.sawAuthFailure = true
+    const prev = this.stats.authFailureText ?? ''
+    if (prev.length < 600) {
+      this.stats.authFailureText = (prev === '' ? '' : prev + ' ') + text.trim().slice(0, 300)
+    }
+  }
+
   private takeLine(line: string): AgyEvent | undefined {
     if (line.trim() === '') return undefined
     this.stats.lines++
     this.recentLines.push(line)
     if (this.recentLines.length > this.maxRecent) this.recentLines.splice(0, this.recentLines.length - this.maxRecent)
-    if (looksLikeAuthFailure(line)) {
-      this.stats.sawAuthFailure = true
-      const prev = this.stats.authFailureText ?? ''
-      if (prev.length < 600) {
-        this.stats.authFailureText = (prev === '' ? '' : prev + ' ') + line.trim().slice(0, 300)
-      }
-    }
-    if (this.stats.authUrl === undefined) {
-      const u = extractAuthUrl(line)
-      if (u) this.stats.authUrl = u
-    }
+
     let obj: unknown
     try {
       obj = JSON.parse(line)
     } catch {
+      // Non-JSON plain text lines: agy banners, plain text auth errors, or login URLs
+      if (looksLikeAuthFailure(line)) {
+        this.recordAuthFailure(line)
+      }
+      if (this.stats.authUrl === undefined) {
+        const u = extractAuthUrl(line)
+        if (u) this.stats.authUrl = u
+      }
       this.stats.garbage++
       this.stats.consecutiveGarbage++
       return { kind: 'garbage', line }
@@ -291,6 +297,9 @@ export class StreamJsonParser {
     }
     if (ev.kind === 'result') {
       this.stats.lastResultError = ev.error ?? undefined
+      if (!ev.ok && ev.error && looksLikeAuthFailure(ev.error)) {
+        this.recordAuthFailure(ev.error)
+      }
     }
     this.stats.consecutiveGarbage = 0
     return ev

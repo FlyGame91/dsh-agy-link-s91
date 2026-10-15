@@ -33,5 +33,6 @@ export const UI_PATHS = {
   move: 'M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01',
   arrowUp: 'M12 19V5M5 12l7-7 7 7',
   arrowDown: 'M12 5v14M19 12l-7 7-7-7',
+  power: 'M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10',
 } as const
 

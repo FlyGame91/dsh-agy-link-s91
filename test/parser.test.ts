@@ -52,6 +52,13 @@ test('counts garbage and captures auth failures', () => {
   assert.equal(p.stats.sawAuthFailure, true)
 })
 
+test('conversational JSON steps containing auth phrases never trigger sawAuthFailure', () => {
+  const p = new StreamJsonParser()
+  const evs = p.feed('{"event":"step","step":{"type":"PLANNER_RESPONSE","content":"The user is not signed in and authentication failed."}}\n')
+  assert.equal(evs.length, 1)
+  assert.equal(p.stats.sawAuthFailure, false)
+})
+
 test('captures the OAuth URL from raw lines', () => {
   const p = new StreamJsonParser()
   p.feed('visit https://accounts.google.com/o/oauth2/auth?code=4/AbC now\n')

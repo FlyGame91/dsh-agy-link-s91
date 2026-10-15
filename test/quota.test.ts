@@ -447,6 +447,7 @@ test('UI_PATHS contains all expected clean SVG paths', async () => {
   assert.ok(UI_PATHS.zap.length > 5)
   assert.ok(UI_PATHS.x.length > 5)
   assert.ok(UI_PATHS.check.length > 5)
+  assert.ok(UI_PATHS.power.length > 10)
 })
 
 

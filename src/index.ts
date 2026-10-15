@@ -237,6 +237,26 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       const sessions = ctx.get('sessions') as { get(id: unknown): { header?: { cwd?: string } } | undefined } | undefined
       return sessions?.get(sessionId)?.header?.cwd
     },
+    sessionGoal: (sessionId) => {
+      const sessions = (ctx.get('sessions') as { get(id: unknown): { events?: readonly { type: string; data?: unknown }[] } | undefined } | undefined)
+        ?? (ctx as unknown as { sessions?: { get(id: unknown): { events?: readonly { type: string; data?: unknown }[] } } }).sessions
+      const session = sessions?.get(sessionId)
+      if (!session?.events) return null
+      for (let i = session.events.length - 1; i >= 0; i--) {
+        const ev = session.events[i]
+        if (ev?.type === 'goal/change' && ev.data && typeof ev.data === 'object') {
+          const d = ev.data as { operation?: string; goal?: { id?: string; revision?: number } }
+          if (d.operation === 'clear') return null
+          if (d.goal?.id) {
+            return {
+              goalId: d.goal.id,
+              revision: typeof d.goal.revision === 'number' ? d.goal.revision : 1,
+            }
+          }
+        }
+      }
+      return null
+    },
     syncSessionModel: (sessionId, model, effort) => {
       if (!sessionId) return
       try {
@@ -379,6 +399,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       quota: () => quota,
       lastRun: () => lastRun,
       setOverride,
+      sessions: () => (ctx.get('sessions') as any) ?? (ctx as any).sessions,
       runDoctor: async () => {
         return writeDoctorReport({
           cfg: getConfig,
@@ -715,6 +736,19 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         const id = typeof body.id === 'string' ? body.id : ''
         pool.deleteAccount(id)
         sendJson(res as RawRes, 200, { ok: true, pool: pool.getPoolData() })
+      })()
+    }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/enable', handler: (req, res) => {
+      void (async () => {
+        if (methodOf(req) !== 'POST') {
+          sendJson(res as RawRes, 405, { error: 'POST only' })
+          return
+        }
+        const body = await readBody(req)
+        const id = typeof body.id === 'string' ? body.id : ''
+        const enabled = typeof body.enabled === 'boolean' ? body.enabled : true
+        const ok = pool.setAccountEnabled(id, enabled)
+        sendJson(res as RawRes, ok ? 200 : 400, { ok, pool: pool.getPoolData() })
       })()
     }})
     reg({ kind: 'exact', path: '/plugins/agy-link/pool/proxy', handler: (req, res) => {

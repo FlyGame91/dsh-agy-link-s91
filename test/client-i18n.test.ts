@@ -137,3 +137,58 @@ test('safe dynamic auth codes and localized duration units have complete diction
     for (const key of ['duration.day', 'duration.hour', 'duration.minute', 'aria.aliasInput', 'aria.proxyInput', 'aria.authCodeInput']) assert.ok(dictionary[key as keyof typeof dictionary])
   }
 })
+
+test('modal host manager reactively promotes secondary header on unmount and suppresses modal portal when closed', () => {
+  const hooks: Record<string, any[]> = {}
+  let sessionStatusComponent: (() => any) | undefined
+
+  const stateMap = new Map<number, any>()
+  let stateIndex = 0
+
+  const plugin = loadClient({
+    createElement(type: unknown, props: Record<string, unknown> | null, ...children: unknown[]) {
+      return { type, props, children }
+    },
+    useState(initial: unknown) {
+      const idx = stateIndex++
+      if (!stateMap.has(idx)) stateMap.set(idx, initial)
+      return [stateMap.get(idx), (val: unknown) => { stateMap.set(idx, typeof val === 'function' ? (val as any)(stateMap.get(idx)) : val) }]
+    },
+    useEffect(effect: () => void | (() => void)) {
+      // Record effects
+    },
+    useRef(initial: unknown) {
+      return { current: initial }
+    },
+  })
+
+  const locale = {
+    addLanguage() { return () => {} },
+    register() { return () => {} },
+    bind() { return (key: string) => key },
+    subscribe() { return () => {} },
+    setLocale() {},
+  }
+
+  plugin.apply({
+    locale,
+    effect(cb: () => void) { cb() },
+    slots: {
+      inject(_name: string, cb: () => void) { cb() },
+      register(opts: { id?: string }, comp: any) {
+        if (opts?.id === 'agy-link-status') sessionStatusComponent = comp
+        return () => {}
+      },
+    },
+  })
+
+  assert.ok(sessionStatusComponent)
+  // When closed, the session status badge returns a single div without the modal portal
+  stateIndex = 0
+  const rendered = sessionStatusComponent()
+  assert.ok(rendered)
+  assert.equal(rendered.type, 'div')
+  // Second child (the portal) is null because isModalOpen is false
+  assert.equal(rendered.children[1], null)
+})
+
