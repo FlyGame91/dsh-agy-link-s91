@@ -15,6 +15,7 @@ import { SessionStore } from '../src/host/sessions.ts'
 import { RunRegistry } from '../src/host/recording.ts'
 import { classifyToolError } from '../src/host/recording.ts'
 import { defineAgyMirrorTool, parseMirrorInvocation } from '../src/host/mirror-tool.ts'
+import { stripNulBytes } from '../src/host/runner.ts'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { defaultConfig, Err, type PluginConfig } from '../src/common/types.ts'
 
@@ -1766,4 +1767,56 @@ test('session sticks to current account across multiple turns and only switches 
 
 test.after(() => {
   rmSync(workDir, { recursive: true, force: true })
+})
+
+// --- NUL-byte hardening -----------------------------------------------------
+// Live failure (2026-10-16): a tool result that quoted binary output (the agent
+// had listed/read a `.git` directory) carried U+0000 into the assembled prompt,
+// and `spawn(agy, args)` threw
+//   ERR_INVALID_ARG_VALUE: The argument 'args[16]' must be a string without null bytes
+// which failed the whole turn ("failed to spawn agy") before agy ever started.
+
+test('stripNulBytes removes NUL bytes and keeps other whitespace intact', () => {
+  assert.equal(stripNulBytes('a\u0000b'), 'ab')
+  assert.equal(stripNulBytes('\u0000\u0000'), '')
+  assert.equal(stripNulBytes('tab\tlf\ncr\r'), 'tab\tlf\ncr\r')
+  assert.equal(stripNulBytes('plain text'), 'plain text')
+})
+
+test('buildDigest strips NUL bytes that arrive with binary tool output', () => {
+  const messages = [
+    msg('user', 'look at .git'),
+    toolResultMsg({ nestedText: 'total 1996\n\u0000drwxr-xr-x 3 zand zand 4096 Oct 1 .\u0000' }),
+    msg('assistant', 'ok'),
+    msg('user', '这啥情况？'),
+  ]
+  const digest = buildDigest(messages, 0, 10_000)
+  assert.ok(digest.includes('[conversation so far]'))
+  assert.ok(!digest.includes('\u0000'), 'digest must be NUL-free')
+  assert.ok(digest.includes('drwxr-xr-x 3 zand zand 4096 Oct 1'), 'text around the NUL survives')
+})
+
+test('a NUL byte in history cannot fail the turn with a spawn TypeError', async () => {
+  const argsFile = join(workDir, `args-nul-${Date.now()}.json`)
+  const prevArgs = process.env.FAKE_AGY_ARGS_FILE
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  try {
+    const { adapter } = makeAdapter()
+    const history = [
+      msg('user', 'look at .git'),
+      toolResultMsg({ nestedText: 'total 1996\n\u0000drwxr-xr-x 3 zand zand 4096 Oct 1 .' }),
+      msg('assistant', 'ok'),
+      msg('user', '这啥情况？'),
+    ]
+    const res = await runTurn(adapter, history, { sessionId: 'sess-nul' as never })
+    const finish = res.chunks[res.chunks.length - 1] as { type: string; reason: { kind: string; failure?: { message?: string } } }
+    assert.equal(finish.type, 'finish')
+    assert.notEqual(finish.reason.kind, 'error', 'the turn must survive NUL-bearing tool output')
+    const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+    assert.ok(Array.isArray(argv) && argv.length > 0, 'fake agy must have been spawned')
+    assert.ok(argv.every((a) => typeof a === 'string' && !a.includes('\u0000')), 'no argv element may contain a NUL')
+  } finally {
+    if (prevArgs === undefined) delete process.env.FAKE_AGY_ARGS_FILE
+    else process.env.FAKE_AGY_ARGS_FILE = prevArgs
+  }
 })

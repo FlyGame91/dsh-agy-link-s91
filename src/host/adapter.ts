@@ -16,7 +16,7 @@ import { parseMirrorCallId, type RunRecording, type RunRegistry } from './record
 import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug, sanitizeCatalogEntries } from './models.ts'
 import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
-import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin } from './runner.ts'
+import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin, stripNulBytes } from './runner.ts'
 import { detectSystemProxy } from './wincred.ts'
 import { acquireCredentialSlot, SlotUnavailableError } from './credential-slot.ts'
 import { stateDir } from '../common/config.ts'
@@ -300,14 +300,16 @@ export function mergeSentImageIds(
  * budget is filled from the newest other turns.
  */
 export function buildDigest(messages: readonly Message[], fromIdx: number, maxChars: number): string {
-  const taskText = latestUserTaskText(messages.slice(fromIdx))
+  const taskText = stripNulBytes(latestUserTaskText(messages.slice(fromIdx)))
   const taskLine = taskText !== '' ? 'User: ' + taskText : ''
   const otherLines: string[] = []
   for (let i = fromIdx; i < messages.length; i++) {
     const m = messages[i]
     if (m === undefined || m.role === 'system') continue
     if (isSyntheticHarnessMessage(m)) continue
-    const text = textOf(m)
+    // Binary tool output (e.g. a quoted .git blob) can carry NUL bytes; they
+    // are illegal in argv and would kill the spawn before agy starts.
+    const text = stripNulBytes(textOf(m))
     if (text === '') continue
     if (taskLine !== '' && !isToolResultMessage(m) && m.role === 'user' && text === taskText) continue
     otherLines.push(digestLabel(m) + text)
@@ -1372,6 +1374,12 @@ export class AgyAdapter extends LlmAdapter {
     const effectiveAddDirs = workspaceRoot !== ''
       ? (stagedDirs.includes(workspaceRoot) ? stagedDirs : [workspaceRoot, ...stagedDirs])
       : stagedDirs
+    // Single choke point: every prompt reaches the child through here, so a NUL
+    // that slipped in from anywhere (tool output, a file path, a pasted blob)
+    // is removed before it can make `spawn` throw ERR_INVALID_ARG_VALUE and
+    // fail the turn ("failed to spawn agy"). NULs are also illegal inside the
+    // stream-json stdin payload, so this covers both transports.
+    prompt = stripNulBytes(prompt)
     const argsBase = this.buildArgs({
       prompt,
       model: activeModelForArgs,

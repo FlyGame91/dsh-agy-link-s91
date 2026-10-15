@@ -3,7 +3,7 @@
 // surface the conversation id so the caller can continue later.
 import { looksLikeAuthFailure, type PluginConfig } from '../common/types.ts'
 import { StreamJsonParser } from './parser.ts'
-import { startAgyProcess, buildStreamInputLine, shouldUsePromptStdin } from './runner.ts'
+import { startAgyProcess, buildStreamInputLine, shouldUsePromptStdin, stripNulBytes } from './runner.ts'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
@@ -111,6 +111,9 @@ export async function runAgyOnce(
   if (req.readPaths && req.readPaths.length > 0) {
     prompt = await inlineFiles(prompt, req.readPaths, cfg.workspaceRoot !== '' ? cfg.workspaceRoot : process.cwd())
   }
+  // Inlined files can be binary; NUL bytes are illegal in argv/stdin payloads
+  // and make spawn() throw ERR_INVALID_ARG_VALUE (see runner.stripNulBytes).
+  prompt = stripNulBytes(prompt)
   let cleanup: (() => Promise<void>) | null = null
   if (req.schema !== undefined && req.schema !== null) {
     const sa = await schemaArgs(req.schema)

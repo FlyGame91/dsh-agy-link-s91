@@ -359,6 +359,21 @@ export function buildStreamInputLine(prompt: string): string {
   return JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } }) + '\n';
 }
 
+/**
+ * Remove NUL characters from text destined for a child process.
+ *
+ * `spawn()` rejects any argv element containing U+0000 with
+ * `ERR_INVALID_ARG_VALUE: The argument 'args[N]' must be a string without null
+ * bytes`, which aborts the whole turn before agy is even started. NULs reach the
+ * assembled prompt through binary tool output (a tool result that quoted a
+ * binary file — `.git` objects, packed refs, images, …), so every prompt that
+ * can carry tool text passes through here. Other control characters are legal in
+ * argv and are left untouched.
+ */
+export function stripNulBytes(text: string): string {
+  return text.includes('\u0000') ? text.split('\u0000').join('') : text;
+}
+
 /** Whether the assembled argv (including a trailing `-p <prompt>`) risks ENAMETOOLONG. */
 export function shouldUsePromptStdin(argsWithPrompt: readonly string[]): boolean {
   let size = 0;
