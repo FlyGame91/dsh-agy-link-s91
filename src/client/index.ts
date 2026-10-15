@@ -1156,6 +1156,17 @@ export function apply(ctx: ClientContext): void {
 			setLoadingAction(null);
 			showToast(t('account.setPrimary'), 'success');
 		};
+		const setActiveAccount = async (id: string): Promise<void> => {
+			setLoadingAction(`active:${id}`);
+			const res = await postJson('/plugins/agy-link/pool/set-active', { id });
+			setLoadingAction(null);
+			if (res && res.ok) {
+				await refresh();
+				showToast(t('account.activeSet'), 'success');
+			} else {
+				showToast(res?.error || t('account.activeSetFailed'), 'error');
+			}
+		};
 
 		const removeAccount = async (id: string, alias: string): Promise<void> => {
 			setLoadingAction(`remove:${id}`);
@@ -1499,10 +1510,6 @@ export function apply(ctx: ClientContext): void {
 							},
 							title: acc.email,
 						}, uiIcon('mail', 10, 'var(--agy-badge-email-text)'), acc.email) : null,
-						isPrimary ? h('span', { style: { ...S.badgePrimary, gap: '3px', fontSize: '10.5px', padding: '1px 5px' } },
-							uiIcon('star', 10, 'var(--agy-badge-primary-text)'),
-							t('status.primary'),
-						) : null,
 						isInUse ? h('span', {
 							style: {
 								...S.badgeTag,
@@ -1534,17 +1541,19 @@ export function apply(ctx: ClientContext): void {
 						h('button', {
 							type: 'button',
 							className: 'agy-btn',
-							style: isExpanded ? { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' } : { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
-							onClick: () => toggleExpand(acc.id),
-						}, isExpanded ? [uiIcon('chevronUp', 10), ` ${t('account.collapse')}`] : [uiIcon('chevronDown', 10), ` ${t('account.otherModels')}`]),
-						h('button', {
-							type: 'button',
-							className: 'agy-btn',
 							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							title: t('account.syncTitle'),
 							disabled: isBusy,
 							onClick: () => void refreshQuota(acc.id),
 						}, loadingAction === `refresh:${acc.id}` ? [renderSpinner(), t('account.syncing')] : [uiIcon('refresh', 10), ` ${t('account.sync')}`]),
+						!isInUse ? h('button', {
+							type: 'button',
+							className: 'agy-btn',
+							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
+							title: t('account.setActive'),
+							disabled: isBusy,
+							onClick: () => void setActiveAccount(acc.id),
+						}, loadingAction === `active:${acc.id}` ? [renderSpinner(), t('account.settingActive')] : [uiIcon('zap', 10), ` ${t('account.setActive')}`]) : null,
 						!isPrimary ? h('button', {
 							type: 'button',
 							className: 'agy-btn',

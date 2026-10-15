@@ -789,6 +789,18 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         sendJson(res as RawRes, 200, { ok: true, pool: pool.getPoolData() })
       })()
     }})
+    reg({ kind: 'exact', path: '/plugins/agy-link/pool/set-active', handler: (req, res) => {
+      void (async () => {
+        if (methodOf(req) !== 'POST') {
+          sendJson(res as RawRes, 405, { error: 'POST only' })
+          return
+        }
+        const body = await readBody(req)
+        const id = typeof body.id === 'string' ? body.id : ''
+        const ok = id !== '' && pool.setActiveAccount(id)
+        sendJson(res as RawRes, ok ? 200 : 400, { ok, pool: pool.getPoolData() })
+      })()
+    }})
     reg({ kind: 'exact', path: '/plugins/agy-link/pool/reorder', handler: (req, res) => {
       void (async () => {
         if (methodOf(req) !== 'POST') {

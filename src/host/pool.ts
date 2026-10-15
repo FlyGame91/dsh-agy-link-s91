@@ -443,6 +443,22 @@ export class AccountPoolManager {
     this.persist()
   }
 
+  /**
+   * Manually pin the active slot for one family (console "设为当前使用").
+   * The pin survives until the scheduler legitimately rotates away (quota
+   * exhaustion / cooldown / auth flag) — getActiveAccountId still enforces
+   * eligibility, so pinning an ineligible slot simply does not stick.
+   */
+  setActiveAccount(id: string, family: ModelFamily = 'google'): boolean {
+    const acc = this.getAccount(id)
+    if (!acc || !acc.enabled || acc.authRequired) return false
+    if (!this.data.activeAccountIds) this.data.activeAccountIds = {}
+    this.data.activeAccountIds[family] = id
+    this.data.lastActiveAccountId = id
+    this.persist()
+    return true
+  }
+
   markAuthRequired(id: string, reason?: string): void {
     const acc = this.getAccount(id)
     if (!acc) return
