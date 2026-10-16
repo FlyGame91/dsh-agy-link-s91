@@ -48,8 +48,17 @@ function parseGoalRoundText(text: string): { goalId?: string; revision?: number;
   const maxRounds = roundMatch && roundMatch[2] ? parseInt(roundMatch[2]!, 10) : undefined
   const objMatch = text.match(/Objective:\s*(?:"([^"]*)"|'([^']*)'|([^\n]+))/)
   const objective = objMatch ? (objMatch[1] || objMatch[2] || objMatch[3])?.trim() : undefined
-  const idMatch = text.match(/goal-[a-zA-Z0-9_-]+/)
-  const goalId = idMatch ? idMatch[0] : undefined
+  // Never guess an id from loose prose: DSH's round prompt contains the words
+  // "goal-tool policy" and the token <goal_round>, so a generic /goal-[A-Za-z0-9_-]+/
+  // scan once synthesized update_goal calls against the literal id "goal-tool"
+  // (always missing → CAS failure → the driver queued round after round). Real
+  // DSH goal ids are UUID-shaped ("goal-3fe686a1-0298-4a5a-88dd-670562821182");
+  // accept only that shape or an explicit `id:`-prefixed value, and otherwise
+  // leave goalId undefined so the host-side sessionGoal fallback supplies the
+  // authoritative id.
+  const idMatch = text.match(/goal-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/)
+    ?? text.match(/\bid:\s*["']?([a-zA-Z0-9_-]+)["']?/)
+  const goalId = idMatch ? (idMatch[1] ?? idMatch[0]) : undefined
   return { goalId, round, maxRounds, objective }
 }
 
@@ -116,16 +125,28 @@ export function isPlanMode(messages: readonly Message[]): boolean {
 }
 
 /**
- * Check if the trailing message is the tool result of a bridge-emitted `update_goal` call.
+ * Check if the trailing span represents completion of a bridge-emitted `update_goal` call.
+ * This covers both the direct tool-result message and DSH's deferred `<goal_complete>` notice.
  */
 export function isGoalToolContinuation(messages: readonly Message[]): boolean {
   if (messages.length === 0) return false
-  const last = messages[messages.length - 1]
-  if (!last) return false
-  const callId = (last as unknown as { toolCallId?: unknown; source?: { callId?: unknown } }).toolCallId
-    ?? (last as unknown as { source?: { callId?: unknown } }).source?.callId
-  if (typeof callId === 'string' && callId.startsWith('agytc-bridge-goal-')) {
-    return true
+  const spanStart = Math.max(0, messages.length - 4)
+  for (let i = messages.length - 1; i >= spanStart; i--) {
+    const m = messages[i]
+    if (!m) continue
+    const callId = (m as unknown as { toolCallId?: unknown; source?: { callId?: unknown } }).toolCallId
+      ?? (m as unknown as { source?: { callId?: unknown } }).source?.callId
+    if (typeof callId === 'string' && callId.startsWith('agytc-bridge-goal-')) {
+      return true
+    }
+    const src = (m as unknown as { source?: { kind?: string } }).source
+    if (src && typeof src === 'object' && src.kind === 'tool-goal') {
+      return true
+    }
+    const text = extractText(m)
+    if (text.includes('<goal_complete>')) {
+      return true
+    }
   }
   return false
 }

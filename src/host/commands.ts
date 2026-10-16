@@ -11,6 +11,7 @@ import type { PoolAuthFlow } from './pool-auth.ts'
 import type { QuotaService } from './quota.ts'
 import { classifyToolError } from './recording.ts'
 import { redactProxyUrl } from './diagnostics.ts'
+import { credentialSlotMutex, fastPathRunCount } from './credential-slot.ts'
 
 export interface CommandDeps {
   cfg: () => PluginConfig
@@ -52,6 +53,10 @@ const HELP = [
   '- `/agy models` — refresh and list discovered models',
   '- `/agy mode <skip|plan|accept-edits>` — permission mode (next turn)',
   '- `/agy effort <low|medium|high|default>` — default reasoning effort',
+  '- `/agy dispatch [minutes|off]` — credential-slot wait cap per attempt (omit to inspect; `off` = unlimited)',
+  '- `/agy dispatch-retries <n>` — extra dispatch attempts after the cap',
+  '- `/agy parallel <on|off>` — same-account parallel agy runs (Windows slot fast path)',
+  '- `/agy max-concurrent <n|off>` — cap on concurrent agy request streams (off = unlimited, native)',
   '- `/agy workspace [path]` — set the agy working directory (absolute path; omit to show)',
   '- `/agy clear` — drop the most recent conversation binding',
   '- `/agy doctor` — write a diagnostic report and return its path',
@@ -64,7 +69,7 @@ export function agyCommandDefinition(deps: CommandDeps): CommandDefinition {
     description: 'Antigravity (agy CLI) bridge: status, login, models, mode, diagnostics, goal',
     // Without `input`, DSH's composer treats `/agy <sub>` as an illegal bare
     // command and silently falls back to a normal chat message (issue #27).
-    input: { hint: '<status|pool|goal|session|enable-account|disable-account|models|mode|effort|workspace|clear|doctor|help>' },
+    input: { hint: '<status|pool|goal|session|enable-account|disable-account|models|mode|effort|dispatch|dispatch-retries|parallel|max-concurrent|workspace|clear|doctor|help>' },
     handler: (invocation) => handle(deps, invocation.rawInput, invocation),
   }
 }
@@ -419,6 +424,68 @@ async function handle(deps: CommandDeps, raw: string, invocation?: CommandInvoca
       }
       deps.setOverride('defaultEffort', arg === 'default' ? '' : arg)
       return ok('Default effort set to **' + (arg === 'default' ? 'model default' : arg) + '**.')
+    }
+    if (sub === 'dispatch' || sub === 'dispatch-retries') {
+      const cfg = deps.cfg()
+      const mutex = credentialSlotMutex
+      if (arg === '') {
+        const cap = cfg.dispatchTimeoutMinutes > 0 ? `${cfg.dispatchTimeoutMinutes} 分钟/次` : '不限时（无限等待）'
+        const lines = [
+          '**Agy 派发守护（dispatch guards）**',
+          `- 硬超时：**${cap}**（重试次数 ${cfg.dispatchRetries}${cfg.dispatchTimeoutMinutes > 0 ? `，总坚持 ≈ ${(1 + cfg.dispatchRetries) * cfg.dispatchTimeoutMinutes} 分钟` : ''}）`,
+          '- 同账号并行：**' + (cfg.parallelSameAccount ? '开（快路径，多会话并行跑同一账号）' : '关（同一时刻仅 1 个 agy 进程）') + '**',
+          `- 并发上限：**${cfg.maxConcurrent > 0 ? cfg.maxConcurrent + ' 个流' : '不限制（原生并发）'}**`,
+          `- 当前凭据槽位队列：**${mutex.waiting} 个等待者 / ${mutex.pending - mutex.waiting} 个持有者**，同账号快路径活跃 **${fastPathRunCount()}** 个`,
+          `- 排队期间：Stop 随时可停；丢失唤醒 5 秒内自愈；每 2 分钟心跳日志`,
+          `- 修改：/agy dispatch <分钟|off>　/agy dispatch-retries <次数>　/agy parallel <on|off>`,
+        ]
+        return ok(lines.join('\n'))
+      }
+      if (sub === 'dispatch') {
+        if (arg === 'off' || arg === '0') {
+          deps.setOverride('dispatchTimeoutMinutes', 0)
+          return ok('派发硬超时已关闭：排队将无限等待（仍然 Stop 可停、轮询自愈、心跳可见）。')
+        }
+        const minutes = Number(arg)
+        if (!Number.isFinite(minutes) || minutes <= 0 || !Number.isInteger(minutes)) {
+          return err('usage: /agy dispatch <分钟数|off>')
+        }
+        deps.setOverride('dispatchTimeoutMinutes', minutes)
+        return ok(
+          `派发硬超时设为 **${minutes} 分钟/次**（含 ${cfg.dispatchRetries} 次重试，总坚持 ≈ ${(1 + cfg.dispatchRetries) * minutes} 分钟）— 下一个回合生效。`,
+        )
+      }
+      const retries = Number(arg)
+      if (!Number.isFinite(retries) || retries < 0 || !Number.isInteger(retries) || retries > 10) {
+        return err('usage: /agy dispatch-retries <0-10>')
+      }
+      deps.setOverride('dispatchRetries', retries)
+      const cap = cfg.dispatchTimeoutMinutes > 0 ? `，总坚持 ≈ ${(1 + retries) * cfg.dispatchTimeoutMinutes} 分钟` : ''
+      return ok(`派发重试次数设为 **${retries}**${cap} — 下一个回合生效。`)
+    }
+    if (sub === 'parallel') {
+      if (arg !== 'on' && arg !== 'off') {
+        return err('usage: /agy parallel <on|off>')
+      }
+      const on = arg === 'on'
+      deps.setOverride('parallelSameAccount', on)
+      return ok(
+        on
+          ? '同账号并行已**开启**：同一账号的多个会话立即并行跑 agy（无需独占凭据槽位），仅账号切换时串行 — 下一个回合生效。'
+          : '同账号并行已**关闭**：恢复同一时刻仅 1 个 agy 进程（全串行）— 下一个回合生效。',
+      )
+    }
+    if (sub === 'max-concurrent') {
+      if (arg === 'off' || arg === '0') {
+        deps.setOverride('maxConcurrent', 0)
+        return ok('并发上限已移除：**不限制**（原生 agy 并发，Google 速率与账号冷却为天然调节）— 下一个回合生效。')
+      }
+      const n = Number(arg)
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > 64) {
+        return err('usage: /agy max-concurrent <1-64|off>')
+      }
+      deps.setOverride('maxConcurrent', n)
+      return ok(`并发上限设为 **${n}** 个请求流 — 下一个回合生效。`)
     }
     if (sub === 'workspace') {
       if (arg === '') return ok('Current workspace: ' + (deps.cfg().workspaceRoot !== '' ? deps.cfg().workspaceRoot : '(session cwd / process cwd)'))

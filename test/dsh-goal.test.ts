@@ -58,6 +58,68 @@ test('detectGoalContext extracts goal context from bare text <goal_round>', () =
   assert.equal(ctx.revision, 1)
 })
 
+// Verbatim shape of DSH's real round prompt (@deepseek-ai/dsh-goal-round-driver
+// renderGoalRoundPrompt). Its prose contains "goal-tool policy" and the
+// <goal_round> tag — a loose /goal-[A-Za-z0-9_-]+/ id scan once turned that
+// prose into goalId "goal-tool", so every synthesized update_goal missed and
+// the driver queued round after round (the 2026-10-16 cardboard-empire loop).
+const REAL_ROUND_PROMPT = `<goal_round>
+Objective: "按照你说的建议全部实施 并验证"
+Round: 1/256
+
+Continue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal, and mark it complete. If work remains, leave the goal active for the next round. Follow the configured goal-tool policy before reporting a blocker.
+</goal_round>`
+
+test('detectGoalContext prefers the source goalId over round-prompt prose', () => {
+  const messages: Message[] = [
+    {
+      role: 'user',
+      content: [{ type: 'text', text: REAL_ROUND_PROMPT }],
+      source: {
+        kind: 'goal',
+        goalId: 'goal-3fe686a1-0298-4a5a-88dd-670562821182',
+        revision: 1,
+        round: 1,
+      },
+    } as unknown as Message,
+  ]
+
+  const ctx = detectGoalContext(messages)
+  assert.ok(ctx, 'Should detect goal context')
+  assert.equal(ctx.goalId, 'goal-3fe686a1-0298-4a5a-88dd-670562821182')
+  assert.notEqual(ctx.goalId, 'goal-tool')
+  assert.equal(ctx.revision, 1)
+  assert.equal(ctx.round, 1)
+  assert.equal(ctx.maxRounds, 256)
+  assert.equal(ctx.objective, '按照你说的建议全部实施 并验证')
+})
+
+test('detectGoalContext never invents "goal-tool" from round-prompt prose', () => {
+  const messages: Message[] = [
+    { role: 'user', content: [{ type: 'text', text: REAL_ROUND_PROMPT }] } as unknown as Message,
+  ]
+
+  const ctx = detectGoalContext(messages)
+  assert.ok(ctx, 'Round prompt alone still marks a goal round')
+  assert.notEqual(ctx.goalId, 'goal-tool', 'prose words must not become the goal id')
+  assert.equal(ctx.goalId, undefined, 'without source or an id: field the bridge must defer to the host-side lookup')
+  assert.equal(ctx.round, 1)
+  assert.equal(ctx.maxRounds, 256)
+})
+
+test('detectGoalContext accepts a UUID-shaped goal id embedded in text', () => {
+  const messages: Message[] = [
+    {
+      role: 'user',
+      content: `<goal_round>\nObjective: "Do it"\nRound: 2/9\nid: goal-0f4c9e2a-11b2-4c33-9d00-52aa10bb77e1\n</goal_round>`,
+    } as unknown as Message,
+  ]
+
+  const ctx = detectGoalContext(messages)
+  assert.ok(ctx)
+  assert.equal(ctx.goalId, 'goal-0f4c9e2a-11b2-4c33-9d00-52aa10bb77e1')
+})
+
 test('detectGoalContext returns null for non-goal conversations', () => {
   const messages: Message[] = [
     {
@@ -110,6 +172,20 @@ test('isGoalToolContinuation recognizes agytc-bridge-goal callId', () => {
     } as unknown as Message,
   ]
   assert.equal(isGoalToolContinuation(goalBridgeTool), true)
+
+  const deferredGoalComplete: Message[] = [
+    {
+      role: 'tool',
+      toolCallId: 'agytc-bridge-goal-123-1',
+      content: '{"ok":true}',
+    } as unknown as Message,
+    {
+      role: 'user',
+      content: '<goal_complete>\nObjective: "Test"\nThe goal is marked complete.',
+      source: { kind: 'tool-goal', form: 'notice' },
+    } as unknown as Message,
+  ]
+  assert.equal(isGoalToolContinuation(deferredGoalComplete), true)
 })
 
 test('isPlanToolContinuation recognizes agytc-bridge-plan callId', () => {

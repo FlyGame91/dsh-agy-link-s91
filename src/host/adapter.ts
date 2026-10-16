@@ -19,7 +19,7 @@ import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
 import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin, stripNulBytes } from './runner.ts'
 import { detectSystemProxy } from './wincred.ts'
-import { acquireCredentialSlot, SlotUnavailableError } from './credential-slot.ts'
+import { AbortedWaitError, WaitTimeoutError, acquireCredentialSlot, credentialSlotMutex, SlotUnavailableError } from './credential-slot.ts'
 import { agyHomeDirFor, readAgyRunLogText, snapshotAgyLogs } from './agy-log.ts'
 import { stateDir } from '../common/config.ts'
 import { SENT_IMAGE_IDS_MAX, type SessionStore } from './sessions.ts'
@@ -136,6 +136,7 @@ export function isSyntheticHarnessMessage(m: Message): boolean {
       kind === 'model-selection' ||
       kind === 'system-reminder' ||
       kind === 'dsh-session-title-llm' ||
+      kind === 'tool-goal' ||
       kind === 'synthetic'
     ) {
       return true
@@ -151,6 +152,7 @@ export function isSyntheticHarnessMessage(m: Message): boolean {
     text.startsWith('Current runtime context') ||
     text.startsWith('[model changed:') ||
     text.startsWith('[conversation so far]') ||
+    text.startsWith('<goal_complete>') ||
     text.startsWith('A skill is a reusable set of task-specific instructions')
   ) {
     return true
@@ -748,12 +750,16 @@ export class AgyAdapter extends LlmAdapter {
       return
     }
 
-    const goalContext = detectGoalContext(options.messages)
-    if (goalContext && (!goalContext.goalId || goalContext.revision === undefined) && sessionKey && this.deps.sessionGoal) {
+    let goalContext = detectGoalContext(options.messages)
+    if ((!goalContext || !goalContext.goalId || goalContext.revision === undefined) && sessionKey && this.deps.sessionGoal) {
       const sg = this.deps.sessionGoal(sessionKey)
       if (sg) {
-        if (!goalContext.goalId) goalContext.goalId = sg.goalId
-        if (goalContext.revision === undefined) goalContext.revision = sg.revision
+        if (!goalContext) {
+          goalContext = { goalId: sg.goalId, revision: sg.revision }
+        } else {
+          if (!goalContext.goalId) goalContext.goalId = sg.goalId
+          if (goalContext.revision === undefined) goalContext.revision = sg.revision
+        }
       }
     }
     const supportsGoalUpdate = Boolean(options.tools?.some((t) => t.name === 'update_goal'))
@@ -853,7 +859,19 @@ export class AgyAdapter extends LlmAdapter {
       if (this.requestTimestamps.length >= cfg.rateLimitPerMinute) {
         const delayMs = this.requestTimestamps[0]! + 60_000 - now
         if (delayMs > 0) {
-          await new Promise((r) => setTimeout(r, delayMs))
+          // Abort-aware: a Stop during the rate-limit sleep must end the turn,
+          // not silently finish the sleep and spawn anyway.
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              options.signal?.removeEventListener('abort', onAbort)
+              resolve()
+            }, delayMs)
+            const onAbort = () => {
+              clearTimeout(timer)
+              reject(new LlmError('aborted during rate-limit spacing', Err.AGY_ERROR))
+            }
+            options.signal?.addEventListener('abort', onAbort, { once: true })
+          })
         }
       }
       this.requestTimestamps.push(Date.now())
@@ -1412,33 +1430,127 @@ export class AgyAdapter extends LlmAdapter {
         })
       : argsBase
     const stdinPayload = promptViaStdin ? buildStreamInputLine(prompt) : undefined
-    const release = await this.deps.acquire(options.signal)
+    // ---- dispatch phase: concurrency slot → credential slot → (spawn) ----
+    //
+    // 2026-10-16 zombie-turn incident: a request queued for the credential
+    // slot while another session held it, the queue wake-up was lost, and the
+    // turn pended FOREVER — no process, no watchdog (those arm only after
+    // spawn), and Stop did nothing because nothing in the wait observed the
+    // abort signal. Three defenses live in this block now:
+    //   1. the credential-slot wait is abort-aware (Stop works) and polls for
+    //      liveness (a lost wake-up self-heals within seconds);
+    //   2. a heartbeat logs the queue state every few minutes, so a stuck
+    //      dispatch is VISIBLE instead of a silent spinner;
+    //   3. an optional hard cap (dispatchTimeoutMinutes) turns a still-stuck
+    //      dispatch into a release → backoff → retry cycle, and finally into a
+    //      VISIBLE turn failure — never a silent infinite wait.
+    const dispatchHardCapMs = cfg.dispatchTimeoutMinutes > 0 ? cfg.dispatchTimeoutMinutes * 60_000 : 0
+    const dispatchStartedAt = Date.now()
+    const DISPATCH_HEARTBEAT_MS = 2 * 60_000
+    let dispatchHeartbeat: NodeJS.Timeout | null = null
+    const stopDispatchHeartbeat = (): void => {
+      if (dispatchHeartbeat !== null) {
+        clearInterval(dispatchHeartbeat)
+        dispatchHeartbeat = null
+      }
+    }
+    const startDispatchHeartbeat = (): void => {
+      if (dispatchHeartbeat !== null) return
+      dispatchHeartbeat = setInterval(() => {
+        const mins = Math.max(1, Math.round((Date.now() - dispatchStartedAt) / 60_000))
+        const mutex = credentialSlotMutex
+        this.deps.log?.(
+          'agy dispatch still waiting: ' + mins + 'm — credential slot queue: ' + mutex.waiting +
+          ' waiter(s), ' + (mutex.pending - mutex.waiting) + ' holder(s) (another session may be running a long agy tool)' +
+          ' — the turn is waiting for the slot; press Stop to cancel',
+        )
+      }, DISPATCH_HEARTBEAT_MS)
+      dispatchHeartbeat.unref?.()
+    }
+    const dispatchSleep = async (ms: number): Promise<void> => {
+      if (options.signal?.aborted) throw new LlmError('request aborted during dispatch backoff', Err.AGY_ERROR)
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          options.signal?.removeEventListener('abort', onAbort)
+          resolve()
+        }, ms)
+        const onAbort = () => {
+          clearTimeout(timer)
+          reject(new LlmError('request aborted during dispatch backoff', Err.AGY_ERROR))
+        }
+        options.signal?.addEventListener('abort', onAbort, { once: true })
+      })
+    }
+    let release: (() => void) | null = null
     let released = false
     let slotLease: Awaited<ReturnType<typeof acquireCredentialSlot>>
+    let granted = false
+    let dispatchBackoffMs = 2_000
+    const maxDispatchAttempts = 1 + Math.max(0, cfg.dispatchRetries)
     try {
-      // Windows has ONE process-global credential slot that every agy process
-      // reads. Ownership is serialized for the whole run and only handed over
-      // when it can provably be handed back. This throws instead of signing in
-      // as the wrong account, which would silently spend that account's quota.
-      //
-      // Never engage the real Credential Manager from a test run: node:test
-      // sets NODE_TEST_CONTEXT, and the fake-agy pool tests build accounts that
-      // do not own the machine's system login (handing those over would write
-      // test credentials into the developer's real slot). Their credential-slot
-      // unit tests inject a fake IO and still exercise the handoff directly.
-      slotLease = process.env.NODE_TEST_CONTEXT === undefined
-        ? await acquireCredentialSlot(account ?? undefined, this.deps.pool, {
-            baseDir: this.deps.pool?.dir,
-            proxyUrl: account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined,
-            log: (msg) => this.deps.log?.(msg),
-          })
-        : undefined
+      for (let attempt = 1; attempt <= maxDispatchAttempts && !granted; attempt++) {
+        try {
+          release = await this.deps.acquire(options.signal)
+          startDispatchHeartbeat()
+          // Windows has ONE process-global credential slot that every agy
+          // process reads. Ownership is serialized for the whole run and only
+          // handed over when it can provably be handed back. This throws
+          // instead of signing in as the wrong account, which would silently
+          // spend that account's quota.
+          //
+          // Never engage the real Credential Manager from a test run: node:test
+          // sets NODE_TEST_CONTEXT, and the fake-agy pool tests build accounts that
+          // do not own the machine's system login (handing those over would write
+          // test credentials into the developer's real slot). Their credential-slot
+          // unit tests inject a fake IO and still exercise the handoff directly.
+          slotLease = process.env.NODE_TEST_CONTEXT === undefined
+            ? await acquireCredentialSlot(account ?? undefined, this.deps.pool, {
+                baseDir: this.deps.pool?.dir,
+                proxyUrl: account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined,
+                log: (msg) => this.deps.log?.(msg),
+                signal: options.signal,
+                dispatchTimeoutMs: dispatchHardCapMs,
+                parallel: cfg.parallelSameAccount,
+              })
+            : undefined
+          granted = true
+        } catch (e) {
+          // Return the concurrency slot before deciding: a retry re-acquires.
+          release?.()
+          release = null
+          if (e instanceof AbortedWaitError) {
+            throw new LlmError('request aborted while waiting for the agy credential slot', Err.AGY_ERROR)
+          }
+          if (e instanceof WaitTimeoutError) {
+            // The slot never arrived within the hard cap. Retry if allowed,
+            // otherwise fail the turn VISIBLY — never park it silently.
+            if (attempt < maxDispatchAttempts) {
+              this.deps.log?.(
+                'agy dispatch attempt ' + attempt + '/' + maxDispatchAttempts + ' timed out after ' +
+                cfg.dispatchTimeoutMinutes + 'm waiting for the credential slot — releasing and retrying in ' +
+                Math.round(dispatchBackoffMs / 1000) + 's',
+              )
+              stopDispatchHeartbeat()
+              await dispatchSleep(dispatchBackoffMs)
+              dispatchBackoffMs = Math.min(dispatchBackoffMs * 2, 15_000)
+              continue
+            }
+            throw new LlmError(
+              'could not take the agy credential slot within ' + cfg.dispatchTimeoutMinutes +
+              'm (another run may be wedged holding it). Check the console for the dispatch heartbeat, restart DSH if a run is truly stuck.',
+              Err.TIMEOUT,
+            )
+          }
+          const detail = e instanceof SlotUnavailableError ? e.message : brief(String(e))
+          throw new LlmError(detail, Err.AGY_ERROR)
+        }
+      }
     } catch (e) {
-      release()
+      stopDispatchHeartbeat()
       this.clearInFlightPrompt(sessionKey, prompt)
-      const detail = e instanceof SlotUnavailableError ? e.message : brief(String(e))
-      throw new LlmError(detail, Err.AGY_ERROR)
+      throw e
     }
+    stopDispatchHeartbeat()
     const releaseOnce = (): void => {
       if (released) return
       released = true
@@ -1447,7 +1559,8 @@ export class AgyAdapter extends LlmAdapter {
       } catch {
         // best-effort
       }
-      release()
+      release?.()
+      release = null
     }
     // The acquire→spawn window can be arbitrarily long (all slots busy on
     // long tool runs). Two failure shapes used to leak permanently:

@@ -599,6 +599,42 @@ test('EventMapper emits update_goal tool-call when in goal continuation round', 
   assert.equal(fin.reason.kind, 'tool-calls')
 })
 
+test('EventMapper emits update_goal tool-call even when result envelope ok: false has non-empty response', () => {
+  const m = new EventMapper({
+    runId: 'r_goal_err',
+    cutOnTool: true,
+    supportsGoalUpdate: true,
+    goalContext: {
+      goalId: 'goal-failover',
+      revision: 1,
+      round: 1,
+    },
+  })
+
+  const chunks = mapAll(m, [
+    { kind: 'init', conversationId: 'c1' },
+    { kind: 'step', stepKey: '1', stepKind: 'text', text: 'Work is finished!' },
+    {
+      kind: 'result',
+      conversationId: 'c1',
+      ok: false,
+      response: 'Work is finished!',
+      error: 'API error: EOF',
+      usage: {},
+    },
+  ])
+
+  const tc = chunks.find((c) => c.type === 'block-end' && (c as { block?: { type: string; name: string } }).block?.name === 'update_goal') as any
+  assert.ok(tc, 'Should emit update_goal tool-call despite ok: false')
+  const args = JSON.parse(tc.block.arguments)
+  assert.equal(args.goal_id, 'goal-failover')
+  assert.equal(args.revision, 1)
+  assert.equal(args.action, 'complete')
+
+  const fin = chunks.find((c) => c.type === 'finish') as any
+  assert.equal(fin.reason.kind, 'tool-calls')
+})
+
 test('EventMapper emits exit_plan_mode tool-call when in plan mode', () => {
   const m = new EventMapper({
     runId: 'r_plan',

@@ -311,12 +311,19 @@ const modalHostManager = {
  */
 function formatQuotaWindow(t: (key: AgyLocaleKey) => string, resetTimeStr?: string): {
 	resetText: string;
+	/** resetTime exists but is already in the past (window has rolled over). */
+	expired: boolean;
 } {
-	if (!resetTimeStr) return { resetText: '' };
+	if (!resetTimeStr) return { resetText: '', expired: false };
 	try {
 		const d = new Date(resetTimeStr);
 		const diffMs = d.getTime() - Date.now();
-		if (diffMs <= 0) return { resetText: '' };
+		// A stale (already passed) resetTime means the window has ROLLED OVER —
+		// the backend keeps reporting the previous boundary once the quota is
+		// back at 100%, and a countdown into the past would be nonsense. Hide
+		// the time but tell the caller so it can say "已重置" instead of a
+		// mysterious blank (2026-10-16: every full 5h row lost its ↻ note).
+		if (Number.isNaN(d.getTime()) || diffMs <= 0) return { resetText: '', expired: true };
 
 		const totalMins = Math.ceil(diffMs / 60000);
 		const days = Math.floor(totalMins / 1440);
@@ -333,9 +340,9 @@ function formatQuotaWindow(t: (key: AgyLocaleKey) => string, resetTimeStr?: stri
 			? `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm} (${countdown})`
 			: `${hh}:${mm} (${countdown})`;
 
-		return { resetText };
+		return { resetText, expired: false };
 	} catch {
-		return { resetText: '' };
+		return { resetText: '', expired: true };
 	}
 }
 
@@ -1304,11 +1311,16 @@ export function apply(ctx: ClientContext): void {
 			// empty). Surface it as a note next to the reset time instead.
 			const cdNote = inCooldown ? t('account.localCooldown') : '';
 			const w5h = formatQuotaWindow(t, info?.resetTime);
+			// Full-quota rows: the backend keeps the LAST window's resetTime, so
+			// the row would go silently blank. When the time has expired but the
+			// fraction is full, say "已重置" instead — the quota is usable now.
+			const expiredFull5h = w5h.expired && has5h && pct5h >= 100;
 
 			// Weekly limit
 			const hasWeekly = typeof info?.weeklyFraction === 'number' && Number.isFinite(info.weeklyFraction);
 			const pctWeekly = hasWeekly ? Math.max(0, Math.min(100, Math.round(info!.weeklyFraction! * 100))) : -1;
 			const wWeekly = formatQuotaWindow(t, info?.weeklyResetTime);
+			const expiredFullWeekly = wWeekly.expired && hasWeekly && pctWeekly >= 100;
 
 			const getColors = (pct: number) => {
 				if (pct < 0) {
@@ -1385,8 +1397,8 @@ export function apply(ctx: ClientContext): void {
 				),
 				// Argon is a WEEKLY-only counter today: render the 5h row only when
 				// the backend actually reports one, never as a permanent "—" ghost.
-				(familyKey !== 'argon' || has5h) ? renderLine(t('quota.fiveHour'), pct5h, c5h, w5h.resetText ? w5h.resetText + cdNote : cdNote.replace(/^ · /, '')) : null,
-				renderLine(t('quota.weekly'), pctWeekly, cWeekly, wWeekly.resetText),
+				(familyKey !== 'argon' || has5h) ? renderLine(t('quota.fiveHour'), pct5h, c5h, w5h.resetText ? w5h.resetText + cdNote : expiredFull5h ? t('quota.windowReset') + cdNote : cdNote.replace(/^ · /, '')) : null,
+				renderLine(t('quota.weekly'), pctWeekly, cWeekly, wWeekly.resetText ? wWeekly.resetText : expiredFullWeekly ? t('quota.windowReset') : ''),
 			);
 		};
 

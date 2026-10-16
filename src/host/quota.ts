@@ -43,6 +43,7 @@ export function mergeFallbackFamilyQuota(
   return fallback
 }
 
+
 export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
   const logDir = join(homeDir, '.gemini', 'antigravity-cli', 'log')
   if (!existsSync(logDir)) return undefined
@@ -663,7 +664,9 @@ export class QuotaService {
           body: JSON.stringify({}),
         }, proxyUrl)
         if (res.ok) {
-          this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
+          if (AGY_ENDPOINTS.indexOf(endpoint) === 0) {
+            this.preferredEndpointIndex = 0
+          }
           return (await res.json()) as DiscoveredModelsResponse
         }
         if (res.status === 401 || res.status === 403) {
@@ -886,13 +889,16 @@ export class QuotaService {
             resetTime,
             updatedAt: now,
           })
-        } else if (familyQuotas[fam]!.remainingFraction === undefined) {
+        } else {
           const curRemaining = familyQuotas[fam]!.remainingFraction ?? 1
-          if (remaining < curRemaining) {
-            familyQuotas[fam]!.remainingFraction = remaining
-            familyQuotas[fam]!.resetTime = resetTime
-          } else if (remaining === curRemaining) {
-            if (resetTime && (!familyQuotas[fam]!.resetTime || Date.parse(resetTime) > Date.parse(familyQuotas[fam]!.resetTime!))) {
+          const fbReset = resetTime ? Date.parse(resetTime) : NaN
+          const is5hWindow = !Number.isNaN(fbReset) && (fbReset - now <= 6 * 3600_000)
+          if (familyQuotas[fam]!.remainingFraction === undefined || is5hWindow) {
+            if (remaining < curRemaining) {
+              familyQuotas[fam]!.remainingFraction = remaining
+              familyQuotas[fam]!.resetTime = resetTime
+            } else if (familyQuotas[fam]!.remainingFraction === undefined) {
+              familyQuotas[fam]!.remainingFraction = remaining
               familyQuotas[fam]!.resetTime = resetTime
             }
           }

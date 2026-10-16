@@ -651,3 +651,63 @@ test('accounts without Argon access carry no argon quota entry (UI hides the row
   assert.equal(pool.getAccount(acc.id)!.quotas.argon, undefined, 'argon row must stay hidden for this account')
 })
 
+test('active 5h consumption in model discovery tightens coarse summary 5h quota', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-tighten-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('tighten-user')
+
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.tighten', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  const now = Date.now()
+  const active5hReset = new Date(now + 15 * 60_000).toISOString() // 15 mins away (active 5h consumption)
+  const summary5hReset = new Date(now + 5 * 3600_000).toISOString() // 5 hours away
+  const weeklyReset = new Date(now + 3 * 24 * 3600_000).toISOString()
+
+  class TightenService extends QuotaService {
+    override async fetchUserInfo() {
+      return { email: 'tighten@gmail.com' }
+    }
+    override async fetchQuotaSummary() {
+      return {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            description: 'Models within this group: Gemini Flash, Gemini Pro',
+            buckets: [
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1.0, resetTime: summary5hReset },
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.8, resetTime: weeklyReset },
+            ],
+          },
+        ],
+      } as never
+    }
+    override async fetchAvailableModels() {
+      return {
+        models: {
+          'gemini-3.8-flash': {
+            displayName: 'Gemini 3.8 Flash',
+            quotaInfo: { remainingFraction: 0.72, resetTime: active5hReset },
+          },
+        },
+      } as never
+    }
+  }
+
+  const svc = new TightenService(pool)
+  const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+  assert.ok(quotas)
+  // Even though summary reported 1.0 (coarse), model discovery tightened it to 0.72!
+  assert.equal(quotas.google?.remainingFraction, 0.72)
+  assert.equal(quotas.google?.resetTime, active5hReset)
+  // Weekly limit from summary is preserved.
+  assert.equal(quotas.google?.weeklyFraction, 0.8)
+  assert.equal(quotas.google?.weeklyResetTime, weeklyReset)
+})
+
+

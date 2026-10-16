@@ -64,14 +64,21 @@ function resolveAssetDir(): string {
   return join(currentDir, 'assets')
 }
 
-/** Cross-session concurrency limiter (ADR-12). */
+/** Cross-session concurrency limiter (ADR-12). max() <= 0 means unlimited. */
 class Semaphore {
   private active = 0
   private queue: Array<() => void> = []
   constructor(private readonly max: () => number) {}
   async acquire(signal?: AbortSignal): Promise<() => void> {
     if (signal?.aborted) throw new Error('aborted before semaphore acquisition')
-    if (this.active < Math.max(1, this.max())) {
+    const limit = this.max()
+    if (limit <= 0) {
+      // Unlimited: native agy concurrency — Google rate limits and the
+      // account pool's cooldowns are the natural regulators.
+      this.active++
+      return () => this.releaseOne()
+    }
+    if (this.active < limit) {
       this.active++
       return () => this.releaseOne()
     }
@@ -259,14 +266,44 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       return sessions?.get(sessionId)?.header?.cwd
     },
     sessionGoal: (sessionId) => {
-      const sessions = (ctx.get('sessions') as { get(id: unknown): { events?: readonly { type: string; data?: unknown }[] } | undefined } | undefined)
-        ?? (ctx as unknown as { sessions?: { get(id: unknown): { events?: readonly { type: string; data?: unknown }[] } } }).sessions
+      try {
+        const agents = (ctx.get('agents') as { get(id: unknown): unknown } | undefined)
+          ?? (ctx as unknown as { agents?: { get(id: unknown): unknown } }).agents
+        const goals = (ctx.get('goals') as { get(agent: unknown): { id?: string; revision?: number; phase?: string; activation?: string } | undefined } | undefined)
+          ?? (ctx as unknown as { goals?: { get(agent: unknown): { id?: string; revision?: number; phase?: string; activation?: string } | undefined } }).goals
+        const agent = agents?.get(sessionId)
+        if (agent && goals) {
+          const g = goals.get(agent)
+          // Only volunteer a completion target for a goal the driver would
+          // actually keep driving: active AND armed. A paused or blocked goal
+          // is under direct human control — synthesizing update_goal(complete)
+          // for it would override the user's explicit pause.
+          if (g?.id && g.phase === 'active' && (g.activation === undefined || g.activation === 'armed')) {
+            return {
+              goalId: g.id,
+              revision: typeof g.revision === 'number' ? g.revision : 1,
+            }
+          }
+        }
+      } catch {
+        // Fallback to inspecting session log below
+      }
+
+      type SessionWithEvents = {
+        log?: readonly { type: string; data?: unknown }[]
+        snapshotEvents?(): readonly { type: string; data?: unknown }[]
+        ownEvents?(): readonly { type: string; data?: unknown }[]
+        events?: readonly { type: string; data?: unknown }[]
+      }
+      const sessions = (ctx.get('sessions') as { get(id: unknown): SessionWithEvents | undefined } | undefined)
+        ?? (ctx as unknown as { sessions?: { get(id: unknown): SessionWithEvents | undefined } }).sessions
       const session = sessions?.get(sessionId)
-      if (!session?.events) return null
-      for (let i = session.events.length - 1; i >= 0; i--) {
-        const ev = session.events[i]
+      const evs = session?.snapshotEvents?.() ?? session?.ownEvents?.() ?? session?.log ?? session?.events
+      if (!evs) return null
+      for (let i = evs.length - 1; i >= 0; i--) {
+        const ev = evs[i]
         if (ev?.type === 'goal/change' && ev.data && typeof ev.data === 'object') {
-          const d = ev.data as { operation?: string; goal?: { id?: string; revision?: number } }
+          const d = ev.data as { operation?: string; goal?: { id?: string; revision?: number }; cleared?: { id?: string } }
           if (d.operation === 'clear') return null
           if (d.goal?.id) {
             return {

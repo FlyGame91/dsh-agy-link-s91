@@ -409,11 +409,10 @@ export class EventMapper {
     // result
     if (!ev.ok) {
       // agy reports status=ERROR even when a usable response exists (e.g. a
-      // tool timed out mid-run). Keep the answer, surface the error as a
-      // reasoning annotation, and finish normally. A bare error with no
-      // response stays passive here — the adapter owns terminal failures
-      // (auth / process / invalid-output) and reads the envelope error from
-      // the parser.
+      // tool timed out mid-run or network closed after generation). Keep the answer,
+      // surface the error as a reasoning annotation, and finish normally. A bare error
+      // with no response stays passive here — the adapter owns terminal failures
+      // (auth / process / invalid-output) and reads the envelope error from the parser.
       if (ev.response === '') return
       if (!this.sawTextStep) {
         yield* this.ensureBlock('text')
@@ -425,18 +424,7 @@ export class EventMapper {
         const d = this.appendDelta('[agy finished with error] ' + ev.error + '\n')
         if (d) yield d
       }
-      const closeErr = this.closeOpen()
-      if (closeErr) yield closeErr
-      yield { type: 'usage', usage: usageFromRaw(this.opts.usage?.finalUsage(ev.usage) ?? ev.usage) }
-      yield {
-        type: 'finish',
-        reason: { kind: 'stop' },
-        ...(ev.conversationId !== '' ? { replayState: { response: { conversationId: ev.conversationId } } } : {}),
-      }
-      this.finished = true
-      return
-    }
-    if (!this.sawTextStep && ev.response !== '') {
+    } else if (!this.sawTextStep && ev.response !== '') {
       yield* this.ensureBlock('text')
       const d = this.appendDelta(ev.response)
       if (d) yield d
@@ -447,7 +435,7 @@ export class EventMapper {
 
     // If running in a DSH goal continuation round and DSH provided the update_goal tool:
     // Emit a synthetic update_goal call to mark the goal complete and prevent infinite loop continuation rounds.
-    if (this.opts.supportsGoalUpdate && this.opts.goalContext?.goalId) {
+    if (this.opts.supportsGoalUpdate && this.opts.goalContext) {
       for (const ch of buildGoalCompleteToolCallBlock(this.opts.goalContext, this.blockIdx)) yield ch
       this.blockIdx++
       yield {

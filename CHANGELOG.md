@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.4.59 (2026-10-16)
+
+### English
+
+- **Fix: turns queued for the Windows credential slot could pend forever as invisible zombies, immune to Stop (cardboard-empire incident, 2026-10-16 22:44).**
+  - **Incident**: a turn dispatched while another session's 32-minute run held the process-global credential slot never received the release wake-up. The turn sat at `request/context` with no agy process spawned for 30+ minutes; the idle watchdog never armed (it only arms after spawn); Stop did nothing because no wait in the dispatch phase observed the abort signal; and the leaked dispatch held one of the 3 `maxConcurrent` slots, starving later turns of other sessions into the same wedge.
+  - **Changes**:
+    1. **`AsyncMutex` rewrite** (`credential-slot.ts`): the promise-chain FIFO could never remove a waiter — an abandoned/aborted one would wedge the whole chain behind it. Now an explicit queue: a cancelled or timed-out waiter is REMOVED and the holder's release wakes the head directly. Cancelling a waiter deliberately does NOT grant the mutex (it is still held).
+    2. **Abort + bounded wait for the slot** (`acquireCredentialSlot`): new `signal` / `dispatchTimeoutMs` resolve-options. Stop now ends a queued dispatch immediately (`AbortedWaitError`); a bounded wait fails visibly (`WaitTimeoutError`) instead of parking silently.
+    3. **Lost-wake-up self-heal**: while queued, a liveness poll (5s) re-checks and takes the mutex directly if it is actually free — the exact failure shape from the incident now self-corrects within seconds even if a wake-up is ever lost again.
+    4. **Dispatch observability**: a 2-minute heartbeat logs the queue state ("dispatch still waiting Nm — X waiter(s), Y holder(s) … press Stop to cancel") so a stuck dispatch is visible in the console instead of a silent spinner.
+    5. **Dispatch retry** (`adapter.ts`): on a hard-cap slot timeout the dispatch releases the concurrency slot, backs off abort-aware (2s→4s→…→15s), and retries (`dispatchRetries`, default 1); exhaustion fails the turn VISIBLY with guidance — never an infinite pending state. Retry is confined to the pre-spawn dispatch phase; a turn that already emitted output is never re-driven.
+    6. **Rate-limit spacing sleep** is now abort-aware (Stop during the 60s window no longer spawns a turn nobody is reading).
+  - **Config**: new `dispatchTimeoutMinutes` (default **15** — each attempt waits up to 15 minutes for the slot, so persistence ≈ (1+retries)×15 min before a visible failure; 0 = wait indefinitely, still abort-aware / poll-healed / heartbeat-logged) and `dispatchRetries` (default 1). User-facing entry: `/agy dispatch` (inspect live queue + effective caps), `/agy dispatch <minutes|off>` and `/agy dispatch-retries <n>` — persisted via runtime overrides, effective next turn.
+  - **Fix: artificial concurrency limits removed — native agy parallelism restored.**
+    - agy is a stateless CLI and handles concurrent processes natively; the only machine-global constraint on Windows is the single credential store, and only when its IDENTITY changes.
+    - **Same-account fast path** (`parallelSameAccount`, default **on**): a run whose credential already sits in the slot starts immediately WITHOUT the mutex, so N sessions on one account run truly in parallel (concurrent refreshes on one grant are safe — refresh tokens are not single-use). `/agy parallel <on|off>` toggles it.
+    - **Account switches still serialize** (correctness): a secondary waits for same-account runs to drain before swapping the slot, new fast paths are refused while a switch pends, and the switch restores the primary afterwards — the anti-corruption invariants are unchanged and covered by new tests.
+    - **`maxConcurrent` default 3 → 0 (unlimited)**: no artificial admission bound; Google rate limits and the pool's cooldowns are the natural regulators. `/agy max-concurrent <n|off>`.
+  - **Tests**: mutex cancel-removes-and-wakes-next; timeout keeps the queue flowing; lost-wake-up poll grant; `acquireCredentialSlot` rejects when already aborted, honors Stop while queued, and fails visibly on the bounded wait.
+
+### 中文 (Chinese)
+
+- **修复：排队等 Windows 凭据槽位的回合可能永远挂起成隐形僵尸，且 Stop 无法取消（cardboard-empire 事件，2026-10-16 22:44）。**
+  - **事件**：一个回合在另一会话 32 分钟长任务持有进程级凭据槽位期间派发，之后永远没有收到释放唤醒。该回合停在 `request/context`，30 多分钟没有拉起任何 agy 进程；空闲看门狗从未武装（只在 spawn 后才武装）；按 Stop 无效，因为派发阶段的所有等待都没有观察中止信号；泄漏的派发还占着 3 个 `maxConcurrent` 槽位之一，把其他会话的新回合也拖进同样的卡死。
+  - **修改**：
+    1. **重写 `AsyncMutex`**（credential-slot.ts）：原来的 promise 链式 FIFO 无法移除等待者——一个被放弃/中止的等待者会把整条链卡死。现在改为显式队列：被取消/超时的等待者会被移除，持有者释放时直接唤醒队头。取消等待者刻意不发放互斥锁（锁仍被持有）。
+    2. **槽位等待支持中止与限时**（`acquireCredentialSlot`）：新增 `signal` / `dispatchTimeoutMs` 选项。Stop 现在立即结束排队中的派发（`AbortedWaitError`）；限时等待可见地失败（`WaitTimeoutError`），不再静默挂起。
+    3. **丢失唤醒自愈**：排队期间每 5 秒自检一次，发现锁实际空闲就直接取锁——即使唤醒再次丢失，本事件形态也会在数秒内自愈。
+    4. **派发可观测性**：每 2 分钟心跳记录队列状态（"dispatch still waiting Nm — X waiter(s), Y holder(s) … press Stop to cancel"），卡死的派发在控制台可见，而不是无声转圈。
+    5. **派发重试**（adapter.ts）：槽位硬超时后释放并发槽位、可中止退避（2s→4s→…→15s）并重试（`dispatchRetries`，默认 1）；重试耗尽则让回合可见地失败并给出处理指引——绝不无限 pending。重试仅限 spawn 前的派发阶段；已经产出内容的回合绝不重跑。
+    6. **限流退避 sleep** 支持中止（60 秒窗口内的 Stop 不再照常 spawn 一个没人读的回合）。
+  - **配置**：新增 `dispatchTimeoutMinutes`（默认 **15** —— 每轮最多等 15 分钟，含重试总坚持 ≈ (1+重试)×15 分钟后可见失败；0 = 无限等待，仍可中止/轮询自愈/心跳可见）与 `dispatchRetries`（默认 1）。用户入口：`/agy dispatch`（查看实时队列与当前配置）、`/agy dispatch <分钟|off>` 与 `/agy dispatch-retries <次数>` —— 经 runtime overrides 持久化，下一回合生效。
+  - **修复：移除人为并发限制，恢复 agy 原生并行能力。**
+    - agy 是无状态 CLI，天然支持多进程并发；Windows 上唯一的机器级约束是单一凭据库，且仅在**账号身份切换**时才需要互斥。
+    - **同账号快路径**（`parallelSameAccount`，默认**开**）：凭据已在槽位中的账号立即启动、完全不取互斥锁 —— N 个会话在同一账号上真并行（同一授权的并发 token 刷新是安全的，refresh token 非一次性）。`/agy parallel <on|off>` 开关。
+    - **账号切换仍然串行**（正确性）：副账号先等同账号 run 全部退出再换槽位；切换等待期间拒绝新的快路径；切换完成后恢复主账号 —— 防腐蚀不变量原样保留，新增测试覆盖。
+    - **`maxConcurrent` 默认 3 → 0（不限制）**：移除人为准入上限；Google 速率限制与账号池冷却是天然调节器。`/agy max-concurrent <n|off>`。
+  - **测试**：互斥锁取消后移除并唤醒下一个；超时不阻塞队列；丢失唤醒的轮询补偿；`acquireCredentialSlot` 已中止即拒绝、排队中响应 Stop、限时等待可见失败。
+
+## 0.4.58 (2026-10-16)
+
+- **Fix: DSH `/goal` loop restart bug (autonomous runs continuing indefinitely instead of marking complete).**
+  - **Root Cause**:
+    1. In `src/host/mapper.ts`, whenever an agy run finished with `!ev.ok` (e.g. background EOF/network timeout right as generation finishes), it yielded `{ type: 'finish', reason: { kind: 'stop' } }` and returned early, bypassing the `supportsGoalUpdate` synthetic `update_goal` completion call even when agy generated a full, successful text response. DSH interpreted this as an uncompleted round and scheduled subsequent rounds indefinitely.
+    2. In `src/index.ts`, `sessionGoal` attempted to read `session.events`, but DSH `Session` instances store events in `session.log` / `session.snapshotEvents()`, causing session goal resolution to always return `null`.
+    3. In `src/host/dsh-goal.ts`, `isGoalToolContinuation` only inspected `messages[messages.length - 1]`. When DSH executes `update_goal`, it defers a `<goal_complete>` user notice (`source.kind: 'tool-goal'`), placing the tool result at `messages.length - 2` and causing agy to respawn on the completion notice.
+  - **Fix**:
+    1. `EventMapper.map` now unifies the finish path so `update_goal` and `exit_plan_mode` are always dispatched upon successful response generation regardless of trailing transport EOF flags.
+    2. `sessionGoal` queries DSH's live `ctx.goals.get(agent)` in O(1) and falls back to `session.log` / `session.snapshotEvents()`.
+    3. `isGoalToolContinuation` checks the trailing span for `agytc-bridge-goal-`, `source.kind === 'tool-goal'`, and `<goal_complete>`, finishing cleanly without respawning agy.
+    4. Marked `tool-goal` and `<goal_complete>` as synthetic harness messages so they never get treated as human user instructions.
+
+- **Fix: real-time 5-hour quota consumption and rolling countdown now accurately display instead of staying frozen at 100% / blank.**
+  - **Root Cause**:
+    1. Google's `retrieveUserQuotaSummary` endpoint returns coarse group-level numbers (`gemini-5h: 1.0`), while `fetchAvailableModels` reports the actual per-model 5-hour consumption and active rolling reset time (e.g. `0.70`, reset in 12 minutes). `QuotaService.refreshAccountQuota` gated the per-model tightening behind `else if (familyQuotas[fam]!.remainingFraction === undefined)`, so whenever the coarse summary returned `1.0`, active model usage was completely ignored and the family quota was locked at `100%`.
+    2. In `fetchAvailableModels`, hitting any staging endpoint (`daily-cloudcode-pa`) set `this.preferredEndpointIndex`, causing subsequent `retrieveUserQuotaSummary` calls to target the staging endpoint (which omits Gemini entirely).
+    3. `mergeFallbackFamilyQuota` returned stale `prev` data whenever `prev.remainingFraction` existed, freezing accounts at their 10:04 AM state (`resetTime` in the past), which caused `formatQuotaWindow` to drop the expired timestamp as empty and render no duration at all.
+  - **Fix**:
+    1. `fetchAvailableModels` now only sets `preferredEndpointIndex` if the endpoint is the official production endpoint (index 0).
+    2. Active 5-hour model consumption (window <= 6h) now tightens `familyQuotas[fam].remainingFraction` and its `resetTime` even when summary returned a coarse `1.0`.
+    3. Full-quota rows where `resetTime` has expired safely fall back to "已重置 · 可用" instead of a blank row, while active windows display the real rolling countdown (e.g. `↻ 02:50 (4小时 55分钟)`).
+
 ## 0.4.57 (2026-10-16)
 
 ### English

@@ -165,35 +165,178 @@ export function accountTokenFilePath(account: ManagedAccount, homeDir: string): 
 /**
  * FIFO async mutex. One instance guards the single Windows credential slot;
  * holding it across an entire agy run is what makes the handoff safe.
+ *
+ * The original implementation chained promises (`tail.then(gate)`), which is
+ * FIFO but structurally unable to remove a waiter: a turn abandoned or aborted
+ * while queued stayed in the chain forever, and if its gate was never resolved
+ * every later waiter wedged with it (the 2026-10-16 cardboard-empire zombie
+ * turn: queued 30+ minutes past the slot's release, immune to Stop, because
+ * nothing observed the wait). This rewrite keeps an explicit queue so a
+ * cancelled or timed-out waiter is REMOVED and the next waiter is woken in its
+ * place, and the wait is guarded by a short poll that re-checks liveness — a
+ * lost wakeup can no longer park a turn silently.
  */
 export class AsyncMutex {
-  private tail: Promise<void> = Promise.resolve()
-  private depth = 0
+  private holders = 0
+  private readonly queue: Array<() => void> = []
 
   /** Number of holders plus waiters; 0 means the mutex is free. */
   get pending(): number {
-    return this.depth
+    return this.holders + this.queue.length
   }
 
-  async acquire(): Promise<() => void> {
-    this.depth += 1
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const previous = this.tail
-    this.tail = previous.then(
-      () => gate,
-      () => gate,
-    )
-    await previous
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      this.depth -= 1
-      release()
+  /** Waiters currently queued behind the holder(s). */
+  get waiting(): number {
+    return this.queue.length
+  }
+
+  /**
+   * Acquire the mutex.
+   *
+   * @param opts.signal  cancel the wait (the waiter is removed and the next
+   *   one is woken); rejects with `AbortedWaitError`
+   * @param opts.timeoutMs  bound the wait; rejects with `WaitTimeoutError`
+   * @param opts.pollMs  liveness self-check interval while queued (0 = off).
+   *   The poll re-checks `shouldProceed` — a hook that lets the caller verify
+   *   the wait is still legitimate (e.g. the queue actually advanced). If it
+   *   returns true while the mutex appears free, the waiter takes the mutex
+   *   directly, healing a lost wakeup within one poll interval instead of
+   *   hanging forever.
+   */
+  async acquire(opts: {
+    signal?: AbortSignal
+    timeoutMs?: number
+    pollMs?: number
+    /** Liveness hook consulted by the poll: true = the wait is still wanted. */
+    shouldProceed?: () => boolean
+  } = {}): Promise<() => void> {
+    const signal = opts.signal
+    if (signal?.aborted) throw new AbortedWaitError('aborted before mutex acquisition')
+    if (this.holders < 1) {
+      this.holders += 1
+      return () => this.releaseOne()
     }
+
+    const pollMs = opts.pollMs ?? 0
+    const timeoutMs = opts.timeoutMs
+    let onAbort: (() => void) | null = null
+    let timer: NodeJS.Timeout | null = null
+    let pollTimer: NodeJS.Timeout | null = null
+
+    const result = new Promise<() => void>((resolve, reject) => {
+      let settled = false
+      let entry: (() => void) | null = null
+      let takenDirectly = false
+
+      const cleanup = (): void => {
+        if (onAbort) {
+          signal?.removeEventListener('abort', onAbort)
+          onAbort = null
+        }
+        if (timer) {
+          clearTimeout(timer)
+          timer = null
+        }
+        if (pollTimer) {
+          clearInterval(pollTimer)
+          pollTimer = null
+        }
+      }
+
+      const take = (): (() => void) => {
+        this.holders += 1
+        return () => this.releaseOne()
+      }
+
+      const grant = (): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve(take())
+      }
+
+      const fail = (err: unknown): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        if (entry !== null) {
+          // Remove this waiter from the queue. Deliberately NO wake here: the
+          // mutex is still HELD by someone, so granting the next waiter now
+          // would break mutual exclusion. When the holder releases, wakeNext
+          // hands the slot to the (now) head of the queue.
+          const idx = this.queue.indexOf(entry)
+          if (idx >= 0) this.queue.splice(idx, 1)
+          entry = null
+        } else if (takenDirectly) {
+          // The poll granted the mutex between a cancel arriving and this
+          // failure landing. Honor the grant: the caller released nothing yet.
+          // (Release through the normal path so the holder count stays right.)
+          this.releaseOne()
+        }
+        reject(err)
+      }
+
+      entry = (): void => grant()
+      this.queue.push(entry)
+
+      onAbort = (): void => {
+        fail(new AbortedWaitError('aborted while waiting for the mutex'))
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+
+      if (timeoutMs !== undefined && timeoutMs > 0) {
+        timer = setTimeout(() => fail(new WaitTimeoutError('timed out waiting for the mutex')), timeoutMs)
+        timer.unref?.()
+      }
+
+      // Lost-wakeup self-heal: while queued, periodically re-check whether the
+      // mutex has actually become free. If the wake call was lost (an earlier
+      // defect parked a turn 30+ minutes past a released slot), the poll takes
+      // the mutex directly instead of waiting forever.
+      if (pollMs > 0 && opts.shouldProceed !== undefined) {
+        pollTimer = setInterval(() => {
+          if (settled) return
+          if (this.holders < 1 && this.queue[0] === entry && opts.shouldProceed?.()) {
+            const idx = this.queue.indexOf(entry)
+            if (idx >= 0) this.queue.splice(idx, 1)
+            entry = null
+            takenDirectly = true
+            grant()
+          }
+        }, pollMs)
+        pollTimer.unref?.()
+      }
+    })
+
+    return result
+  }
+
+  private releaseOne(): void {
+    this.holders -= 1
+    this.wakeNext()
+  }
+
+  private wakeNext(): void {
+    const next = this.queue.shift()
+    // A grant must not run user code inline: the releaser's synchronous
+    // context stays short and reentrancy-safe.
+    if (next) queueMicrotask(next)
+  }
+}
+
+/** The caller's abort signal fired while queued on the mutex. */
+export class AbortedWaitError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AbortedWaitError'
+  }
+}
+
+/** The bounded wait elapsed before the mutex became available. */
+export class WaitTimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'WaitTimeoutError'
   }
 }
 
@@ -308,6 +451,23 @@ export interface ResolveOptions {
   log?: (message: string) => void
   io?: Partial<SlotIo>
   /**
+   * Cancels a queued wait for the slot (Stop propagation for the dispatch
+   * phase). Only consulted by acquireCredentialSlot.
+   */
+  signal?: AbortSignal
+  /**
+   * Bounds the queued wait for the slot in ms; 0/undefined = wait
+   * indefinitely. Only consulted by acquireCredentialSlot.
+   */
+  dispatchTimeoutMs?: number
+  /**
+   * Same-account fast path (default true): a run whose credential is already
+   * in the slot starts immediately without the mutex, so multiple sessions on
+   * one account run in parallel. Only identity switches serialize. false
+   * restores full-run exclusivity.
+   */
+  parallel?: boolean
+  /**
    * Re-derive the primary credential from live sources instead of trusting the
    * durable store. Used by the repair tool when the store itself may hold a
    * degraded (refresh-token-less) document.
@@ -409,16 +569,63 @@ export class SlotUnavailableError extends Error {
   }
 }
 
+// ---- same-account concurrency ----------------------------------------------
+//
+// agy is a stateless CLI process and natively supports concurrent runs. The
+// ONLY thing that must stay exclusive on Windows is the machine-global
+// credential slot, and only when its IDENTITY has to change:
+//
+//   * Runs on the identity ALREADY in the slot (the sticky primary — the
+//     common case) only ever READ the credential. Google refresh tokens are
+//     not single-use, so parallel token refreshes on one grant produce
+//     multiple valid access tokens — no conflict. These runs bypass the mutex
+//     entirely (FAST PATH) and are pure parallelism.
+//   * A run that needs a DIFFERENT identity in the slot (a secondary account)
+//     must first wait out every fast-path run: swapping the slot under a live
+//     process would feed it the wrong credential on its next in-run token
+//     refresh — the exact corruption class this module exists to prevent.
+//     While a switch is pending, new fast paths are refused so the switcher
+//     cannot starve (they fall back to the serialized slow path).
+
+let primaryFastRuns = 0
+let slotSwitchPending = false
+
+/** Live fast-path (same-account) run count — exported for diagnostics. */
+export function fastPathRunCount(): number {
+  return primaryFastRuns
+}
+
+/** True while a secondary account is waiting to swap the slot identity. */
+export function isSlotSwitchPending(): boolean {
+  return slotSwitchPending
+}
+
 /**
- * Take exclusive ownership of the credential slot for a run and arrange its
- * guaranteed restoration.
+ * Take ownership of the credential slot for a run and arrange its guaranteed
+ * restoration.
  *
  * Non-Windows platforms have no shared slot (per-account Keychain isolation
  * works), so this is a no-op there.
  *
+ * Same-account runs (the sticky primary — the common case) take a FAST PATH:
+ * when the slot already provably holds this account's credential and no slot
+ * switch is pending, the run starts IMMEDIATELY without the mutex, so
+ * multiple sessions on one account run truly in parallel (agy is a stateless
+ * CLI and handles concurrent processes natively). Only identity SWITCHES
+ * serialize.
+ *
+ * @param options.signal  cancels the wait for the slot — without it a turn
+ *   queued behind another session's long run ignored Stop entirely (the
+ *   cardboard-empire zombie turn, 2026-10-16).
+ * @param options.dispatchTimeoutMs  bounds the wait; 0/undefined waits
+ *   indefinitely (the wait stays observable and cancellable either way).
+ * @param options.parallel  same-account fast path (default true). false
+ *   restores full-run exclusivity.
  * @throws SlotUnavailableError when the slot cannot be handed over safely.
- * The caller must abort the run instead of silently signing in as the wrong
- * account (which would spend that account's quota).
+ *   The caller must abort the run instead of silently signing in as the wrong
+ *   account (which would spend that account's quota).
+ * @throws AbortedWaitError when the signal aborted while queued.
+ * @throws WaitTimeoutError when the bounded wait elapsed.
  */
 export async function acquireCredentialSlot(
   account: ManagedAccount | undefined,
@@ -431,20 +638,64 @@ export async function acquireCredentialSlot(
   const baseDir = options.baseDir ?? defaultPoolDir()
   const homeDir = options.homeDir ?? process.env.HOME ?? process.env.USERPROFILE ?? ''
   const log = options.log ?? ((): void => {})
-  const releaseMutex = await credentialSlotMutex.acquire()
+  const parallel = options.parallel !== false
+  const isPrimarySlot = Boolean(account.systemHome) || !account.dir
+
+  // -- FAST PATH: same-account, slot identity already correct ---------------
+  // No mutex, no wait: N sessions on the primary account run in parallel.
+  if (parallel && isPrimarySlot && !slotSwitchPending && !options.signal?.aborted) {
+    const stored = readPrimaryCredential(baseDir)
+    if (stored && sameCredentialGrant(io.readSlot(), stored.raw)) {
+      primaryFastRuns += 1
+      log('[agy-link] same-account fast path: slot already holds the primary credential — running without exclusivity')
+      return {
+        identity: stored.email,
+        release: (): void => {
+          primaryFastRuns = Math.max(0, primaryFastRuns - 1)
+          // Opportunistic in-place refresh capture: agy may have rotated the
+          // access token (same grant). Cheap and guarded by the grant check —
+          // concurrent releases writing identical content are harmless.
+          try {
+            const afterRaw = io.readSlot()
+            if (afterRaw && afterRaw !== stored.raw && sameCredentialGrant(afterRaw, stored.raw)) {
+              writePrimaryCredential({ raw: afterRaw, email: stored.email, savedAt: Date.now() }, baseDir)
+            }
+          } catch {
+            // best effort — the durable store is refreshed on the next slow path
+          }
+        },
+      }
+    }
+  }
+
+  // -- SLOW PATH: serialized handoff (identity switch or slot repair) ------
+  const releaseMutex = await credentialSlotMutex.acquire({
+    signal: options.signal,
+    timeoutMs: options.dispatchTimeoutMs,
+    // Heal a lost wakeup within seconds instead of parking the turn forever.
+    pollMs: 5_000,
+    shouldProceed: () => true,
+  })
 
   let released = false
   const done = (): void => {
     if (released) return
     released = true
+    slotSwitchPending = false
     releaseMutex()
+  }
+
+  // An abort that landed in the same tick as the grant must not run a turn
+  // nobody is reading anymore.
+  if (options.signal?.aborted) {
+    done()
+    throw new AbortedWaitError('aborted after acquiring the credential slot')
   }
 
   try {
     const primary = await resolvePrimaryCredential(pool, { ...options, baseDir, homeDir })
     const accountFile = accountTokenFilePath(account, homeDir)
     const accountRaw = readTokenFileRaw(accountFile)
-    const isPrimarySlot = Boolean(account.systemHome) || !account.dir
 
     if (!primary) {
       done()
@@ -454,7 +705,7 @@ export async function acquireCredentialSlot(
       )
     }
 
-    // -- Primary run ------------------------------------------------------
+    // -- Primary run (serialized: slot repair or parallel disabled) -------
     if (isPrimarySlot) {
       if (!sameCredentialGrant(io.readSlot(), primary.raw)) {
         log('[agy-link] re-asserting the primary credential into the Windows credential slot')
@@ -484,7 +735,31 @@ export async function acquireCredentialSlot(
       }
     }
 
-    // -- Secondary run ----------------------------------------------------
+    // -- Secondary run: identity SWITCH — drain fast-path runs first ------
+    // Swapping the slot under a live primary process would feed it THIS
+    // account's credential on its next in-run token refresh.
+    if (parallel && primaryFastRuns > 0) {
+      slotSwitchPending = true
+      const deadline = options.dispatchTimeoutMs !== undefined && options.dispatchTimeoutMs > 0
+        ? Date.now() + options.dispatchTimeoutMs
+        : 0
+      log(`[agy-link] waiting for ${primaryFastRuns} same-account run(s) to finish before switching the credential slot to ${account.alias || account.id}`)
+      while (primaryFastRuns > 0) {
+        if (options.signal?.aborted) {
+          slotSwitchPending = false
+          throw new AbortedWaitError('aborted while waiting for same-account runs to finish')
+        }
+        if (deadline !== 0 && Date.now() > deadline) {
+          slotSwitchPending = false
+          throw new WaitTimeoutError(
+            `timed out waiting for ${primaryFastRuns} same-account run(s) to finish before switching the credential slot`,
+          )
+        }
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      slotSwitchPending = false
+    }
+
     if (!accountRaw) {
       done()
       throw new SlotUnavailableError(

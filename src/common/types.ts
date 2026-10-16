@@ -35,6 +35,15 @@ export interface PluginConfig {
    * loudly instead of holding the session for hours.
    */
   longToolIdleMinutes: number
+  /** Hard cap (minutes) on the credential-slot wait before release+retry; 0 = unlimited. */
+  dispatchTimeoutMinutes: number
+  /** Extra dispatch attempts after a credential-slot hard-cap timeout. */
+  dispatchRetries: number
+  /**
+   * Same-account credential-slot fast path: parallel runs on one account,
+  * exclusive only for account switches (Windows credential slot).
+   */
+  parallelSameAccount: boolean
   maxConcurrent: number
   contextWindowDefault: number
   maxTokensDefault: number
@@ -117,7 +126,32 @@ export function defaultConfig(): PluginConfig {
     defaultEffort: '',
     timeoutMs: 600_000,
     longToolIdleMinutes: 240,
-    maxConcurrent: 3,
+    /**
+     * Hard cap (minutes) on waiting for the Windows credential slot before the
+     * dispatch releases, backs off and retries (dispatchRetries). Each attempt
+     * waits up to this long, so persistence ≈ (1 + dispatchRetries) × N
+     * minutes before the turn fails visibly. 0 = wait indefinitely (the wait
+     * stays abort-aware, poll-healed and heartbeat-logged).
+     */
+    dispatchTimeoutMinutes: 15,
+    /** Extra dispatch attempts after a credential-slot hard-cap timeout. */
+    dispatchRetries: 1,
+    /**
+     * Same-account credential-slot fast path (default true): sessions running
+     * on the account whose credential already sits in the Windows slot start
+     * immediately WITHOUT exclusivity — agy is a stateless CLI and handles
+     * concurrent processes natively. Only account SWITCHES serialize.
+     * false restores full-run slot exclusivity (one agy process at a time).
+     */
+    parallelSameAccount: true,
+    /**
+     * Cross-session cap on concurrent agy request streams. 0 = UNLIMITED
+     * (default): native agy concurrency — agy is a stateless CLI and runs
+     * concurrent processes natively; Google rate limits and the account
+     * pool's cooldowns are the natural regulators. Set a positive number to
+     * re-introduce an admission bound.
+     */
+    maxConcurrent: 0,
     contextWindowDefault: 1_048_576,
     maxTokensDefault: 65_536,
     forwardSystemPrompt: false,
