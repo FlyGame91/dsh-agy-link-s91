@@ -890,17 +890,20 @@ export class QuotaService {
             updatedAt: now,
           })
         } else {
+          // The binding constraint is the LOWEST reported remaining across all
+          // sources, full stop. The previous is5hWindow gate (only merge
+          // per-model rows whose reset lands within 6h) mislabeled the real
+          // signal: when the 5h bucket is exhausted, Google reports the NEXT
+          // reset as the weekly boundary (14+ hours out) — the gate then
+          // skipped the merge and the UI showed the coarse summary's
+          // meaningless "100%, resets in now+5h" placeholder while the account
+          // was actually down to 4% (observed live, 2026-10-17 00:37).
+          // A lower remaining is by definition more consumed — tighten to it
+          // and adopt its reset; the weekly row stays visible separately.
           const curRemaining = familyQuotas[fam]!.remainingFraction ?? 1
-          const fbReset = resetTime ? Date.parse(resetTime) : NaN
-          const is5hWindow = !Number.isNaN(fbReset) && (fbReset - now <= 6 * 3600_000)
-          if (familyQuotas[fam]!.remainingFraction === undefined || is5hWindow) {
-            if (remaining < curRemaining) {
-              familyQuotas[fam]!.remainingFraction = remaining
-              familyQuotas[fam]!.resetTime = resetTime
-            } else if (familyQuotas[fam]!.remainingFraction === undefined) {
-              familyQuotas[fam]!.remainingFraction = remaining
-              familyQuotas[fam]!.resetTime = resetTime
-            }
+          if (remaining < curRemaining) {
+            familyQuotas[fam]!.remainingFraction = remaining
+            familyQuotas[fam]!.resetTime = resetTime
           }
         }
       }

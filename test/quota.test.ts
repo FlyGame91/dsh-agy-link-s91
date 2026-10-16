@@ -710,4 +710,74 @@ test('active 5h consumption in model discovery tightens coarse summary 5h quota'
   assert.equal(quotas.google?.weeklyResetTime, weeklyReset)
 })
 
+test('exhausted 5h bucket: per-model weekly-boundary remaining tightens the coarse placeholder', async () => {
+  // 2026-10-17 00:37 incident: the coarse summary reported the meaningless
+  // placeholder "100%, resets in now+5h" while the account was actually down
+  // to 4.06% — every model row carried the real remaining with the NEXT reset
+  // at the weekly boundary, 14.5 hours out. The previous is5hWindow gate
+  // (reset must land within 6h) skipped that merge, so the UI kept showing
+  // 100% for an account that was effectively dry.
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-weeklytighten-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('weekly-tighten-user')
+
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.weeklytighten', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  const now = Date.now()
+  const summary5hReset = new Date(now + 5 * 3600_000).toISOString() // the "now+5h" placeholder
+  const weeklyBoundaryReset = new Date(now + 14.5 * 3600_000).toISOString() // 14.5h out — beyond the old 6h gate
+  const REAL_REMAINING = 0.040659066
+
+  class WeeklyTightenService extends QuotaService {
+    override async fetchUserInfo() {
+      return { email: 'weeklytighten@gmail.com' }
+    }
+    override async fetchQuotaSummary() {
+      return {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            description: 'Models within this group: Gemini Flash, Gemini Pro',
+            buckets: [
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1.0, resetTime: summary5hReset },
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: REAL_REMAINING, resetTime: weeklyBoundaryReset },
+            ],
+          },
+        ],
+      } as never
+    }
+    override async fetchAvailableModels() {
+      return {
+        models: {
+          'gemini-3.8-flash-tiered': {
+            displayName: 'gemini-3.8-flash-tiered',
+            quotaInfo: { remainingFraction: REAL_REMAINING, resetTime: weeklyBoundaryReset },
+          },
+          'gemini-3.6-flash-high': {
+            displayName: 'Gemini 3.6 Flash (High)',
+            quotaInfo: { remainingFraction: REAL_REMAINING, resetTime: weeklyBoundaryReset },
+          },
+        },
+      } as never
+    }
+  }
+
+  const svc = new WeeklyTightenService(pool)
+  const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+  assert.ok(quotas)
+  // The coarse "100%" placeholder must be tightened to the real remaining
+  // even though the reset sits beyond 6 hours.
+  assert.equal(quotas.google?.remainingFraction, REAL_REMAINING)
+  assert.equal(quotas.google?.resetTime, weeklyBoundaryReset)
+  // Weekly row is preserved alongside.
+  assert.equal(quotas.google?.weeklyFraction, REAL_REMAINING)
+  assert.equal(quotas.google?.weeklyResetTime, weeklyBoundaryReset)
+})
+
 

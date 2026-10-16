@@ -125,12 +125,33 @@ export function isPlanMode(messages: readonly Message[]): boolean {
 }
 
 /**
+ * Harness-injected user-role texts (turn-preparation time samples, system
+ * reminders, runtime context) are NOT user instructions: they must not break
+ * the completion-hop scan, while a genuine instruction must.
+ */
+function isHarnessInjectedUserText(text: string): boolean {
+  const t = text.trimStart()
+  return (
+    t.startsWith('Time sampled while preparing') ||
+    t.startsWith('Current runtime context') ||
+    t.includes('<system-reminder>')
+  )
+}
+
+/**
  * Check if the trailing span represents completion of a bridge-emitted `update_goal` call.
  * This covers both the direct tool-result message and DSH's deferred `<goal_complete>` notice.
+ *
+ * The markers only mean "synthetic completion hop" while they are the TRAILING
+ * content. A genuine user message appearing before any marker is a fresh
+ * instruction that must reach agy — scanning a fixed window for markers
+ * "anywhere" swallowed exactly that: a message sent right after a goal
+ * completed was finished as an empty turn without spawning agy
+ * (2026-10-17, "把相关的经验整理到agents.md" × 2).
  */
 export function isGoalToolContinuation(messages: readonly Message[]): boolean {
   if (messages.length === 0) return false
-  const spanStart = Math.max(0, messages.length - 4)
+  const spanStart = Math.max(0, messages.length - 8)
   for (let i = messages.length - 1; i >= spanStart; i--) {
     const m = messages[i]
     if (!m) continue
@@ -146,6 +167,11 @@ export function isGoalToolContinuation(messages: readonly Message[]): boolean {
     const text = extractText(m)
     if (text.includes('<goal_complete>')) {
       return true
+    }
+    // A genuine user message with no marker ends the scan: the completion hop
+    // is over — whatever the user said must be driven normally.
+    if (m.role === 'user' && text.trim() !== '' && !isHarnessInjectedUserText(text)) {
+      return false
     }
   }
   return false

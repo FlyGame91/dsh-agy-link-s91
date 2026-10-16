@@ -188,6 +188,85 @@ test('isGoalToolContinuation recognizes agytc-bridge-goal callId', () => {
   assert.equal(isGoalToolContinuation(deferredGoalComplete), true)
 })
 
+test('a genuine user message after the goal result is NOT a continuation (must reach agy)', () => {
+  // 2026-10-17 incident: the user sent "把相关的经验整理到agents.md" right after a
+  // goal completed. The old fixed-window marker scan found the goal tool-result
+  // 2 messages earlier and short-circuited the turn into an empty finish — the
+  // instruction never reached agy. Twice in a row.
+  const afterGoal = [
+    {
+      role: 'assistant',
+      content: 'We removed the web-like layout and rebuilt the tabletop view.',
+    },
+    {
+      role: 'tool',
+      toolCallId: 'agytc-bridge-goal-goal-3fe686a1-0298-4a5a-88dd-670562821182-1',
+      content: '{"ok":true}',
+    },
+    {
+      role: 'user',
+      content: '把相关的经验整理到agents.md 杜绝这种web味！',
+    },
+  ] as unknown as Message[]
+  assert.equal(isGoalToolContinuation(afterGoal), false)
+})
+
+test('deferred goal_complete notice followed by a real user message drives agy', () => {
+  const noticeThenUser = [
+    {
+      role: 'tool',
+      toolCallId: 'agytc-bridge-goal-123-1',
+      content: '{"ok":true}',
+    },
+    {
+      role: 'user',
+      content: '<goal_complete>\nObjective: "Test"\nThe goal is marked complete.',
+      source: { kind: 'tool-goal', form: 'notice' },
+    },
+    {
+      role: 'user',
+      content: '把相关的经验整理到agents.md 杜绝这种web味！',
+    },
+  ] as unknown as Message[]
+  assert.equal(isGoalToolContinuation(noticeThenUser), false)
+})
+
+test('trailing goal markers still short-circuit when nothing genuine follows', () => {
+  const toolThenNotice = [
+    {
+      role: 'tool',
+      toolCallId: 'agytc-bridge-goal-123-1',
+      content: '{"ok":true}',
+    },
+    {
+      role: 'user',
+      content: '<goal_complete>\nObjective: "Test"\nThe goal is marked complete.',
+      source: { kind: 'tool-goal', form: 'notice' },
+    },
+  ] as unknown as Message[]
+  assert.equal(isGoalToolContinuation(toolThenNotice), true)
+
+  const reminderTail = [
+    {
+      role: 'tool',
+      toolCallId: 'agytc-bridge-goal-123-1',
+      content: '{"ok":true}',
+    },
+    {
+      role: 'user',
+      content: '<goal_complete>\nThe goal is marked complete.',
+      source: { kind: 'tool-goal', form: 'notice' },
+    },
+    {
+      role: 'user',
+      content: 'Time sampled while preparing turn 2, step 1: 2026-10-17T00:40:00+08:00',
+    },
+  ] as unknown as Message[]
+  // A harness-injected reminder after the notice is not a user instruction:
+  // the completion hop still finishes cleanly.
+  assert.equal(isGoalToolContinuation(reminderTail), true)
+})
+
 test('isPlanToolContinuation recognizes agytc-bridge-plan callId', () => {
   const planBridgeTool: Message[] = [
     {

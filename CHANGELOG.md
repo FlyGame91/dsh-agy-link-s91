@@ -19,7 +19,9 @@
     - **Same-account fast path** (`parallelSameAccount`, default **on**): a run whose credential already sits in the slot starts immediately WITHOUT the mutex, so N sessions on one account run truly in parallel (concurrent refreshes on one grant are safe — refresh tokens are not single-use). `/agy parallel <on|off>` toggles it.
     - **Account switches still serialize** (correctness): a secondary waits for same-account runs to drain before swapping the slot, new fast paths are refused while a switch pends, and the switch restores the primary afterwards — the anti-corruption invariants are unchanged and covered by new tests.
     - **`maxConcurrent` default 3 → 0 (unlimited)**: no artificial admission bound; Google rate limits and the pool's cooldowns are the natural regulators. `/agy max-concurrent <n|off>`.
-  - **Tests**: mutex cancel-removes-and-wakes-next; timeout keeps the queue flowing; lost-wake-up poll grant; `acquireCredentialSlot` rejects when already aborted, honors Stop while queued, and fails visibly on the bounded wait.
+  - **Fix: quota merge — the real remaining was blocked by the 6h window gate.** When the 5h bucket is exhausted, Google reports the NEXT reset at the weekly boundary (14+ hours out); the `is5hWindow` gate (reset must land within 6h) skipped the per-model merge, so the UI kept showing the coarse summary's meaningless "100%, resets in now+5h" placeholder while the account was actually down to **4.06%** (observed live 2026-10-17 00:37: reported reset 05:37:49 == refresh+5h exactly, while every model row carried 4.06% @ 15:07). The merge now tightens to the LOWEST reported remaining regardless of which window it owns; the weekly row stays visible separately. Regression test reproduces the exact incident numbers.
+  - **Fix: goal completion short-circuit swallowed genuine user messages.** `isGoalToolContinuation` scanned a fixed trailing window for goal markers "anywhere": a message sent right after a goal completed (the goal tool-result was still in that window) was finished as an EMPTY turn without spawning agy — twice in a row, "把相关的经验整理到agents.md" never reached the agent (2026-10-17, turns completed in 7s/16s with zero output). The scan now walks backwards and STOPS at a genuine user instruction (harness-injected texts — time samples, system-reminder wrappers, runtime context — stay transparent), so markers only short-circuit while they are actually the trailing content.
+  - **Tests**: mutex cancel-removes-and-wakes-next; timeout keeps the queue flowing; lost-wake-up poll grant; `acquireCredentialSlot` rejects when already aborted, honors Stop while queued, and fails visibly on the bounded wait; same-account fast path / drain / starvation; quota weekly-boundary tightening; goal-continuation genuine-message cases.
 
 ### 中文 (Chinese)
 
@@ -38,7 +40,9 @@
     - **同账号快路径**（`parallelSameAccount`，默认**开**）：凭据已在槽位中的账号立即启动、完全不取互斥锁 —— N 个会话在同一账号上真并行（同一授权的并发 token 刷新是安全的，refresh token 非一次性）。`/agy parallel <on|off>` 开关。
     - **账号切换仍然串行**（正确性）：副账号先等同账号 run 全部退出再换槽位；切换等待期间拒绝新的快路径；切换完成后恢复主账号 —— 防腐蚀不变量原样保留，新增测试覆盖。
     - **`maxConcurrent` 默认 3 → 0（不限制）**：移除人为准入上限；Google 速率限制与账号池冷却是天然调节器。`/agy max-concurrent <n|off>`。
-  - **测试**：互斥锁取消后移除并唤醒下一个；超时不阻塞队列；丢失唤醒的轮询补偿；`acquireCredentialSlot` 已中止即拒绝、排队中响应 Stop、限时等待可见失败。
+  - **修复：配额合并 —— 真实剩余被 6 小时窗口门槛挡掉。** 5 小时桶耗尽时，Google 把下一次重置报在周边界（14+ 小时后）；`is5hWindow` 门槛（重置必须落在 6 小时内）跳过了逐模型合并，于是界面持续显示粗粒度汇总端点那个无意义的"100%，now+5h 重置"占位值，而账号实际只剩 **4.06%**（2026-10-17 00:37 实测：上报重置 05:37:49 恰好等于刷新时刻+5h，而所有模型行都是 4.06% @ 15:07）。合并现在无条件取各来源中**最低**的剩余值；周额度行照常单独显示。回归测试复现了本次事故的精确数字。
+  - **修复：目标完成短路吞掉了真实用户消息。** `isGoalToolContinuation` 在固定尾部窗口里"任意位置"找目标标记：目标完成后立刻发送的消息（目标工具结果还在窗口里）被当成完成跳直接空转结束——连续两次，"把相关的经验整理到agents.md" 根本没到达 agent（2026-10-17，7 秒/16 秒"已完成"但零输出）。扫描改为从末尾回溯，遇到**真实用户指令即停止**（宿主注入的文本——时间采样、system-reminder 包裹、运行时上下文——保持透明），目标标记只有在真正处于末尾时才短路。
+  - **测试**：互斥锁取消后移除并唤醒下一个；超时不阻塞队列；丢失唤醒的轮询补偿；`acquireCredentialSlot` 已中止即拒绝、排队中响应 Stop、限时等待可见失败；同账号快路径 / 排空 / 防饿死；配额周边界收紧；目标延续真实消息场景。
 
 ## 0.4.58 (2026-10-16)
 
