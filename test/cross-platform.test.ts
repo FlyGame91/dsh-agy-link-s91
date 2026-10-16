@@ -82,11 +82,11 @@ test('isCmdShim detects cmd/bat case-insensitively', () => {
 test('Windows execFile call sites pass windowsHide', async () => {
   const { readFile } = await import('node:fs/promises')
   const oauth = await readFile(new URL('../src/host/oauth.ts', import.meta.url), 'utf8')
-  const index = await readFile(new URL('../src/index.ts', import.meta.url), 'utf8')
+  const runner = await readFile(new URL('../src/host/runner.ts', import.meta.url), 'utf8')
   assert.match(oauth, /windowsVerbatimArguments: true, windowsHide: true/)
-  // pool/add and pool/open-terminal each spawn cmd.exe with windowsHide nearby
-  const cmdSpawns = [...index.matchAll(/execFile\('cmd\.exe'[\s\S]{0,300}?\n/g)].map((m) => m[0])
-  assert.ok(cmdSpawns.length >= 2, `expected >=2 cmd.exe spawns, found ${cmdSpawns.length}`)
+  // openAccountTerminal spawns cmd.exe with windowsHide nearby to prevent flashing console windows
+  const cmdSpawns = [...runner.matchAll(/run\('cmd\.exe'[\s\S]{0,300}?\n/g)].map((m) => m[0])
+  assert.ok(cmdSpawns.length >= 1, `expected >=1 cmd.exe spawns, found ${cmdSpawns.length}`)
   for (const call of cmdSpawns) {
     assert.match(call, /windowsHide:\s*true/, `missing windowsHide in: ${call.slice(0, 120)}`)
   }

@@ -16,21 +16,57 @@
 // block is left visible. Failed loads are retried after a cooldown.
 
 export const MERMAID_CSS = `
-div.md-code-block[data-agy-mermaid="done"] [data-code-block-content] {
+div.md-code-block[data-agy-mermaid="done"]:not([data-agy-mermaid-view="source"]) [data-code-block-content] {
+	display: none !important;
+}
+div.md-code-block[data-agy-mermaid="done"][data-agy-mermaid-view="source"] [data-agy-mermaid-svg] > .agy-mermaid-body {
 	display: none !important;
 }
 div.md-code-block[data-agy-mermaid="render"] {
 	border-color: var(--dsw-alias-border-l2, #e2e8f0);
 }
 div[data-agy-mermaid-svg] {
-	padding: 12px 8px;
+	position: relative;
+	padding: 8px 8px 12px 8px;
 	overflow-x: auto;
 	text-align: center;
 	background: var(--dsw-alias-bg-base, #ffffff);
 }
 div[data-agy-mermaid-svg] svg {
 	max-width: 100%;
+	min-width: 280px;
 	height: auto;
+}
+.agy-mermaid-toolbar {
+	display: flex;
+	justify-content: flex-end;
+	padding: 2px 4px 6px 4px;
+	background: transparent;
+}
+.agy-mermaid-toggle {
+	font-size: 11px;
+	line-height: 1.4;
+	padding: 2px 8px;
+	border-radius: 4px;
+	border: 1px solid var(--dsw-alias-border-l2, #e2e8f0);
+	background: var(--dsw-alias-bg-surface, #f8fafc);
+	color: var(--dsw-alias-label-secondary, #475569);
+	cursor: pointer;
+	user-select: none;
+	transition: all 0.15s ease;
+}
+.agy-mermaid-toggle:hover {
+	background: var(--dsw-alias-bg-hover, #f1f5f9);
+	color: var(--dsw-alias-label-primary, #0f172a);
+}
+.agy-mermaid-warn {
+	padding: 6px 10px;
+	margin-bottom: 6px;
+	font-size: 12px;
+	color: #92400e;
+	background: #fef3c7;
+	border-radius: 4px;
+	text-align: left;
 }
 div[data-agy-mermaid-svg][data-agy-mermaid-error] {
 	text-align: left;
@@ -125,12 +161,21 @@ async function loadMermaid(): Promise<MermaidApi | null> {
 			const ok = await loadScript(url)
 			if (ok && window.mermaid !== undefined) {
 				try {
+					const isDark = typeof document !== 'undefined' && (
+						document.documentElement.classList.contains('dark') ||
+						document.body.classList.contains('dark') ||
+						window.matchMedia?.('(prefers-color-scheme: dark)').matches === true
+					)
 					window.mermaid.initialize({
 						startOnLoad: false,
 						securityLevel: 'strict',
-						theme: 'neutral',
+						theme: isDark ? 'dark' : 'neutral',
 						fontFamily: 'inherit',
 						suppressErrorRendering: true,
+						flowchart: {
+							useMaxWidth: true,
+							htmlLabels: false,
+						},
 					})
 				} catch {
 					// initialize is idempotent enough; keep going
@@ -147,23 +192,30 @@ async function loadMermaid(): Promise<MermaidApi | null> {
 
 /** Banner infostring text ("mermaid") identifies the fence language. */
 function fenceLang(block: HTMLElement): string {
-	const info = block.querySelector('[data-code-block-banner] [class*="infostring"]')
-		?? block.querySelector('[data-code-block-banner] [class*="language"]')
-		?? block.querySelector('[data-code-block-banner]')
-	const text = (info?.textContent ?? '').trim().toLowerCase()
-	if (text !== '') {
-		// The language is the FIRST token of the infostring; the banner may
-		// carry UI text after it, so never return more than one token.
-		return text.split(/\s+/)[0] ?? ''
-	}
-	// DSH renders UNKNOWN fence languages with a generic banner ("代码块")
-	// and no infostring — the raw language then only survives on the code
-	// element itself, if at all.
+	// 1. First check explicit language class on code/pre element: <code class="language-mermaid">
 	const code = block.querySelector('[data-code-block-content] code')
+		?? block.querySelector('[data-code-block-content] pre')
 	const cls = code?.getAttribute('class') ?? ''
 	const m = cls.match(/language-([\w-]+)/)
 	if (m?.[1]) return m[1]!.toLowerCase()
-	return (code?.getAttribute('data-language') ?? block.getAttribute('data-language') ?? '').toLowerCase()
+	const dataLang = (code?.getAttribute('data-language') ?? block.getAttribute('data-language') ?? '').trim().toLowerCase()
+	if (dataLang !== '') return dataLang
+
+	// 2. Next check the banner infostring or language element
+	const info = block.querySelector('[data-code-block-banner] [class*="infostring"]')
+		?? block.querySelector('[data-code-block-banner] [class*="language"]')
+	const text = (info?.textContent ?? '').trim().toLowerCase()
+	if (text !== '') {
+		return text.split(/\s+/)[0] ?? ''
+	}
+
+	// 3. Fallback: banner text ONLY if it is not a generic localized placeholder
+	const banner = block.querySelector('[data-code-block-banner]')
+	const bannerText = (banner?.textContent ?? '').trim().toLowerCase()
+	if (bannerText !== '' && bannerText !== '代码块' && bannerText !== 'code' && bannerText !== 'code block') {
+		return bannerText.split(/\s+/)[0] ?? ''
+	}
+	return ''
 }
 
 // First-line shapes of the fence languages mermaid v11 can draw.
@@ -216,7 +268,71 @@ export function cleanupTempElements(id?: string): void {
 	}
 }
 
-async function renderInto(block: HTMLElement, source: string): Promise<void> {
+export function repairMermaidSource(source: string): string {
+	const isFlowchart = /^\s*(?:flowchart|graph)\b/i.test(source)
+	if (!isFlowchart) return source
+
+	const lines = source.split(/\r?\n/)
+	const repairedLines = lines.map((line) => {
+		let l = line
+		// 1. Repair subgraph lines without quotes containing colons, spaces or Chinese punctuation
+		const subMatch = l.match(/^(\s*subgraph\s+)([^"[\]\n]+)$/i)
+		if (subMatch && (subMatch[2]!.includes(':') || subMatch[2]!.includes(' ') || subMatch[2]!.includes('：'))) {
+			const title = subMatch[2]!.trim()
+			l = `${subMatch[1]}"${title}"`
+		}
+
+		// 2. Repair node brackets [...] with unquoted special chars like >, <, :, (, )
+		l = l.replace(/(\b[a-zA-Z0-9_\u4e00-\u9fa5]+)\[([^"\]\n]+)\]/g, (m, id, text) => {
+			if (text.includes('>') || text.includes('<') || text.includes(':') || text.includes('：') || text.includes('(') || text.includes(')')) {
+				return `${id}["${text.trim()}"]`
+			}
+			return m
+		})
+
+		// 3. Repair node parens (...) with unquoted special chars
+		l = l.replace(/(\b[a-zA-Z0-9_\u4e00-\u9fa5]+)\(([^")\n]+)\)/g, (m, id, text) => {
+			if (text.includes('>') || text.includes('<') || text.includes(':') || text.includes('：') || text.includes('[') || text.includes(']')) {
+				return `${id}("${text.trim()}")`
+			}
+			return m
+		})
+
+		// 4. Repair + between nodes on lines containing arrows in flowcharts
+		if (l.includes('-->') || l.includes('---') || l.includes('-.->') || l.includes('==>') || l.includes('<--')) {
+			let inQuote = false
+			let inBracket = 0
+			let inPipe = false
+			let out = ''
+			for (let i = 0; i < l.length; i++) {
+				const ch = l[i]!
+				if (ch === '"' && (i === 0 || l[i - 1] !== '\\')) {
+					inQuote = !inQuote
+					out += ch
+				} else if (!inQuote && ch === '|') {
+					inPipe = !inPipe
+					out += ch
+				} else if (!inQuote && !inPipe && (ch === '[' || ch === '(' || ch === '{')) {
+					inBracket++
+					out += ch
+				} else if (!inQuote && !inPipe && (ch === ']' || ch === ')' || ch === '}')) {
+					if (inBracket > 0) inBracket--
+					out += ch
+				} else if (!inQuote && !inPipe && inBracket === 0 && ch === '+') {
+					out += '&'
+				} else {
+					out += ch
+				}
+			}
+			l = out
+		}
+
+		return l
+	})
+	return repairedLines.join('\n')
+}
+
+async function renderInto(block: HTMLElement, source: string, lang = ''): Promise<void> {
 	// Drop a previous overlay so a React rebuild can re-render cleanly.
 	block.querySelector('[data-agy-mermaid-svg]')?.remove()
 	const mount = document.createElement('div')
@@ -233,18 +349,80 @@ async function renderInto(block: HTMLElement, source: string): Promise<void> {
 	}
 	renderSeq += 1
 	const id = 'agy-mmd-' + renderSeq
+	let targetSource = source
 	try {
-		// Pre-validate diagram syntax: parse throws without mutating DOM or rendering error fallback
+		// Pre-validate diagram syntax; try auto-repairing common LLM syntax errors if raw fails
+		let parseValidated = false
 		if (typeof api.parse === 'function') {
-			await api.parse(source)
+			try {
+				await api.parse(targetSource)
+				parseValidated = true
+			} catch (parseErr) {
+				const repaired = repairMermaidSource(targetSource)
+				if (repaired !== targetSource) {
+					try {
+						await api.parse(repaired)
+						targetSource = repaired
+						parseValidated = true
+					} catch {
+						throw parseErr
+					}
+				} else {
+					throw parseErr
+				}
+			}
 		}
-		const { svg } = await api.render(id, source, mount)
-		mount.innerHTML = svg
+		if (!parseValidated && typeof api.parse !== 'function') {
+			targetSource = repairMermaidSource(targetSource)
+		}
+		const { svg } = await api.render(id, targetSource, mount)
+		const isErrorSvg = !svg || svg.trim() === '' || svg.includes('class="error-icon"') || svg.includes('class="error-text"') || svg.includes('aria-roledescription="error"')
+		if (isErrorSvg) {
+			throw new Error('Mermaid returned an empty or error diagram')
+		}
+
+		mount.innerHTML = ''
+		const toolbar = document.createElement('div')
+		toolbar.className = 'agy-mermaid-toolbar'
+		const toggleBtn = document.createElement('button')
+		toggleBtn.type = 'button'
+		toggleBtn.className = 'agy-mermaid-toggle'
+		toggleBtn.textContent = '查看源码'
+		toggleBtn.title = '切换图表与原始代码'
+		toggleBtn.addEventListener('click', (ev) => {
+			ev.preventDefault()
+			ev.stopPropagation()
+			const isSrc = block.getAttribute('data-agy-mermaid-view') === 'source'
+			if (isSrc) {
+				block.removeAttribute('data-agy-mermaid-view')
+				toggleBtn.textContent = '查看源码'
+			} else {
+				block.setAttribute('data-agy-mermaid-view', 'source')
+				toggleBtn.textContent = '查看图表'
+			}
+		})
+		toolbar.appendChild(toggleBtn)
+		mount.appendChild(toolbar)
+
+		const bodyDiv = document.createElement('div')
+		bodyDiv.className = 'agy-mermaid-body'
+		bodyDiv.innerHTML = svg
+		mount.appendChild(bodyDiv)
+
 		block.setAttribute('data-agy-mermaid', 'done')
 	} catch (e) {
-		block.setAttribute('data-agy-mermaid', 'error')
-		mount.setAttribute('data-agy-mermaid-error', '1')
-		mount.textContent = 'Mermaid render failed: ' + (e instanceof Error ? e.message : String(e))
+		const isExplicit = isMermaidLang(lang)
+		if (!isExplicit) {
+			// Auto-sniffed block (not explicitly tagged as ```mermaid).
+			// If parsing/rendering fails, gracefully fall back to displaying
+			// as a normal code block without injecting a distracting error banner.
+			mount.remove()
+			block.setAttribute('data-agy-mermaid', 'fallback')
+		} else {
+			// Explicit mermaid block: show clear warning without hiding the code block!
+			block.setAttribute('data-agy-mermaid', 'error')
+			mount.innerHTML = '<div class="agy-mermaid-warn">⚠️ Mermaid 图表解析失败，已保留原始代码呈现</div>'
+		}
 	} finally {
 		cleanupTempElements(id)
 	}
@@ -271,13 +449,13 @@ function scan(): void {
 		const state = block.getAttribute('data-agy-mermaid')
 		// Error blocks stay source-visible; they are retried only when React
 		// genuinely rebuilds the block (which wipes the state attribute).
-		if (state === 'done' || state === 'busy' || state === 'error') continue
+		if (state === 'done' || state === 'busy' || state === 'error' || state === 'fallback') continue
 		const lang = fenceLang(block)
 		const source = readSource(block)
 		if (source === '') continue
 		if (!isMermaidBlock(lang, source)) continue
 		block.setAttribute('data-agy-mermaid', 'busy')
-		void renderInto(block, source)
+		void renderInto(block, source, lang)
 	}
 }
 

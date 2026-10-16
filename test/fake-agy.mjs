@@ -13,7 +13,8 @@
 //   exit-error    — stdout error envelope + exit 1 + empty stderr (the real
 //                   silent-failure shape that hid causes behind "exited 1")
 // Records its argv (JSON) to FAKE_AGY_ARGS_FILE when set.
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 const argv = process.argv.slice(2)
 const mode = process.env.FAKE_AGY_MODE ?? 'ok'
@@ -153,6 +154,30 @@ if (mode === 'auth-network') {
   process.stderr.write('Print mode: token validation failed due to network error (token may still be valid): Post "https://oauth2.googleapis.com/token": EOF\n')
   process.stdout.write('Print mode: silent auth failed\n')
   process.stdout.write('Please sign in\n')
+  emit({ event: 'result', result: { conversation_id: '', status: 'ERROR', error: 'You are not logged into Antigravity.' } })
+  process.exit(1)
+}
+
+// Auth-shaped refusal whose agy log proves a STORED credential could not be
+// validated over the network (keyring auth missed its 10s window). The stderr
+// banner is byte-identical to a real sign-out; only the log separates them —
+// this is the exact shape that sticky-quarantined three healthy accounts on
+// 2026-10-16.
+if (mode === 'auth-jitter') {
+  const home = process.env.HOME || process.env.USERPROFILE
+  if (home) {
+    try {
+      const logDir = join(home, '.gemini', 'antigravity-cli', 'log')
+      mkdirSync(logDir, { recursive: true })
+      writeFileSync(join(logDir, `cli-${Date.now()}.log`), [
+        'I1016 17:29:16.281503       1 printmode.go:403] Print mode: not authenticated, trying silent auth',
+        'I1016 17:29:16.708947     291 keyring.go:64] keyringAuth: loaded token, expiry=2026-10-16 09:38:48.745 +0000 UTC expired=false',
+        'W1016 17:29:26.284604       1 keyring.go:111] keyringAuth: timed out after 10s, skipping keyring auth',
+        'I1016 17:29:26.284725       1 printmode.go:409] Print mode: silent auth failed',
+      ].join('\n'))
+    } catch { /* evidence is best-effort in a fake */ }
+  }
+  process.stderr.write('Authentication required. Please visit the URL to log in:\n  https://accounts.google.com/o/oauth2/auth?access_type=offline\nError: authentication timed out.\n')
   emit({ event: 'result', result: { conversation_id: '', status: 'ERROR', error: 'You are not logged into Antigravity.' } })
   process.exit(1)
 }

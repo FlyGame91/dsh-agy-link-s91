@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveConfig } from '../src/common/config.ts'
 import { defaultConfig } from '../src/common/types.ts'
-import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess } from '../src/host/runner.ts'
+import { ensureIsolatedKeychain, isolatedHomeEnv, openAccountTerminal, proxyEnvFor, purgeStaleIsolatedKeychain, repairMacSystemKeychain, startAgyProcess } from '../src/host/runner.ts'
+import { detectSystemProxy, invalidateProxyCache, parseMacScutilProxy, parseWindowsProxyServer } from '../src/host/wincred.ts'
 
 test('proxyEnvFor maps one URL onto all six proxy vars', () => {
   assert.deepEqual(proxyEnvFor(undefined), {})
@@ -39,6 +40,87 @@ test('resolveConfig reads proxyUrl from entry, overrides and env', () => {
   }
 })
 
+test('parseMacScutilProxy extracts HTTP, HTTPS, and SOCKS correctly', () => {
+  assert.equal(parseMacScutilProxy(''), undefined)
+  assert.equal(parseMacScutilProxy('   '), undefined)
+  assert.equal(parseMacScutilProxy('HTTPEnable : 0\nHTTPSEnable : 0\n'), undefined)
+
+  const httpsSample = `
+<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7890
+  HTTPSProxy : 127.0.0.1
+}
+`
+  assert.equal(parseMacScutilProxy(httpsSample), 'http://127.0.0.1:7890')
+
+  const httpOnlySample = `
+  HTTPEnable : 1
+  HTTPPort : 8080
+  HTTPProxy : proxy.local
+  HTTPSEnable : 0
+`
+  assert.equal(parseMacScutilProxy(httpOnlySample), 'http://proxy.local:8080')
+
+  const socksSample = `
+  HTTPEnable : 0
+  HTTPSEnable : 0
+  SOCKSEnable : 1
+  SOCKSPort : 1080
+  SOCKSProxy : 127.0.0.1
+`
+  assert.equal(parseMacScutilProxy(socksSample), 'socks5://127.0.0.1:1080')
+})
+
+test('parseWindowsProxyServer supports single and multi-protocol WinINet format', () => {
+  assert.equal(parseWindowsProxyServer(''), '')
+  assert.equal(parseWindowsProxyServer('127.0.0.1:7890'), 'http://127.0.0.1:7890')
+  assert.equal(parseWindowsProxyServer('http://127.0.0.1:7890'), 'http://127.0.0.1:7890')
+  assert.equal(
+    parseWindowsProxyServer('http=http://proxy:8080;https=http://secproxy:8443;ftp=ftp://ftpproxy:21'),
+    'http://secproxy:8443',
+  )
+})
+
+test('openAccountTerminal dispatches per platform (darwin, win32, linux)', () => {
+  assert.equal(openAccountTerminal(''), false)
+
+  // macOS (darwin)
+  const macCalls: Array<{ file: string; args: string[] }> = []
+  const macRun = (file: string, args: readonly string[]) => { macCalls.push({ file, args: [...args] }) }
+  assert.equal(openAccountTerminal('/tmp/mac-acc', 'darwin', macRun), true)
+  assert.equal(macCalls.length, 1)
+  assert.equal(macCalls[0]?.file, 'osascript')
+  assert.ok(macCalls[0]?.args[1]?.includes("export HOME='/tmp/mac-acc'; agy"))
+
+  // Windows (win32)
+  const winCalls: Array<{ file: string; args: string[] }> = []
+  const winRun = (file: string, args: readonly string[]) => { winCalls.push({ file, args: [...args] }) }
+  assert.equal(openAccountTerminal('C:\\Users\\test\\.dsh\\acc', 'win32', winRun), true)
+  assert.equal(winCalls.length, 1)
+  assert.equal(winCalls[0]?.file, 'cmd.exe')
+  assert.ok(winCalls[0]?.args[4]?.includes('set "USERPROFILE=C:\\Users\\test\\.dsh\\acc"'))
+
+  // Linux: succeeds on first working emulator
+  const linuxCalls: Array<{ file: string; args: string[] }> = []
+  const linuxRun = (file: string, args: readonly string[]) => {
+    linuxCalls.push({ file, args: [...args] })
+    if (file === 'xdg-terminal-exec') throw new Error('not installed')
+    // x-terminal-emulator succeeds
+  }
+  assert.equal(openAccountTerminal('/tmp/linux-acc', 'linux', linuxRun), true)
+  assert.equal(linuxCalls.length, 2)
+  assert.equal(linuxCalls[0]?.file, 'xdg-terminal-exec')
+  assert.equal(linuxCalls[1]?.file, 'x-terminal-emulator')
+
+  // Linux: all emulators missing -> returns false
+  const linuxFail = () => { throw new Error('command not found') }
+  assert.equal(openAccountTerminal('/tmp/linux-acc', 'linux', linuxFail), false)
+})
+
 test('ensureIsolatedKeychain no-ops off darwin', () => {
   let calls = 0
   const ok = ensureIsolatedKeychain('/tmp/whatever', 'linux', () => { calls++ })
@@ -66,6 +148,99 @@ test('ensureIsolatedKeychain provisions once per home and survives errors', () =
     assert.equal(ensureIsolatedKeychain(dir, 'darwin', () => { throw new Error('boom') }), false)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('purgeStaleIsolatedKeychain unregisters and deletes un-unlockable keychains', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-kc-purge-'))
+  try {
+    // Non-darwin is a no-op
+    assert.equal(purgeStaleIsolatedKeychain(dir, 'linux'), false)
+    assert.equal(purgeStaleIsolatedKeychain('', 'darwin'), false)
+    assert.equal(purgeStaleIsolatedKeychain(dir, 'darwin'), false) // file doesn't exist yet
+
+    const kcDir = join(dir, 'Library', 'Keychains')
+    mkdirSync(kcDir, { recursive: true })
+    const kc = join(kcDir, 'login.keychain-db')
+    writeFileSync(kc, 'corrupt-or-locked-content')
+
+    // Scenario 1: unlock-keychain succeeds -> not stale, preserved
+    const calls1: string[] = []
+    const runOk = (_file: string, args: readonly string[]) => { calls1.push(args.join(' ')) }
+    assert.equal(purgeStaleIsolatedKeychain(dir, 'darwin', runOk), false)
+    assert.equal(calls1.length, 1)
+    assert.match(calls1[0] ?? '', /unlock-keychain -p/)
+    assert.equal(existsSync(kc), true)
+
+    // Scenario 2: unlock-keychain throws (stale random password from pre-0.4.45) -> purged!
+    const calls2: string[] = []
+    const runThrow = (_file: string, args: readonly string[]) => {
+      calls2.push(args.join(' '))
+      if (args[0] === 'unlock-keychain') throw new Error('unlock failed (status 51)')
+    }
+    assert.equal(purgeStaleIsolatedKeychain(dir, 'darwin', runThrow), true)
+    assert.equal(calls2.length, 2)
+    assert.match(calls2[0] ?? '', /unlock-keychain -p/)
+    assert.match(calls2[1] ?? '', /delete-keychain/)
+    assert.equal(existsSync(kc), false, 'corrupted keychain file must be deleted from disk')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('repairMacSystemKeychain restores real login keychain when default/search list is hijacked', () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), 'agy-fake-home-'))
+  try {
+    assert.equal(repairMacSystemKeychain(fakeHome, 'linux'), false)
+    assert.equal(repairMacSystemKeychain('', 'darwin'), false)
+    // No real keychain present in fakeHome -> no-op
+    assert.equal(repairMacSystemKeychain(fakeHome, 'darwin'), false)
+
+    // Create real user login keychain in fakeHome
+    const kcDir = join(fakeHome, 'Library', 'Keychains')
+    mkdirSync(kcDir, { recursive: true })
+    const realKc = join(kcDir, 'login.keychain-db')
+    writeFileSync(realKc, 'real-login-kc')
+
+    const calls: string[] = []
+    const run = (_file: string, args: readonly string[]) => {
+      calls.push(args.join(' '))
+      if (args[0] === 'default-keychain' && args.length === 1) {
+        return '"/Users/test/.dsh/agy-accounts/acc_hijacked/Library/Keychains/login.keychain-db"\n'
+      }
+      if (args[0] === 'login-keychain' && args.length === 1) {
+        return '"/Users/test/.dsh/agy-accounts/acc_hijacked/Library/Keychains/login.keychain-db"\n'
+      }
+      if (args[0] === 'list-keychains') {
+        return '    "/Users/test/.dsh/agy-accounts/acc_hijacked/Library/Keychains/login.keychain-db"\n    "/Library/Keychains/System.keychain"\n'
+      }
+      return ''
+    }
+
+    const repaired = repairMacSystemKeychain(fakeHome, 'darwin', run)
+    assert.equal(repaired, true)
+    // Verify default-keychain was reset to realKc
+    assert.ok(calls.some((c) => c.startsWith(`default-keychain -s ${realKc}`)))
+    // Verify login-keychain was reset to realKc
+    assert.ok(calls.some((c) => c.startsWith(`login-keychain -s ${realKc}`)))
+    // Verify list-keychains was cleaned
+    const setListCall = calls.find((c) => c.startsWith('list-keychains -d user -s'))
+    assert.ok(setListCall)
+    assert.ok(setListCall.includes(realKc))
+    assert.ok(!setListCall.includes('acc_hijacked'))
+
+    // Second run: everything is already clean -> returns false
+    const cleanCalls: string[] = []
+    const runClean = (_file: string, args: readonly string[]) => {
+      cleanCalls.push(args.join(' '))
+      if (args[0] === 'default-keychain' && args.length === 1) return `"${realKc}"\n`
+      if (args[0] === 'login-keychain' && args.length === 1) return `"${realKc}"\n`
+      if (args[0] === 'list-keychains') return `    "${realKc}"\n    "/Library/Keychains/System.keychain"\n`
+      return ''
+    }
+    assert.equal(repairMacSystemKeychain(fakeHome, 'darwin', runClean), false)
+  } finally {
+    rmSync(fakeHome, { recursive: true, force: true })
   }
 })
 

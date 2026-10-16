@@ -90,6 +90,12 @@ async function handle(deps: CommandDeps, raw: string, invocation?: CommandInvoca
         const qG = a.quotas.google?.remainingFraction !== undefined ? `${Math.round(a.quotas.google.remainingFraction * 100)}%` : 'unknown'
         const qC = a.quotas.anthropic?.remainingFraction !== undefined ? `${Math.round(a.quotas.anthropic.remainingFraction * 100)}%` : 'unknown'
         const qO = a.quotas.openai?.remainingFraction !== undefined ? `${Math.round(a.quotas.openai.remainingFraction * 100)}%` : 'unknown'
+        // Gemini 4 Argon (Pro/Ultra only): a weekly-only counter. Append the
+        // column ONLY when the backend reported one — accounts without the
+        // argon permission keep the classic three-family line.
+        const qA = a.quotas.argon?.weeklyFraction
+        const quotaLine = `   - Quota: Gemini ${qG} | Claude ${qC} | GPT-OSS ${qO}` +
+          (qA !== undefined ? ` | Argon ${Math.round(qA * 100)}% (weekly)` : '')
         const cds: string[] = []
         for (const [fam, cd] of Object.entries(a.cooldowns)) {
           if (cd && cd.cooldownUntil > Date.now()) {
@@ -109,7 +115,7 @@ async function handle(deps: CommandDeps, raw: string, invocation?: CommandInvoca
             `${i + 1}. **${a.alias}** (${a.email || a.id})${isPrimary ? ' ⭐ primary' : ''}`,
             // Proxy URLs can embed user:pass — never print them raw into the GUI.
             `   - Proxy: ${a.proxyUrl ? redactProxyUrl(a.proxyUrl) : deps.cfg().proxyUrl ? redactProxyUrl(deps.cfg().proxyUrl) : 'system default'}`,
-            `   - Quota: Gemini ${qG} | Claude ${qC} | GPT-OSS ${qO}`,
+            quotaLine,
             statusText,
           )
         }

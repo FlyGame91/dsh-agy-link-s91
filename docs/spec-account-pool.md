@@ -84,7 +84,7 @@ This specification details a **Multi-Account Pool (号池系统)** that enables 
 ## 3. Real-Time Quota Statistics (实时配额统计)
 
 ### 3.1 Quota API Endpoint & Payload
-- **Endpoint**: `https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` (Fallback: `https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels`)
+- **Endpoint**: `https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` (Fallback: `https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels`)
 - **Headers**: `Authorization: Bearer <access_token>`, `User-Agent: antigravity/1.1.15 darwin/arm64`
 - **Response Format**:
   ```json

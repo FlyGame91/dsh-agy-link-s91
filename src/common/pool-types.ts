@@ -1,11 +1,19 @@
 // Domain types and models for the Antigravity Multi-Account Pool & Sequential Drain.
 
-export type ModelFamily = 'google' | 'anthropic' | 'openai' | 'unknown'
+export type ModelFamily = 'google' | 'argon' | 'anthropic' | 'openai' | 'unknown'
 
-/** Map a model slug to its backend quota counter family. */
+/**
+ * Map a model slug to its backend quota counter family.
+ *
+ * Gemini 4 Argon (Pro/Ultra-only) bills against its OWN weekly quota pool —
+ * never the plain Gemini one. Its ids look like `gemini-4-argon-low/-medium`
+ * and MUST be detected before the generic `gemini-` prefix below, otherwise
+ * argon usage would silently drain/report the Gemini counter.
+ */
 export function modelFamilyOf(modelId?: string): ModelFamily {
   if (!modelId) return 'unknown'
   const id = modelId.toLowerCase()
+  if (id.includes('argon')) return 'argon'
   if (id.startsWith('claude-') || id.includes('claude')) return 'anthropic'
   if (id.startsWith('gemini-') || id.startsWith('gemma-') || id.includes('gemini')) return 'google'
   if (id.startsWith('gpt-') || id.startsWith('openai/') || id.includes('gpt-oss')) return 'openai'
@@ -105,6 +113,17 @@ export function shouldPollAccount(account: ManagedAccount): boolean {
   }
   return true
 }
+
+/**
+ * How many independent, NON-authoritative auth-classified failures are needed
+ * before an account is sticky-quarantined. agy's "not signed in" stderr banner
+ * is byte-identical for a real sign-out and for a keyring validation that died
+ * on the network, so a SINGLE occurrence is not proof of a dead login (live
+ * incident 2026-10-16: one afternoon of proxy jitter quarantined three healthy
+ * accounts on first sight). Authoritative evidence (invalid_grant, revoked…)
+ * and the explicit re-login paths bypass this gate entirely.
+ */
+export const AUTH_CONFIRM_STRIKES = 2
 
 /**
  * After this long, an authRequired flag becomes eligible for ONE background

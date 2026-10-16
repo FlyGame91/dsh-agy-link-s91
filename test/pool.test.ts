@@ -11,6 +11,11 @@ test('modelFamilyOf correctly categorizes models', () => {
   assert.equal(modelFamilyOf('gemini-3.6-flash'), 'google')
   assert.equal(modelFamilyOf('gemini-3.1-pro'), 'google')
   assert.equal(modelFamilyOf('gemma-2-9b'), 'google')
+  // Gemini 4 Argon bills its own weekly pool — never the plain Gemini family.
+  assert.equal(modelFamilyOf('gemini-4-argon'), 'argon')
+  assert.equal(modelFamilyOf('gemini-4-argon-low'), 'argon')
+  assert.equal(modelFamilyOf('gemini-4-argon-medium'), 'argon')
+  assert.equal(modelFamilyOf('gemini-4-argon-high'), 'argon')
   assert.equal(modelFamilyOf('claude-sonnet-4-6'), 'anthropic')
   assert.equal(modelFamilyOf('claude-3-7-sonnet'), 'anthropic')
   assert.equal(modelFamilyOf('claude-opus-4-6-thinking'), 'anthropic')

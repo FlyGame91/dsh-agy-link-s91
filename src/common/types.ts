@@ -174,6 +174,38 @@ export function looksLikeNetworkError(message: string): boolean {
 }
 
 /**
+ * Evidence from agy's OWN per-run log that a stored credential was present but
+ * could not be VALIDATED over the network — i.e. jitter wearing an auth costume.
+ *
+ * The stderr banner agy prints when silent auth fails is byte-identical for a
+ * genuine sign-out and for a keyring validation that missed its hard 10s
+ * window, so the banner cannot decide AUTH vs NETWORK. The log can:
+ *
+ *   real sign-out   printmode.go:403 not authenticated, trying silent auth
+ *                   printmode.go:409 silent auth failed        ← 29 ms later,
+ *                   (NO keyringAuth: line — nothing to validate)  no keyring line
+ *   network blip    printmode.go:403 not authenticated, trying silent auth
+ *                   keyring.go:64   keyringAuth: loaded token … expired=false
+ *                   keyring.go:111  keyringAuth: timed out after 10s
+ *                   printmode.go:409 silent auth failed
+ *                   keyring.go:93   keyringAuth: failed to fetch user info:
+ *                                   userinfo request failed: … i/o timeout
+ *
+ * `keyringAuth:` lines only exist when agy actually HAD a credential to
+ * validate, and the timeout / userinfo markers are transport failures inside
+ * that validation. Verified against real logs (2026-10-16): the sign-out log
+ * contains 0 occurrences of every marker below, the blip log contains all of
+ * them.
+ */
+export function looksLikeAuthVerificationJitter(agyLogText: string): boolean {
+  if (agyLogText === '') return false
+  // An authoritative OAuth token error (revoked / invalid_grant …) is proof of
+  // a dead login no matter what else the run logged — never downgrade it.
+  if (isAuthoritativeAuthError(agyLogText)) return false
+  return /keyringAuth: timed out after|failed to fetch user info|userinfo request failed/i.test(agyLogText)
+}
+
+/**
  * Decide whether a failed call may flag an account as "needs re-login".
  * Genuine AUTH classification wins (unless the failure was transport-shaped),
  * and the message must name an authoritative token state otherwise.

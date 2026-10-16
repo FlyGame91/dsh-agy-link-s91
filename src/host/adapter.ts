@@ -6,8 +6,9 @@
 // prompt; earlier context rides agy-native history plus a digest prefix on
 // first bind (ADR-7).
 import { join } from 'node:path'
+import { homedir } from 'node:os'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
-import { Err, isAccountScopedFailure, looksLikeAuthFailure, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeNetworkError, looksLikeRateLimit, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
+import { Err, isAccountScopedFailure, isAuthoritativeAuthError, looksLikeAuthFailure, looksLikeAuthVerificationJitter, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeNetworkError, looksLikeRateLimit, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
 import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { conversationsDirFor, diffConversations, snapshotConversations } from './discovery.ts'
@@ -19,6 +20,7 @@ import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
 import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin, stripNulBytes } from './runner.ts'
 import { detectSystemProxy } from './wincred.ts'
 import { acquireCredentialSlot, SlotUnavailableError } from './credential-slot.ts'
+import { agyHomeDirFor, readAgyRunLogText, snapshotAgyLogs } from './agy-log.ts'
 import { stateDir } from '../common/config.ts'
 import { SENT_IMAGE_IDS_MAX, type SessionStore } from './sessions.ts'
 import { readFullToolArgs, readStepThoughts, clearAgyDbCache } from './agy-db.ts'
@@ -348,7 +350,7 @@ export interface AgyAdapterDeps {
   pool?: AccountPoolManager
   bin: () => string | null
   /** Shared semaphore for cross-session concurrency (ADR-12). */
-  acquire: () => Promise<() => void>
+  acquire: (signal?: AbortSignal) => Promise<() => void>
   log?: (msg: string) => void
   /** Recordings shared with the agy_tool mirror (native tool-card mirroring). */
   runs: RunRegistry
@@ -659,10 +661,11 @@ export class AgyAdapter extends LlmAdapter {
     model: LlmResolvedModelInfo
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>
   }> {
+    if (signal?.aborted) throw signal.reason ?? new LlmError('aborted', 'ABORTED')
     const modelInfo = await this.resolveModel(provider, model, signal)
     return {
       model: modelInfo,
-      stream: (options) => this.stream(options),
+      stream: (options) => this.stream({ ...options, signal: options.signal ?? signal }),
     }
   }
 
@@ -778,7 +781,7 @@ export class AgyAdapter extends LlmAdapter {
       // forever on rotating accounts.
       const deadFailure = rec !== undefined && rec.isSettled ? rec.failureInfo : null
       if (rec !== undefined && !(deadFailure !== null && this.claimFailover(sessionKey, deadFailure.code))) {
-        yield* this.driveSpan(rec, continuation.eventIndex + 1, hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit)
+        yield* this.driveSpan(rec, continuation.eventIndex + 1, hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal)
         return
       }
       if (rec !== undefined) {
@@ -1211,7 +1214,7 @@ export class AgyAdapter extends LlmAdapter {
             'duplicate-debounce rescue: identical prompt for a live agy run ' + liveRun.runId + ' — re-driving from event ' + rescueFrom + ' instead of throwing BUSY',
           )
           this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: now, inFlight: true })
-          yield* this.driveSpan(liveRun, rescueFrom, hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit)
+          yield* this.driveSpan(liveRun, rescueFrom, hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal)
           return
         }
         throw new LlmError(
@@ -1409,7 +1412,7 @@ export class AgyAdapter extends LlmAdapter {
         })
       : argsBase
     const stdinPayload = promptViaStdin ? buildStreamInputLine(prompt) : undefined
-    const release = await this.deps.acquire()
+    const release = await this.deps.acquire(options.signal)
     let released = false
     let slotLease: Awaited<ReturnType<typeof acquireCredentialSlot>>
     try {
@@ -1467,6 +1470,13 @@ export class AgyAdapter extends LlmAdapter {
     // the macOS Keychain); injecting HOME there signs agy out ("Please
     // sign in") and every turn fails with an auth error.
     if (account && account.dir) ensureIsolatedKeychain(account.dir)
+    // Snapshot agy's per-run log set BEFORE spawning so evidence found after
+    // the run can be attributed to THIS run (each invocation writes a fresh
+    // cli-*.log). The stderr banner for a failed silent auth is byte-identical
+    // for a genuine sign-out and for a keyring validation that died on the
+    // network; only this log separates the two.
+    const runLogHome = agyHomeDirFor(account)
+    const runLogsBefore = snapshotAgyLogs(runLogHome)
     const effectiveProxy = account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined
     const env = {
       ...process.env,
@@ -1496,7 +1506,18 @@ export class AgyAdapter extends LlmAdapter {
         const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
         const targetInterval = this.minSpawnIntervalMs + jitter
         if (elapsed < targetInterval) {
-          await new Promise((r) => setTimeout(r, targetInterval - elapsed))
+          if (options.signal?.aborted) throw new LlmError('request aborted before the agy process was spawned', Err.AGY_ERROR)
+          await new Promise<void>((r, reject) => {
+            const timer = setTimeout(() => {
+              options.signal?.removeEventListener('abort', onAbort)
+              r()
+            }, targetInterval - elapsed)
+            const onAbort = () => {
+              clearTimeout(timer)
+              reject(new LlmError('request aborted before the agy process was spawned', Err.AGY_ERROR))
+            }
+            options.signal?.addEventListener('abort', onAbort, { once: true })
+          })
         }
         this.lastAccountSpawnTime.set(account.id, Date.now())
       }
@@ -1604,7 +1625,12 @@ export class AgyAdapter extends LlmAdapter {
       // the auth-shaped banner agy prints on stdout ("silent auth failed").
       // A flaky proxy makes agy report "not logged into Antigravity" for a
       // login that is perfectly fine, so this decides AUTH vs NETWORK below.
-      const transportFailure = looksLikeNetworkError(
+      // This run's agy log is the decisive extra input: keyring-auth timeout /
+      // userinfo transport failure proves a credential was present and only
+      // the network was down (2026-10-16 quarantine incident).
+      const runLogText = readAgyRunLogText(runLogHome, runLogsBefore)
+      const keyringJitter = looksLikeAuthVerificationJitter(runLogText)
+      const transportFailure = keyringJitter || looksLikeNetworkError(
         [rawErrText, parser.stats.authFailureText ?? '', outcome.stderrTail, outcome.stdout.slice(0, 4000)].filter(Boolean).join(' '),
       )
       // A timeout that never produced a single stdout event is an account-level
@@ -1633,7 +1659,9 @@ export class AgyAdapter extends LlmAdapter {
             ? {
                 kind: 'error',
                 code: Err.NETWORK,
-                message: 'agy could not validate its Google login over the network (transport failure, not a sign-out) — retrying on another account. '
+                message: 'agy could not validate its Google login over the network (transport failure'
+                  + (keyringJitter ? '; its own log shows keyring auth timing out on the network, not a sign-out' : '')
+                  + ', not a sign-out) — retrying on another account. '
                   + (rawErrText !== '' ? brief(rawErrText) : ''),
               }
             : { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — run /agy auth (or run agy once in a terminal) to login' }
@@ -1774,7 +1802,18 @@ export class AgyAdapter extends LlmAdapter {
         // quota refresh disproved the flag. NETWORK is not AUTH, and
         // shouldMarkAuthRequired additionally exempts transport-shaped text.
         if (account && shouldMarkAuthRequired(failure.code, failure.message)) {
-          this.deps.pool?.markAuthRequired(account.id, failure.message)
+          // Authoritative OAuth evidence (invalid_grant, revoked…) or the
+          // explicit re-login paths quarantine immediately. A bare "not signed
+          // in" banner carries no such proof — it is byte-identical for a real
+          // sign-out and a keyring validation that lost the network race — so
+          // it needs a second independent confirmation before it may take the
+          // account out of rotation.
+          const authoritative = isAuthoritativeAuthError(rawErrText + ' ' + runLogText)
+          if (failure.code === Err.AUTH && !authoritative) {
+            this.deps.pool?.noteAuthFailure(account.id, failure.message)
+          } else {
+            this.deps.pool?.markAuthRequired(account.id, failure.message)
+          }
         }
         // A conversation only becomes unusable when the login died or agy
         // itself rejected the id. Rate limits / overload / transport blips do
@@ -1842,7 +1881,7 @@ export class AgyAdapter extends LlmAdapter {
 
     // First span of the run: stream recorded events until the first
     // completed tool step cuts it (or the result finishes it).
-    yield* this.driveSpan(rec, 0, !isAux && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit)
+    yield* this.driveSpan(rec, 0, !isAux && hasToolSupport, isCodeMode, goalContext, supportsGoalUpdate, supportsPlanExit, options.signal)
   }
 
   /**
@@ -1860,7 +1899,16 @@ export class AgyAdapter extends LlmAdapter {
     goalContext?: GoalContext | null,
     supportsGoalUpdate?: boolean,
     supportsPlanExit?: boolean,
+    signal?: AbortSignal,
   ): AsyncIterable<StreamChunk> {
+    if (signal?.aborted) {
+      rec.requestAbort?.()
+      yield {
+        type: 'finish',
+        reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted by caller' } },
+      }
+      return
+    }
     // A span can wait hours for a wedged agy tool step. Pin the recording for
     // its whole lifetime so the shared registry can never evict a run whose
     // mirror calls are still queued behind that cut, and refresh its recency
@@ -1869,7 +1917,7 @@ export class AgyAdapter extends LlmAdapter {
     this.deps.runs.remember(rec)
     this.deps.runs.pin(rec.runId)
     try {
-      yield* this.driveSpanBody(rec, from, cutOnTool, useCodeWrapper, goalContext, supportsGoalUpdate, supportsPlanExit)
+      yield* this.driveSpanBody(rec, from, cutOnTool, useCodeWrapper, goalContext, supportsGoalUpdate, supportsPlanExit, signal)
     } finally {
       this.deps.runs.unpin(rec.runId)
       this.deps.runs.remember(rec)
@@ -1885,8 +1933,21 @@ export class AgyAdapter extends LlmAdapter {
     goalContext?: GoalContext | null,
     supportsGoalUpdate?: boolean,
     supportsPlanExit?: boolean,
+    signal?: AbortSignal,
   ): AsyncIterable<StreamChunk> {
     const queue = new ChunkQueue()
+    let abortedLocally = false
+    const onAbort = () => {
+      abortedLocally = true
+      rec.requestAbort?.()
+      queue.push({
+        type: 'finish',
+        reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted by caller' } },
+      })
+      queue.close()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+
     void (async () => {
       // Resolve FULL tool args and thoughts from the agy conversation DB (agy's
       // stream output strips CodeContent/TargetContent/ReplacementContent via
@@ -1911,6 +1972,7 @@ export class AgyAdapter extends LlmAdapter {
       let i = from
       try {
         for await (const ev of rec.eventsFrom(from)) {
+          if (abortedLocally || signal?.aborted) break
           const recordedThought = rec.getThoughts(i)
           if (recordedThought !== undefined) {
             resolvedThoughts.set(i, recordedThought)
@@ -1990,7 +2052,7 @@ export class AgyAdapter extends LlmAdapter {
             break
           }
         }
-        if (!mapper.isFinished) {
+        if (!mapper.isFinished && !abortedLocally && !signal?.aborted) {
           const f = rec.failureInfo
           if (f !== null) {
             for (const ch of mapper.emitFailure(f.kind, f.code, f.message)) queue.push(ch)
@@ -1999,11 +2061,17 @@ export class AgyAdapter extends LlmAdapter {
           }
         }
       } catch (err) {
-        for (const ch of mapper.emitFailure('error', Err.PROCESS_EXIT, 'internal error: ' + brief(String(err)))) queue.push(ch)
+        if (!abortedLocally && !signal?.aborted) {
+          for (const ch of mapper.emitFailure('error', Err.PROCESS_EXIT, 'internal error: ' + brief(String(err)))) queue.push(ch)
+        }
       }
       queue.close()
     })()
-    yield* queue.drain()
+    try {
+      yield* queue.drain()
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
   }
 }
 

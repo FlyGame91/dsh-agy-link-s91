@@ -19,7 +19,7 @@ import { defineAgyMirrorTool } from './host/mirror-tool.ts'
 import type { ToolExecution, PreToolDecision } from '@deepseek-ai/dsh-tools'
 import { ModelCatalog, sanitizeCatalogEntries } from './host/models.ts'
 import { RunRegistry } from './host/recording.ts'
-import { MIN_AGY_VERSION, compareVersions, ensureIsolatedKeychain, isolatedHomeEnv, parseVersion, probeProcess, proxyEnvFor, resolveAgyBin } from './host/runner.ts'
+import { MIN_AGY_VERSION, compareVersions, ensureIsolatedKeychain, isolatedHomeEnv, openAccountTerminal, parseVersion, probeProcess, proxyEnvFor, purgeStaleIsolatedKeychain, repairMacSystemKeychain, resolveAgyBin } from './host/runner.ts'
 import { SessionStore } from './host/sessions.ts'
 import { AccountPoolManager } from './host/pool.ts'
 import { PoolAuthFlow } from './host/pool-auth.ts'
@@ -69,16 +69,26 @@ class Semaphore {
   private active = 0
   private queue: Array<() => void> = []
   constructor(private readonly max: () => number) {}
-  async acquire(): Promise<() => void> {
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) throw new Error('aborted before semaphore acquisition')
     if (this.active < Math.max(1, this.max())) {
       this.active++
       return () => this.releaseOne()
     }
-    return new Promise((resolve) => {
-      this.queue.push(() => {
+    return new Promise((resolve, reject) => {
+      let entry: () => void
+      const onAbort = () => {
+        const idx = this.queue.indexOf(entry)
+        if (idx >= 0) this.queue.splice(idx, 1)
+        reject(new Error('aborted while waiting for semaphore slot'))
+      }
+      entry = () => {
+        signal?.removeEventListener('abort', onAbort)
         this.active++
         resolve(() => this.releaseOne())
-      })
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      this.queue.push(entry)
     })
   }
   private releaseOne(): void {
@@ -194,9 +204,20 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   // without one, agy's keyring save pops the system "create login keychain"
   // password dialog on every token refresh. Idempotent; pre-existing homes
   // from older versions are covered here too.
+  if (process.platform === 'darwin') {
+    try {
+      const repaired = repairMacSystemKeychain()
+      if (repaired) log('repaired macOS system keychain settings (restored real login keychain)')
+    } catch {
+      // ignore
+    }
+  }
   let kcProvisioned = 0
   for (const acc of pool.getAccounts()) {
-    if (acc.dir && ensureIsolatedKeychain(acc.dir)) kcProvisioned++
+    if (acc.dir) {
+      purgeStaleIsolatedKeychain(acc.dir)
+      if (ensureIsolatedKeychain(acc.dir)) kcProvisioned++
+    }
   }
   if (kcProvisioned > 0) log('provisioned isolated keychains for ' + kcProvisioned + ' pool account(s)')
   // Windows shares ONE process-global credential slot across every agy
@@ -229,7 +250,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     store,
     pool,
     bin,
-    acquire: () => semaphore.acquire(),
+    acquire: (signal) => semaphore.acquire(signal),
     log,
     runs,
     getMediaBaseUrl: () => (webServerPort.current ? `http://127.0.0.1:${webServerPort.current}/plugins/agy-link/media` : null),
@@ -686,16 +707,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         pool.markAuthRequired(acc.id, 'not signed in yet — complete the terminal login')
         const autoOpen = body.autoOpenTerminal !== false
         if (autoOpen && acc.dir) {
-          if (process.platform === 'darwin') {
-            const script = `tell application "Terminal" to activate\ntell application "Terminal" to do script "export HOME='${acc.dir}'; agy"`
-            execFile('osascript', ['-e', script], () => {})
-          } else if (process.platform === 'win32') {
-            // HOME alone is ignored by Node/Go on Windows — set USERPROFILE too.
-            // windowsHide keeps the outer wrapper from flashing a console in GUI hosts.
-            execFile('cmd.exe', ['/c', 'start', 'cmd.exe', '/k', `set "HOME=${acc.dir}" && set "USERPROFILE=${acc.dir}" && agy`], { windowsHide: true }, () => {})
-          } else {
-            execFile('x-terminal-emulator', ['-e', `sh -c "export HOME='${acc.dir}'; agy; exec sh"`], () => {})
-          }
+          openAccountTerminal(acc.dir)
         }
         sendJson(res as RawRes, 200, { ok: true, account: acc, pool: pool.getPoolData() })
       })()
@@ -713,16 +725,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           sendJson(res as RawRes, 400, { error: 'account has no isolated directory' })
           return
         }
-        if (process.platform === 'darwin') {
-          const script = `tell application "Terminal" to activate\ntell application "Terminal" to do script "export HOME='${acc.dir}'; agy"`
-          execFile('osascript', ['-e', script], () => {})
-        } else if (process.platform === 'win32') {
-          // HOME alone is ignored by Node/Go on Windows — set USERPROFILE too.
-          // windowsHide keeps the outer wrapper from flashing a console in GUI hosts.
-          execFile('cmd.exe', ['/c', 'start', 'cmd.exe', '/k', `set "HOME=${acc.dir}" && set "USERPROFILE=${acc.dir}" && agy`], { windowsHide: true }, () => {})
-        } else {
-          execFile('x-terminal-emulator', ['-e', `sh -c "export HOME='${acc.dir}'; agy; exec sh"`], () => {})
-        }
+        openAccountTerminal(acc.dir)
         sendJson(res as RawRes, 200, { ok: true, dir: acc.dir })
       })()
     }})

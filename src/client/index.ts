@@ -373,8 +373,10 @@ function uiIcon(key: UiIconKey, size = 12, color = 'currentColor'): unknown {
 	}));
 }
 
-const FAMILY_BRAND: Record<'google' | 'anthropic' | 'openai', BrandKey> = {
+const FAMILY_BRAND: Record<'google' | 'argon' | 'anthropic' | 'openai', BrandKey> = {
 	google: 'gemini',
+	// Gemini 4 Argon is a Google model — it keeps the Gemini mark.
+	argon: 'gemini',
 	anthropic: 'claude',
 	openai: 'openai',
 };
@@ -1289,7 +1291,7 @@ export function apply(ctx: ClientContext): void {
 			);
 		};
 
-		const renderQuotaBar = (label: string, familyKey: 'google' | 'anthropic' | 'openai', acc: ManagedAccount): unknown => {
+		const renderQuotaBar = (label: string, familyKey: 'google' | 'argon' | 'anthropic' | 'openai', acc: ManagedAccount): unknown => {
 			const info = acc.quotas[familyKey];
 			const cd = acc.cooldowns[familyKey];
 			const inCooldown = cd && cd.cooldownUntil > Date.now();
@@ -1381,7 +1383,9 @@ export function apply(ctx: ClientContext): void {
 					brandIcon(FAMILY_BRAND[familyKey], 14),
 					h('span', null, label),
 				),
-				renderLine(t('quota.fiveHour'), pct5h, c5h, w5h.resetText ? w5h.resetText + cdNote : cdNote.replace(/^ · /, '')),
+				// Argon is a WEEKLY-only counter today: render the 5h row only when
+				// the backend actually reports one, never as a permanent "—" ghost.
+				(familyKey !== 'argon' || has5h) ? renderLine(t('quota.fiveHour'), pct5h, c5h, w5h.resetText ? w5h.resetText + cdNote : cdNote.replace(/^ · /, '')) : null,
 				renderLine(t('quota.weekly'), pctWeekly, cWeekly, wWeekly.resetText),
 			);
 		};
@@ -1413,10 +1417,12 @@ export function apply(ctx: ClientContext): void {
 				: acc.alias;
 
 			const googleModels = acc.quotas.google?.models ?? [];
+			const argonModels = acc.quotas.argon?.models ?? [];
 			const anthropicModels = acc.quotas.anthropic?.models ?? [];
 			const openaiModels = acc.quotas.openai?.models ?? [];
 			const allChildModels: { family: string; model: ModelQuotaInfo }[] = [
 				...googleModels.map((m) => ({ family: 'Google', model: m })),
+				...argonModels.map((m) => ({ family: 'Argon', model: m })),
 				...anthropicModels.map((m) => ({ family: 'Anthropic', model: m })),
 				...openaiModels.map((m) => ({ family: 'OpenAI', model: m })),
 			];
@@ -1620,6 +1626,11 @@ export function apply(ctx: ClientContext): void {
 				// Body: Always directly visible, showing quota
 h('div', { key: 'agy-body', style: S.quotaBox },
 						renderQuotaBar('Gemini', 'google', acc),
+						// Gemini 4 Argon (Pro/Ultra only): the backend reports its own
+						// quota group/weekly bucket ONLY for accounts that have the
+						// permission, so gate the row on the data itself — free and
+						// legacy plans never see an empty Argon panel.
+						acc.quotas.argon ? renderQuotaBar('Argon', 'argon', acc) : null,
 						h('button', {
 							type: 'button',
 							className: 'agy-btn',

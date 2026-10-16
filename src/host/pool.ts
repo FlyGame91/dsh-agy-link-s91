@@ -4,6 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameS
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { homedir } from 'node:os'
 import {
+  AUTH_CONFIRM_STRIKES,
   defaultPoolData,
   modelFamilyOf,
   type AccountPoolData,
@@ -30,6 +31,14 @@ export class AccountPoolManager {
    * sessions.json: web + headless share this file).
    */
   private readonly knownIds = new Set<string>()
+
+  /**
+   * Consecutive non-authoritative auth failures per account id (noteAuthFailure).
+   * Deliberately in-memory: losing the streak on restart only costs one extra
+   * confirmation round, while persisting it could quarantine an account for a
+   * blip that healed while the process was down.
+   */
+  private readonly authStrikes = new Map<string, number>()
   /** Serialized snapshot of the last successful persist/load; skips no-op writes. */
   private persistedJson = ''
 
@@ -473,7 +482,33 @@ export class AccountPoolManager {
         if (accId === id) delete this.data.activeAccountIds[fam as ModelFamily]
       }
     }
+    this.authStrikes.delete(id)
     this.persist()
+  }
+
+  /**
+   * Confirmation-gated quarantine for auth-classified failures that carry NO
+   * authoritative evidence (no invalid_grant / revoked / unauthorized_client).
+   *
+   * agy prints the same "not signed in" banner whether the login is really
+   * dead or its keyring validation merely missed a 10s window on a flaky
+   * network, so one banner used to sticky-quarantine healthy accounts — the
+   * user then saw a red 需重新登录 and could not even 设为当前使用. A single
+   * strike now only rotates the account away for the current retry; the flag
+   * hardens into a real quarantine only when the failure repeats with no
+   * success in between. Authoritative OAuth paths keep calling
+   * markAuthRequired directly and quarantine on first sight.
+   *
+   * Returns true when the account is now hard-quarantined.
+   */
+  noteAuthFailure(id: string, reason?: string): boolean {
+    const strikes = (this.authStrikes.get(id) ?? 0) + 1
+    if (strikes < AUTH_CONFIRM_STRIKES) {
+      this.authStrikes.set(id, strikes)
+      return false
+    }
+    this.markAuthRequired(id, reason)
+    return true
   }
 
   /**
@@ -500,6 +535,7 @@ export class AccountPoolManager {
     delete acc.authRequired
     delete acc.authError
     delete acc.authMarkedAt
+    this.authStrikes.delete(id)
     this.persist()
   }
 
@@ -793,6 +829,9 @@ export class AccountPoolManager {
     if (acc.cooldowns?.[family]) {
       delete acc.cooldowns[family]
     }
+    // A successful run is positive proof the login is alive: drop any pending
+    // auth-confirmation streak so an old blip cannot harden later.
+    this.authStrikes.delete(id)
     this.persist()
   }
 

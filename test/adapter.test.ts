@@ -480,6 +480,88 @@ test('agy 1.1.15 stream mirrors tools as native cards across spans', async () =>
   assert.equal((card as { card: string } | undefined)?.card, 'terminal')
 })
 
+test('a Stop mid-flight during tool continuation aborts immediately and terminates the stream', async () => {
+  const { adapter } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'real'
+  const messages: Message[] = [msg('user', 'count the files')]
+
+  // Hop 0: streams until first tool call
+  const span0 = await collect(adapter.stream(opts([...messages])))
+  const finish0 = span0[span0.length - 1] as { type: string; reason: { kind: string } }
+  assert.equal(finish0.reason.kind, 'tool-calls')
+
+  const end = span0.find(
+    (c) => c.type === 'block-end' && (c as { block: { type: string } }).block.type === 'tool-call',
+  ) as unknown as { block: { id: string; name: string; arguments: string } }
+  assert.ok(end !== undefined)
+
+  messages.push({
+    role: 'assistant',
+    content: [{ type: 'tool-call', id: end.block.id, name: end.block.name, arguments: end.block.arguments }],
+  } as unknown as Message)
+  messages.push({
+    role: 'tool',
+    toolCallId: end.block.id,
+    content: [{ type: 'text', text: 'note1.txt\nnote2.txt\n' }],
+  } as unknown as Message)
+
+  // Hop 1 (continuation span): simulate user clicking "Stop generating"
+  const ctrl = new AbortController()
+  const iter = adapter.stream(opts([...messages], { signal: ctrl.signal }))[Symbol.asyncIterator]()
+
+  ctrl.abort()
+
+  const continuationChunks: StreamChunk[] = []
+  for await (const chunk of { [Symbol.asyncIterator]: () => iter }) {
+    continuationChunks.push(chunk)
+  }
+
+  const lastChunk = continuationChunks[continuationChunks.length - 1] as { type: string; reason?: { kind: string } }
+  assert.equal(lastChunk?.type, 'finish')
+  assert.equal(lastChunk?.reason?.kind, 'aborted')
+})
+
+test('a Stop mid-flight during tool continuation with active iterator aborts cleanly', async () => {
+  const { adapter } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'real'
+  const messages: Message[] = [msg('user', 'count the files')]
+
+  const span0 = await collect(adapter.stream(opts([...messages])))
+  const end = span0.find(
+    (c) => c.type === 'block-end' && (c as { block: { type: string } }).block.type === 'tool-call',
+  ) as unknown as { block: { id: string; name: string; arguments: string } }
+  assert.ok(end !== undefined)
+
+  messages.push({
+    role: 'assistant',
+    content: [{ type: 'tool-call', id: end.block.id, name: end.block.name, arguments: end.block.arguments }],
+  } as unknown as Message)
+  messages.push({
+    role: 'tool',
+    toolCallId: end.block.id,
+    content: [{ type: 'text', text: 'note1.txt\nnote2.txt\n' }],
+  } as unknown as Message)
+
+  const ctrl = new AbortController()
+  const iter = adapter.stream(opts([...messages], { signal: ctrl.signal }))[Symbol.asyncIterator]()
+  // Read first chunk
+  const first = await iter.next()
+  assert.equal(first.done, false)
+  // Stop clicked while continuation span is draining
+  ctrl.abort()
+
+  const rem: StreamChunk[] = []
+  for (;;) {
+    const next = await iter.next()
+    if (next.done) break
+    rem.push(next.value)
+  }
+  const last = rem[rem.length - 1] as { type: string; reason?: { kind: string } }
+  assert.equal(last?.type, 'finish')
+  assert.equal(last?.reason?.kind, 'aborted')
+})
+
+
 test('agy 1.1.15 result ERROR with response still finishes stop', async () => {
   const { adapter } = makeAdapter()
   process.env.FAKE_AGY_MODE = 'real-error'
@@ -1430,6 +1512,49 @@ test('transport-shaped auth failure is NETWORK (retryable, rotates) instead of A
     const primary = pool.getAccounts()[0]!
     assert.equal(primary.authRequired, undefined, 'a transport blip must never flag the account for re-login')
     assert.equal(pool.getPoolData().lastActiveAccountId, second.id, 'the retry must land on another account')
+  } finally {
+    process.env.FAKE_AGY_MODE = prevMode
+  }
+})
+
+test('a keyring-auth timeout in agy\'s own log is NETWORK, never a sticky AUTH quarantine', async () => {
+  // The live 2026-10-16 bug: the stderr banner is byte-identical to a real
+  // sign-out, but agy's log shows `keyringAuth: timed out after 10s` — proof a
+  // stored credential existed and only the network was down.
+  const prevMode = process.env.FAKE_AGY_MODE
+  process.env.FAKE_AGY_MODE = 'auth-jitter'
+  const pool = new AccountPoolManager(join(workDir, 'pool-auth-jitter'))
+  const slot = pool.createAccountSlot('Jitter')
+  pool.setAccountEnabled('acc_primary', false)
+  try {
+    const { adapter } = makeAdapter({}, { pool })
+    const chunks = await collect(adapter.stream(opts([msg('user', 'hi')], { sessionId: 'sess-auth-jitter' as never })))
+    const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string; message: string } } }
+    assert.equal(finish.reason.kind, 'error')
+    assert.equal(finish.reason.failure?.code, Err.NETWORK, JSON.stringify(finish.reason.failure))
+    assert.ok(/keyring auth timing out/.test(finish.reason.failure?.message ?? ''), finish.reason.failure?.message)
+    const flagged = pool.getAccount(slot.id)!
+    assert.equal(flagged.authRequired, undefined, 'jitter must never sticky-quarantine the account')
+    assert.equal(pool.getPoolData().lastActiveAccountId, slot.id === flagged.id ? slot.id : pool.getPoolData().lastActiveAccountId)
+  } finally {
+    process.env.FAKE_AGY_MODE = prevMode
+  }
+})
+
+test('a bare "not signed in" banner does not sticky-quarantine on the first occurrence', async () => {
+  const prevMode = process.env.FAKE_AGY_MODE
+  process.env.FAKE_AGY_MODE = 'auth'
+  const pool = new AccountPoolManager(join(workDir, 'pool-auth-confirm'))
+  const slot = pool.createAccountSlot('Ambiguous')
+  pool.setAccountEnabled('acc_primary', false)
+  try {
+    const { adapter } = makeAdapter({}, { pool })
+    const chunks = await collect(adapter.stream(opts([msg('user', 'hi')], { sessionId: 'sess-auth-confirm' as never })))
+    const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string; message: string } } }
+    // The turn still fails with the accurate AUTH diagnosis…
+    assert.equal(finish.reason.failure?.code, Err.AUTH)
+    // …but one banner is not proof of a dead login, so no sticky flag yet.
+    assert.equal(pool.getAccount(slot.id)!.authRequired, undefined, 'a single ambiguous AUTH must not hard-quarantine')
   } finally {
     process.env.FAKE_AGY_MODE = prevMode
   }

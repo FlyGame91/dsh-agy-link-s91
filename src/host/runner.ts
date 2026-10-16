@@ -2,9 +2,9 @@
 // `agy -p` process as its own process group; abort and watchdog kill the
 // whole tree (agy re-spawns exec children). stderr is captured as a tail
 // for error attribution; stdout is streamed line-by-line to the caller.
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { accessSync, constants, existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { homedir } from 'node:os'
 import type { PluginConfig } from '../common/types.ts'
@@ -193,6 +193,178 @@ export function ensureIsolatedKeychain(
   } catch {
     return false
   }
+}
+
+/**
+ * Purge any stale locked keychain from an isolated account HOME directory.
+ * Keychains from older versions (v0.4.41-v0.4.44) were provisioned with
+ * ephemeral random passwords that cannot be unlocked with an empty password,
+ * causing repeated modal password dialogs from macOS SecurityAgent.
+ * If unlocking with `-p ""` fails, the file and its registration in securityd
+ * are purged so that ensureIsolatedKeychain can cleanly re-provision it.
+ */
+export function purgeStaleIsolatedKeychain(
+  dir: string,
+  platform: string = process.platform,
+  run: (file: string, args: readonly string[], env: NodeJS.ProcessEnv) => unknown = (file, args, env) =>
+    execFileSync(file, args, { stdio: 'ignore', env, timeout: 5000 }),
+): boolean {
+  if (platform !== 'darwin') return false
+  if (dir === '') return false
+  const kc = join(dir, 'Library', 'Keychains', 'login.keychain-db')
+  if (!existsSync(kc)) return false
+  const env = { ...process.env, HOME: dir }
+  try {
+    // Attempt silent unlock with empty passphrase
+    run('security', ['unlock-keychain', '-p', '', kc], env)
+    return false // unlocked successfully, not stale
+  } catch {
+    // Failed to unlock with empty passphrase — unregister and delete
+    try {
+      run('security', ['delete-keychain', kc], env)
+    } catch {
+      // ignore
+    }
+    try {
+      rmSync(kc, { force: true })
+    } catch {
+      // ignore
+    }
+    return true
+  }
+}
+
+/**
+ * macOS: Repair hijacked user-level keychain configuration.
+ *
+ * Versions prior to v0.4.49 set `security default-keychain -s <isolated-kc>`,
+ * redirecting the user's desktop session default and login keychain into an
+ * account-specific folder under ~/.dsh/agy-accounts/.
+ *
+ * This function detects if default-keychain, login-keychain, or the search list
+ * (`list-keychains -d user`) point to any path containing `agy-accounts` or `.dsh`,
+ * and restores them to the user's real login keychain (`~/Library/Keychains/login.keychain-db`).
+ */
+export function repairMacSystemKeychain(
+  userHome: string = homedir(),
+  platform: string = process.platform,
+  run: (file: string, args: readonly string[], env?: NodeJS.ProcessEnv) => string = (file, args, env) =>
+    execFileSync(file, args, { encoding: 'utf8', env: env ?? process.env, timeout: 5000 }),
+): boolean {
+  if (platform !== 'darwin') return false
+  if (!userHome) return false
+
+  let repaired = false
+  const realCandidates = [
+    join(userHome, 'Library', 'Keychains', 'login.keychain-db'),
+    join(userHome, 'Library', 'Keychains', 'login.keychain'),
+  ]
+  const realKc = realCandidates.find((p) => existsSync(p))
+  if (!realKc) return false
+
+  const isIsolatedPath = (p: string) => /[\\/]\.dsh[\\/]agy-accounts[\\/]/i.test(p)
+  const env = { ...process.env, HOME: userHome }
+
+  try {
+    const def = run('security', ['default-keychain'], env).trim().replace(/^"|"$/g, '')
+    if (isIsolatedPath(def)) {
+      run('security', ['default-keychain', '-s', realKc], env)
+      repaired = true
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    const loginkc = run('security', ['login-keychain'], env).trim().replace(/^"|"$/g, '')
+    if (isIsolatedPath(loginkc)) {
+      run('security', ['login-keychain', '-s', realKc], env)
+      repaired = true
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    const rawList = run('security', ['list-keychains', '-d', 'user'], env)
+    const entries = rawList
+      .split('\n')
+      .map((l) => l.trim().replace(/^"|"$/g, ''))
+      .filter(Boolean)
+    const hasTainted = entries.some(isIsolatedPath)
+    const hasReal = entries.includes(realKc)
+    if (hasTainted || !hasReal) {
+      const cleaned = entries.filter((p) => !isIsolatedPath(p))
+      if (!cleaned.includes(realKc)) cleaned.unshift(realKc)
+      const sysKc = '/Library/Keychains/System.keychain'
+      if (!cleaned.includes(sysKc) && existsSync(sysKc)) {
+        cleaned.push(sysKc)
+      }
+      run('security', ['list-keychains', '-d', 'user', '-s', ...cleaned], env)
+      repaired = true
+    }
+  } catch {
+    // ignore
+  }
+
+  return repaired
+}
+
+/**
+ * Open an interactive terminal session inside the given account directory.
+ * Supports macOS (Terminal.app via AppleScript), Windows (cmd.exe start),
+ * and Linux (xdg-terminal-exec, x-terminal-emulator, gnome-terminal, konsole,
+ * xfce4-terminal, alacritty, xterm across distributions).
+ * Safe, non-blocking and non-throwing.
+ */
+export function openAccountTerminal(
+  accDir: string,
+  platform: NodeJS.Platform = process.platform,
+  run: (file: string, args: readonly string[], opts?: { windowsHide?: boolean }) => void = (file, args, opts) =>
+    execFile(file, [...args], { windowsHide: opts?.windowsHide }, () => {}),
+): boolean {
+  if (!accDir) return false
+
+  if (platform === 'darwin') {
+    const script = `tell application "Terminal" to activate\ntell application "Terminal" to do script "export HOME='${accDir}'; agy"`
+    try {
+      run('osascript', ['-e', script])
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  if (platform === 'win32') {
+    try {
+      run('cmd.exe', ['/c', 'start', 'cmd.exe', '/k', `set "HOME=${accDir}" && set "USERPROFILE=${accDir}" && agy`], { windowsHide: true })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  // Linux: Try candidate terminal emulators across distros (FreeDesktop, Debian, GNOME, KDE, XFCE, etc.)
+  const cmd = `export HOME='${accDir}'; agy; exec bash`
+  const candidates: Array<{ bin: string; args: string[] }> = [
+    { bin: 'xdg-terminal-exec', args: ['bash', '-c', cmd] },
+    { bin: 'x-terminal-emulator', args: ['-e', `sh -c "export HOME='${accDir}'; agy; exec sh"`] },
+    { bin: 'gnome-terminal', args: ['--', 'bash', '-c', cmd] },
+    { bin: 'konsole', args: ['-e', 'bash', '-c', cmd] },
+    { bin: 'xfce4-terminal', args: ['-e', `bash -c "${cmd}"`] },
+    { bin: 'alacritty', args: ['-e', 'bash', '-c', cmd] },
+    { bin: 'xterm', args: ['-e', 'bash', '-c', cmd] },
+  ]
+
+  for (const c of candidates) {
+    try {
+      run(c.bin, c.args)
+      return true
+    } catch {
+      continue
+    }
+  }
+  return false
 }
 
 export const MIN_AGY_VERSION = '1.1.8'

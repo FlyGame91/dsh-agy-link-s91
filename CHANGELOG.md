@@ -1,5 +1,133 @@
 # Changelog
 
+## 0.4.57 (2026-10-16)
+
+### English
+
+- **Fix: transient network jitter no longer sticky-quarantines healthy accounts as "需重新登录".**
+  - **Background**: agy prints the same 939-byte "Authentication required" stderr banner whether the login is really dead OR its keyring auth merely missed its hard 10s window on a flaky network. One afternoon of proxy jitter (2026-10-16) quarantined three healthy accounts on first sight; `setActiveAccount` then refused the quarantined slot with 该账号当前不可用（冷却或需重新登录）.
+  - **Changes**:
+    1. **Log-evidence classification** (`src/host/agy-log.ts` + `looksLikeAuthVerificationJitter`): the adapter now snapshots agy's per-run `cli-*.log` set before spawning and reads this run's log on an auth-shaped failure. `keyringAuth: timed out after 10s` / `failed to fetch user info` / `userinfo request failed` prove a STORED credential existed and only the network was down — the failure is reclassified NETWORK (retryable, rotates, no quarantine). An authoritative token error (`invalid_grant`…) always wins over jitter. Verified against real logs: the genuine sign-out log contains zero occurrences of every jitter marker.
+    2. **Confirmation-gated quarantine** (`pool.noteAuthFailure`): a bare, non-authoritative "not signed in" banner no longer sets the sticky `authRequired` flag on the first occurrence — it only rotates the account away for the current retry. The flag hardens into a real quarantine on a second consecutive failure with no success in between; a successful run resets the streak. Authoritative OAuth paths (`invalid_grant` from the token endpoint) and the explicit re-login paths still quarantine immediately.
+  - **Tests**: classifier fixtures from the real jitter and sign-out logs; log-reader run attribution; single-strike / streak-reset pool semantics; end-to-end `auth-jitter` fake mode ⇒ NETWORK with no flag, bare `auth` banner ⇒ AUTH with no flag on first sight.
+
+### 中文 (Chinese)
+
+- **修复：瞬时网络抖动不再把健康账号错误地隔离为"需重新登录"。**
+  - **背景**：无论登录是真的失效，还是 keyring 鉴权在抖动网络上没赶上 10 秒硬超时，agy 都会打印同一段 939 字节的 "Authentication required" stderr 横幅。2026-10-16 一个下午的代理抖动就让三个健康账号被一次性隔离；随后 `setActiveAccount` 对被隔离账号直接返回 该账号当前不可用（冷却或需重新登录）。
+  - **变更**：
+    1. **基于日志证据的分类**（`src/host/agy-log.ts` + `looksLikeAuthVerificationJitter`）：适配器在 spawn 前对 agy 的本次运行日志（`cli-*.log`）做快照，出现鉴权形态失败时读取本次日志。`keyringAuth: timed out after 10s` / `failed to fetch user info` / `userinfo request failed` 证明本地确实存有凭据、只是网络不通 —— 此时失败改判为 NETWORK（可重试、轮转、不隔离）。权威的 token 错误（`invalid_grant` 等）永远优先于抖动证据。已用真实日志验证：真正登出的日志中所有抖动标记出现次数为 0。
+    2. **隔离需二次确认**（`pool.noteAuthFailure`）：不带权威证据的裸"未登录"横幅，第一次出现不再直接置粘性 `authRequired` 标记，仅为本次重试轮转走；只有连续两次失败且中间没有成功才升级为真正隔离；一次成功运行即清零计数。权威 OAuth 路径（token 端点返回 `invalid_grant`）与显式重新登录路径仍在首次即隔离。
+  - **测试**：取自真实抖动/登出日志的分类器用例；日志读取器的"仅本次运行"归属；单次不隔离/成功清零的池语义；端到端 `auth-jitter` 假模式 ⇒ NETWORK 且无标记，裸 `auth` 横幅 ⇒ AUTH 且首次不隔离。
+
+## 0.4.56 (2026-10-16)
+
+### English
+
+- **Feature: Gemini 4 Argon (Pro/Ultra) now shows as its own quota family with its separate weekly limit.**
+  - **Background**: Antigravity now grants paid Google AI Pro / Ultra accounts access to **Gemini 4 Argon**, which bills against its OWN weekly quota pool (it does not consume the plain Gemini pool). The backend surfaces this as a dedicated quota group in `retrieveUserQuotaSummary` (display name like "Gemini 4 Argon") and as `gemini-4-argon-low/-medium/-high` model ids in `fetchAvailableModels`.
+  - **Changes**:
+    1. Added a new `'argon'` entry to `ModelFamily`; `modelFamilyOf` now classifies any id containing `argon` into it BEFORE the generic `gemini-` gate — previously argon ids folded into the `google` family and their usage silently drained/reported the plain Gemini counter.
+    2. `QuotaService.refreshAccountQuota` detects the Argon quota group (its display name still contains "gemini", so the argon gate must win) and ingests its weekly bucket into `quotas.argon`; argon model-level breakdown follows the same family.
+    3. GUI quota panel: an **Argon** row renders directly under Gemini ONLY when the backend actually returned argon quota data for that account — free plans and accounts without the Argon permission never see an empty Argon panel. Since Argon is a weekly-only counter today, the ghost "5-hour / —" line is suppressed unless the backend reports one.
+    4. `/agy pool` status appends `| Argon N% (weekly)` to the Quota line only for accounts that carry argon data.
+    5. Cross-family auto-failover (`autoFallbackModel`) intentionally does NOT target the argon family: it is a paid-plan-only pool and must not become a silent fallback for exhausted Gemini quota.
+  - **Tests**: argon model-id classification; argon summary group lands in `quotas.argon` without clobbering `quotas.google`; accounts without argon access carry no argon entry (row hidden).
+
+### 中文 (Chinese)
+
+- **功能：Gemini 4 Argon（Pro/Ultra 专属）现在作为独立的额度家族展示，并显示其单独的周额度。**
+  - **背景**：Antigravity 已向付费 Google AI Pro / Ultra 账号开放 **Gemini 4 Argon**，它消耗独立的周额度池（不占用普通 Gemini 额度）。后端在 `retrieveUserQuotaSummary` 中以独立的额度组返回（显示名形如 "Gemini 4 Argon"），并在 `fetchAvailableModels` 中返回 `gemini-4-argon-low/-medium/-high` 模型 ID。
+  - **改动**：
+    1. `ModelFamily` 新增 `'argon'`；`modelFamilyOf` 在通用 `gemini-` 前缀判定**之前**优先识别包含 `argon` 的 ID —— 此前 argon 模型会被归入 `google` 家族，其用量会错误地挤占/上报普通 Gemini 计数。
+    2. `QuotaService.refreshAccountQuota` 识别 Argon 额度组（其显示名仍包含 "gemini"，因此 argon 判定必须优先）并把周额度桶写入 `quotas.argon`；模型级明细同样按该家族归类。
+    3. GUI 额度面板：仅当后端确实返回了该账号的 argon 额度数据时，才在 Gemini 下方渲染 **Argon** 面板 —— 免费套餐及无 Argon 权限的账号绝不会看到空的 Argon 栏。由于 Argon 目前只有周额度，后端未上报 5 小时窗口时不再显示幽灵的「5 小时额度 —」行。
+    4. `/agy pool` 状态输出仅为携带 argon 数据的账号在 Quota 行尾追加 `| Argon N% (weekly)`。
+    5. 跨家族自动故障转移（`autoFallbackModel`）刻意不指向 argon 家族：它是付费专属额度池，不应在 Gemini 额度耗尽时被静默兜底。
+  - **测试**：argon 模型 ID 分类；argon 额度组写入 `quotas.argon` 且不覆盖 `quotas.google`；无 argon 权限的账号不产生 argon 条目（面板隐藏）。
+
+---
+
+## 0.4.55 (2026-10-16)
+
+### English
+
+- **Fix: Gemini weekly quota displaying as empty/dash (`—`) after sync.**
+  - **Root Cause**: `AGY_ENDPOINTS` placed Google's internal staging endpoint (`https://daily-cloudcode-pa.googleapis.com`) ahead of the official production endpoint (`https://cloudcode-pa.googleapis.com`). While the staging endpoint responds HTTP 200, its `retrieveUserQuotaSummary` output completely omits the `Gemini Models` group (returning only `Claude and GPT models`). Consequently, `QuotaService.fetchQuotaSummary` took the 200 response and locked onto the staging endpoint; `familyQuotas['google']` never received the server's weekly bucket and fell back to model-level 5-hour discovery data (`weeklyFraction: undefined`), resulting in the UI rendering Gemini's weekly quota as `—`.
+  - **Resolution**:
+    1. Reordered `AGY_ENDPOINTS` to prioritize the official production endpoint `https://cloudcode-pa.googleapis.com`, matching the official `agy` CLI binary.
+    2. Added a completeness gate in `fetchQuotaSummary`: if an endpoint returns a partial summary that omits the primary `Gemini Models` group, `QuotaService` continues falling through to the remaining endpoints until a complete summary is obtained, rather than locking onto the partial staging response.
+- **Feature/Fix: auto-repair common LLM Mermaid syntax flaws and graceful fallback.**
+  - **Auto-repair (`repairMermaidSource`)**: When models produce flowchart/graph diagrams with common pseudo-code syntax flaws (e.g. using `+` to join nodes `A + B --> C + D` instead of `A & B --> C & D`, unquoted subgraph titles with colons/spaces like `subgraph 链条1: 工具打制`, or node labels containing unquoted special characters like `T[人口 > 12]`, `S[私有制: 守罐人]`), the client-side renderer now automatically heals these patterns before passing to Mermaid, enabling diagrams to render successfully without errors.
+  - **Graceful fallback for auto-sniffed blocks**: If an unrecognized code block (`代码块`) sniffed as Mermaid fails parsing even after auto-repair, the plugin now silently falls back to displaying it as a normal clean code block without rendering an intrusive `Mermaid render failed:` error banner under it.
+
+- **Fix: DSH "Stop generating" (停止生成) button failing in multi-turn tool continuation spans and queues.**
+  - **Root Cause**: While single-turn initial spans wired `options.signal` to process termination, tool continuation spans (`detectContinuation(messages) !== null`) and live run debounce rescue invoked `driveSpan` without forwarding `options.signal`. Furthermore, `driveSpanBody` lacked an `abort` event listener, causing the generator to wait indefinitely on `rec.eventsFrom(from)` even when DSH signaled an abort. Similarly, queued requests blocked on `Semaphore.acquire()` did not observe `signal` cancellations.
+  - **Resolution**:
+    1. Forwarded `options.signal` across all `driveSpan` callsites (continuation, debounce rescue, and initial span).
+    2. Attached an `abort` listener in `driveSpanBody` that immediately calls `rec.requestAbort?.()`, terminates the underlying `agy` process, pushes `{ type: 'finish', reason: { kind: 'aborted' } }` into the chunk queue, and closes the stream iterator cleanly.
+    3. Added `signal` cancellation support to `Semaphore.acquire(signal)` and burst throttle backoff to release queued requests immediately upon abort.
+- **Fix/Feature: Mermaid rendering swallowing source code, wide layout collapse, and interactive view toggle.**
+  - **Root Cause**:
+    1. Language detection in `fenceLang` matched DSH's generic banner text `"代码块"`, erroneously treating explicitly tagged ````mermaid```` blocks as untagged generic blocks.
+    2. Large multi-subgraph flowcharts using Chromium's default `<foreignObject>` HTML labels collapsed into invisible blank boxes when constrained by `max-width: 100%`.
+    3. When Mermaid rendering threw or produced an error SVG, the CSS rule hiding code blocks paired with the suppression of error text resulted in swallowing all content—leaving a completely blank white container.
+  - **Resolution**:
+    1. Corrected `fenceLang` to inspect code block classes and attributes before falling back to banner labels.
+    2. Configured Mermaid with `flowchart: { htmlLabels: false }` to render reliable native SVG `<text>` elements, eliminating the Chromium `<foreignObject>` blank-paint bug.
+    3. Added an interactive `查看源码 / 查看图表` toggle button allowing users to switch between the visual diagram and raw Mermaid source code at any time.
+    4. Guarded against swallowed content: when rendering fails, the original code remains 100% visible alongside a subtle warning banner, ensuring source content is never lost.
+
+### 中文 (Chinese)
+
+- **修复：DSH 界面中点击「停止生成」在多轮工具调用延续期失效的问题。**
+  - **根本原因**：在首轮对话中 `options.signal` 正确绑定了进程终止，但在原生工具镜像调用的后续延续轮次（`detectContinuation` 分支）以及防抖拯救调用中，`driveSpan` 均未向下传递 `options.signal`。此外，`driveSpanBody` 内部没有监听 `signal.abort` 事件，导致用户在 DSH 点击停止时，生成器依旧停在 `eventsFrom` 等待事件流，后台进程未被杀死，界面停止按钮卡住无效。同时跨会话并发信号量 `Semaphore.acquire()` 在排队等待时也未响应取消信号。
+  - **解决方案**：
+    1. 在所有 `driveSpan` 调用处（工具延续、防抖拯救、首轮启动）完整传递 `options.signal`。
+    2. 在 `driveSpanBody` 挂载 `abort` 监听器：一旦收到取消信号，立即触发 `rec.requestAbort?.()` 杀死底层 `agy` 进程，向输出队列推送 `{ type: 'finish', reason: { kind: 'aborted' } }` 并安全关闭队列，使 DSH 的流式迭代器瞬间退出。
+    3. 升级 `Semaphore.acquire(signal)` 及并发节流延时，支持在排队中收到 abort 信号时立即退出并清理队列，杜绝无意义挂起。
+- **修复/功能：Mermaid 图表内容被吞、超宽图表缩放空白及源码交互式切换。**
+  - **根本原因**：
+    1. `fenceLang` 语言嗅探提取到了 DSH 顶部横幅文本 `"代码块"`，导致显式声明为 ````mermaid```` 的图表被误当成未指定语言的通用块。
+    2. Mermaid 默认使用 HTML `<foreignObject>` 标签渲染文本，在 Chromium / Electron 宿主中遇到多子图超宽流程图（如 >3000px）并应用 `max-width: 100%` 缩放时，极易发生文本排版崩溃或整体空白不渲染的 bug。
+    3. 当 Mermaid 渲染报错或生成空图时，由于隐藏原生代码块的 CSS 规则生效且错误提示被隐藏，导致原始代码和图表全部消失，形成一片空白区域（内容被吞）。
+  - **解决方案**：
+    1. 修正 `fenceLang`：优先读取 `code` 标签 class 及属性，忽略无意义的横幅标签 `"代码块"`。
+    2. 优化渲染配置：初始化 Mermaid 时启用 `flowchart: { htmlLabels: false }`，使用原生 SVG `<text>` 渲染节点，彻底规避 Chromium `<foreignObject>` 缩放渲染空白的底层缺陷。
+    3. 增加交互式切换工具栏：在渲染图表右上角提供「查看源码 / 查看图表」按钮，用户可随时一键切换查看 Mermaid 原始 Markdown 代码与可视化图表。
+    4. 兜底保护机制：若渲染异常，确保原始代码块 100% 完整保留可见，并在上方以友好提示条展示，绝不吞没用户和模型的内容。
+
+- **修复：点击「同步」后 Gemini 周额度显示为空/短横杠（`—`）的问题。**
+  - **根本原因**：`AGY_ENDPOINTS` 此前将 Google 内部预演端点（`https://daily-cloudcode-pa.googleapis.com`）排在官方生产端点（`https://cloudcode-pa.googleapis.com`）之前。虽然预演端点返回 HTTP 200，但其 `retrieveUserQuotaSummary` 响应中完全缺失了 `Gemini Models` 额度组（仅返回了 `Claude and GPT models`）。这导致 `QuotaService.fetchQuotaSummary` 命中 200 后锁定该端点，`familyQuotas['google']` 无法获取到官方周配额桶，只能回退使用单模型 5 小时数据（`weeklyFraction` 始终为 `undefined`），前端进而将 Gemini 的周额度渲染为 `—`。
+  - **解决方案**：
+    1. 调整 `AGY_ENDPOINTS` 顺序：优先请求与官方 `agy` CLI 保持一致的官方生产端点 `https://cloudcode-pa.googleapis.com`。
+    2. 增强 `fetchQuotaSummary` 完整性校验门禁：若端点返回的配额摘要缺失了核心的 `Gemini Models` 组，自动顺次下穿到后续端点获取完整摘要，不再过早锁定仅包含第三方模型的残缺响应。
+- **功能/修复：Mermaid 常见大模型语法自动自愈修复与优雅降级。**
+  - **语法自动自愈（`repairMermaidSource`）**：针对大模型输出流程图时高频出现的伪代码语法瑕疵（例如材料合成中用加号连接 `A + B --> C + D`、包含冒号的子图未加引号 `subgraph 链条1: 工具打制`、节点文本包含特殊字符未加引号 `T[人口 > 12]`、`S[私有制: 守罐人]` 等），客户端在解析前自动自愈修正，直接成功渲染图表。
+  - **自动嗅探代码块优雅降级**：对于未显式标注为 ````mermaid```` 的通用代码块（语言标签为 `代码块` 或未指定），若自愈后仍无法解析，安静降级为普通代码块展示，不再在代码下方直接打印刺眼的 `Mermaid render failed:` 错误文本。
+
+## 0.4.54 (2026-10-16)
+
+### English
+
+- **Fix (macOS): complete resolution for recurring modal keychain password prompts.** Older versions (v0.4.41-v0.4.48) accidentally ran `security default-keychain -s <isolated-kc>`, permanently redirecting the user's desktop session `default-keychain`, `login-keychain`, and user search list (`list-keychains -d user`) to a locked per-account keychain under `~/.dsh/agy-accounts/` created with an un-unlockable random passphrase. On modern macOS, `Library/Keychains/login.keychain-db` is also a special-cased filename that SecurityServer associates with the user's OS login password, rejecting empty-passphrase unlocks. The plugin now:
+  1. Automatically detects and repairs hijacked `default-keychain`, `login-keychain`, and `list-keychains` on boot (`repairMacSystemKeychain`), restoring the real user login keychain (`~/Library/Keychains/login.keychain-db`) safely and idempotently.
+  2. Automatically purges legacy un-unlockable isolated keychains (`purgeStaleIsolatedKeychain`), unregistering them from `securityd` and deleting conflicting files so SecurityAgent never raises unanswerable password dialogs.
+- **Feature (Multi-platform): comprehensive cross-platform logic unification.**
+  1. **Unified Terminal Launcher (`openAccountTerminal`)**: Fully unified interactive terminal launching across macOS (AppleScript Terminal.app), Windows (`cmd.exe /c start` with `USERPROFILE` + `HOME` environment and `windowsHide: true`), and Linux (adaptive detection across `xdg-terminal-exec`, `x-terminal-emulator`, `gnome-terminal`, `konsole`, `xfce4-terminal`, `alacritty`, `xterm`).
+  2. **Unified System Proxy Detection (`detectSystemProxy`)**: Automatically discovers system-wide proxy settings for GUI environments where shell env vars are missing—supporting macOS (`scutil --proxy`), Windows Registry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`), Linux desktop (`gsettings` GNOME proxy mode), and fallback environment variables (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`).
+  3. **Cross-Platform Credential Isolation**: Standardized credential boundaries across platforms—Windows Credential Manager targeted isolation, macOS isolated throwaway keychains with auto-repair, and standard Unix file-based isolation.
+
+### 中文 (Chinese)
+
+- **修复（macOS）：彻底解决钥匙串密码弹窗反复弹出问题。** v0.4.41-v0.4.48 曾调用 `security default-keychain -s <isolated-kc>`，导致用户的桌面会话全局 `default-keychain`、`login-keychain` 以及用户搜索列表被持久化重定向到了 `~/.dsh/agy-accounts/` 下由旧版本生成的随机密码隔离钥匙串中。此外 macOS 的 SecurityServer 会对名为 `login.keychain-db` 的路径做特殊绑定，强制要求系统用户登录密码，导致空密码解锁失败并引发系统 SecurityAgent 弹窗提示输入密码。本次修复：
+  1. 插件启动时自动执行 `repairMacSystemKeychain`：检测并修复被篡改的 `default-keychain`、`login-keychain` 与用户搜索列表，自动恢复为用户真实的登录钥匙串（`~/Library/Keychains/login.keychain-db`），幂等且安全。
+  2. 自动检测并清理历史遗留的无法解锁的废弃钥匙串（`purgeStaleIsolatedKeychain`），从 `securityd` 会话中彻底注销并删除文件，阻断 SecurityAgent 弹出任何死循环密码框。
+- **功能（多平台）：全面梳理并实现 Windows、macOS、Linux 跨平台逻辑统一。**
+  1. **多平台统一终端唤醒器（`openAccountTerminal`）**：彻底统一账号登录终端的唤醒逻辑，原生支持 macOS（AppleScript 激活 Terminal.app）、Windows（`cmd.exe /c start` 注入 `USERPROFILE` + `HOME` 隔离目录并设置 `windowsHide: true` 避免控制台闪烁）以及 Linux（自适应探测 `xdg-terminal-exec`、`x-terminal-emulator`、`gnome-terminal`、`konsole`、`xfce4-terminal`、`alacritty`、`xterm` 等各种桌面环境）。
+  2. **多平台系统代理自动感知（`detectSystemProxy`）**：针对 GUI 宿主未继承终端 Shell 代理环境变量的场景，全面支持三端系统级代理自动检测——macOS（`scutil --proxy` 解析 HTTP/HTTPS/SOCKS）、Windows（读取注册表 WinINet Internet Settings 代理设置）、Linux（通过 `gsettings` 读取 GNOME 桌面代理配置）以及标准环境变量兜底。
+  3. **多平台凭据与隔离统一**：规范各端凭据存储边界——Windows 使用 Credential Manager 目标隔离、macOS 使用独立钥匙串配给加自愈防篡改机制、Linux 使用标准 Unix 用户目录隔离。
+
 ## 0.4.53 (2026-10-15)
 
 ### English

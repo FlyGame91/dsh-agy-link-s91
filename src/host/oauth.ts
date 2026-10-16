@@ -61,10 +61,10 @@ export const OAUTH_CALLBACK_PORT = 51121
 export const OAUTH_CALLBACK_PATH = '/oauth-callback'
 export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_CALLBACK_PORT}${OAUTH_CALLBACK_PATH}`
 
-/** Runtime endpoint fallback order (daily first, mirroring OmniRoute). */
+/** Runtime endpoint fallback order (official production first, then staging/daily fallbacks). */
 export const AGY_ENDPOINTS: readonly string[] = [
-  'https://daily-cloudcode-pa.googleapis.com',
   'https://cloudcode-pa.googleapis.com',
+  'https://daily-cloudcode-pa.googleapis.com',
   'https://daily-cloudcode-pa.sandbox.googleapis.com',
   'https://autopush-cloudcode-pa.sandbox.googleapis.com',
 ]

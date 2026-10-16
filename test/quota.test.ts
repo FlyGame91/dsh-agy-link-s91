@@ -475,3 +475,179 @@ test('readSystemKeychainToken dispatches per platform (GH #8 / GH #30)', async (
   const tok = await svc.getStoredToken(primary)
   assert.ok(tok === null || typeof tok.accessToken === 'string', 'dispatch resolves without throwing')
 })
+
+test('AGY_ENDPOINTS prioritizes official production endpoint', async () => {
+  const { AGY_ENDPOINTS } = await import('../src/host/oauth.ts')
+  assert.equal(AGY_ENDPOINTS[0], 'https://cloudcode-pa.googleapis.com', 'official production endpoint must be first')
+  assert.ok(AGY_ENDPOINTS.includes('https://daily-cloudcode-pa.googleapis.com'), 'daily endpoint remains as fallback')
+})
+
+test('fetchQuotaSummary falls through partial summaries omitting Gemini to complete endpoints', async () => {
+  const { QuotaService } = await import('../src/host/quota.ts')
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-complete-'))
+  const pool = new AccountPoolManager(dir)
+
+  const partialSummary = {
+    groups: [
+      {
+        displayName: 'Claude and GPT models',
+        description: 'Models within this group: Claude Opus, Claude Sonnet, GPT-OSS',
+        buckets: [
+          { bucketId: '3p-5h', window: '5h', remainingFraction: 1, resetTime: '2026-10-16T12:00:00Z' },
+          { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 1, resetTime: '2026-10-23T12:00:00Z' },
+        ],
+      },
+    ],
+  }
+
+  const completeSummary = {
+    groups: [
+      {
+        displayName: 'Gemini Models',
+        description: 'Models within this group: Gemini Flash, Gemini Pro',
+        buckets: [
+          { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.9, resetTime: '2026-10-16T12:00:00Z' },
+          { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.85, resetTime: '2026-10-21T12:00:00Z' },
+        ],
+      },
+      {
+        displayName: 'Claude and GPT models',
+        description: 'Models within this group: Claude Opus, Claude Sonnet, GPT-OSS',
+        buckets: [
+          { bucketId: '3p-5h', window: '5h', remainingFraction: 1, resetTime: '2026-10-16T12:00:00Z' },
+          { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 1, resetTime: '2026-10-23T12:00:00Z' },
+        ],
+      },
+    ],
+  }
+
+  let callCount = 0
+  class TestQuotaService extends QuotaService {
+    override async fetchSummaryEndpoint(): Promise<Response> {
+      callCount++
+      if (callCount === 1) {
+        return new Response(JSON.stringify(partialSummary), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(completeSummary), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+  }
+
+  const svc = new TestQuotaService(pool)
+  const result = await svc.fetchQuotaSummary('fake_tok')
+  assert.ok(result, 'summary should be returned')
+  assert.equal(callCount, 2, 'should have fallen through the partial endpoint to the complete one')
+  const hasGemini = result.groups?.some((g) => g.displayName?.toLowerCase().includes('gemini'))
+  assert.equal(hasGemini, true, 'returned summary must contain Gemini models')
+})
+
+test('Gemini 4 Argon quota group lands in its own family, never on google', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-argon-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('argon-user')
+
+  // Valid on-disk token so no refresh flow runs.
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.argo', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  class ArgonService extends QuotaService {
+    override async fetchUserInfo(): Promise<{ email?: string; name?: string } | null> {
+      return { email: 'pro-user@gmail.com' }
+    }
+    override async fetchQuotaSummary() {
+      return {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            description: 'Models within this group: Gemini Flash, Gemini Pro',
+            buckets: [
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.7, resetTime: '2026-10-20T12:00:00Z' },
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.42, resetTime: '2026-10-23T12:00:00Z' },
+            ],
+          },
+          {
+            // Real shape: the argon group name still contains "gemini" but
+            // carries ONLY its own weekly bucket (paid Pro/Ultra accounts).
+            displayName: 'Gemini 4 Argon',
+            description: 'Models within this group: Gemini 4 Argon',
+            buckets: [
+              { bucketId: 'argon-weekly', window: 'weekly', remainingFraction: 0.66, resetTime: '2026-10-23T12:00:00Z' },
+            ],
+          },
+        ],
+      } as never
+    }
+    override async fetchAvailableModels() {
+      return {
+        models: {
+          'gemini-4-argon-low': { displayName: 'Gemini 4 Argon (Low)', quotaInfo: { remainingFraction: 0.66, resetTime: '2026-10-23T12:00:00Z' } },
+          'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash', quotaInfo: { remainingFraction: 0.9, resetTime: '2026-10-20T12:00:00Z' } },
+        },
+      } as never
+    }
+  }
+
+  const svc = new ArgonService(pool)
+  const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+  assert.ok(quotas, 'quota refresh succeeded')
+  // Argon group + argon model ids live under their OWN family...
+  assert.equal(quotas.argon?.weeklyFraction, 0.66)
+  assert.equal(quotas.argon?.weeklyResetTime, '2026-10-23T12:00:00Z')
+  assert.equal(quotas.argon?.models?.length, 1)
+  assert.equal(quotas.argon?.models?.[0]?.modelId, 'gemini-4-argon-low')
+  // ...without clobbering the plain Gemini family.
+  assert.equal(quotas.google?.remainingFraction, 0.7)
+  assert.equal(quotas.google?.weeklyFraction, 0.42)
+
+  const stored = pool.getAccount(acc.id)!
+  assert.equal(stored.quotas.argon?.weeklyFraction, 0.66)
+  assert.equal(stored.quotas.google?.weeklyFraction, 0.42)
+})
+
+test('accounts without Argon access carry no argon quota entry (UI hides the row)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-noargon-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('free-user')
+
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.free', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  class FreeService extends QuotaService {
+    override async fetchUserInfo(): Promise<{ email?: string; name?: string } | null> {
+      return { email: 'free-user@gmail.com' }
+    }
+    override async fetchQuotaSummary() {
+      return {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            description: 'Models within this group: Gemini Flash, Gemini Pro',
+            buckets: [
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.7, resetTime: '2026-10-20T12:00:00Z' },
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.42, resetTime: '2026-10-23T12:00:00Z' },
+            ],
+          },
+        ],
+      } as never
+    }
+    override async fetchAvailableModels() {
+      return { models: {} } as never
+    }
+  }
+
+  const svc = new FreeService(pool)
+  const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+  assert.ok(quotas, 'quota refresh succeeded')
+  assert.equal(quotas.argon, undefined, 'no argon permission → no argon quota family')
+  assert.equal(pool.getAccount(acc.id)!.quotas.argon, undefined, 'argon row must stay hidden for this account')
+})
+

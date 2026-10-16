@@ -175,6 +175,42 @@ export function parseWindowsProxyServer(raw: string): string {
   return /^https?:\/\//i.test(s) ? s : `http://${s}`
 }
 
+/**
+ * Parse macOS `scutil --proxy` dictionary output.
+ * Keys of interest:
+ *   HTTPEnable : 1
+ *   HTTPPort : 7890
+ *   HTTPProxy : 127.0.0.1
+ *   HTTPSEnable : 1
+ *   HTTPSPort : 7890
+ *   HTTPSProxy : 127.0.0.1
+ *   SOCKSEnable : 1
+ *   SOCKSPort : 7890
+ *   SOCKSProxy : 127.0.0.1
+ */
+export function parseMacScutilProxy(raw: string): string | undefined {
+  if (!raw.trim()) return undefined
+  const lines = raw.split('\n')
+  const dict: Record<string, string> = {}
+  for (const line of lines) {
+    const m = /^\s*([A-Za-z0-9_]+)\s*:\s*(.+)$/.exec(line)
+    if (m && m[1] && m[2]) {
+      dict[m[1]] = m[2].trim()
+    }
+  }
+  // HTTPS takes priority, then HTTP, then SOCKS
+  if (dict.HTTPSEnable === '1' && dict.HTTPSProxy && dict.HTTPSPort) {
+    return `http://${dict.HTTPSProxy}:${dict.HTTPSPort}`
+  }
+  if (dict.HTTPEnable === '1' && dict.HTTPProxy && dict.HTTPPort) {
+    return `http://${dict.HTTPProxy}:${dict.HTTPPort}`
+  }
+  if (dict.SOCKSEnable === '1' && dict.SOCKSProxy && dict.SOCKSPort) {
+    return `socks5://${dict.SOCKSProxy}:${dict.SOCKSPort}`
+  }
+  return undefined
+}
+
 let cachedProxy: { value: string | undefined; expiresAt: number } | null = null
 
 /** Invalidate cached proxy detection (useful in tests). */
@@ -183,19 +219,21 @@ export function invalidateProxyCache(): void {
 }
 
 /**
- * Detect system proxy configuration.
+ * Detect system proxy configuration across Windows, macOS, and Linux.
  * Priority:
- * 1. Standard environment variables (HTTPS_PROXY, HTTP_PROXY, ALL_PROXY)
+ * 1. Standard environment variables (HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, and lowercase)
  * 2. Windows Registry (HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings)
- * Results are cached for 5 seconds to minimize registry queries.
+ * 3. macOS scutil (--proxy)
+ * 4. Linux desktop system proxy (GNOME gsettings)
+ * Results are cached for 5 minutes (300s) to minimize subprocess and registry queries.
  */
-export function detectSystemProxy(): string | undefined {
+export function detectSystemProxy(platform: NodeJS.Platform = process.platform): string | undefined {
   const now = Date.now()
   if (cachedProxy && cachedProxy.expiresAt > now) {
     return cachedProxy.value
   }
 
-  // 1. Environment variables
+  // 1. Standard environment variables across all platforms
   const envProxy =
     process.env.HTTPS_PROXY ||
     process.env.https_proxy ||
@@ -210,7 +248,7 @@ export function detectSystemProxy(): string | undefined {
   }
 
   // 2. Windows registry
-  if (IS_WIN) {
+  if (platform === 'win32') {
     try {
       const out = execFileSync(
         'reg',
@@ -228,6 +266,54 @@ export function detectSystemProxy(): string | undefined {
             cachedProxy = { value: val, expiresAt: now + 300_000 }
             return val
           }
+        }
+      }
+    } catch {
+      // Best-effort
+    }
+  }
+
+  // 3. macOS system proxy (scutil --proxy)
+  if (platform === 'darwin') {
+    try {
+      const out = execFileSync('scutil', ['--proxy'], {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+      const val = parseMacScutilProxy(out)
+      if (val) {
+        cachedProxy = { value: val, expiresAt: now + 300_000 }
+        return val
+      }
+    } catch {
+      // Best-effort
+    }
+  }
+
+  // 4. Linux desktop system proxy (GNOME gsettings)
+  if (platform === 'linux') {
+    try {
+      const mode = execFileSync('gsettings', ['get', 'org.gnome.system.proxy', 'mode'], {
+        encoding: 'utf8',
+        timeout: 1000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim().replace(/^'|'$/g, '')
+      if (mode === 'manual') {
+        const host = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.https', 'host'], {
+          encoding: 'utf8',
+          timeout: 1000,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim().replace(/^'|'$/g, '')
+        const port = execFileSync('gsettings', ['get', 'org.gnome.system.proxy.https', 'port'], {
+          encoding: 'utf8',
+          timeout: 1000,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim()
+        if (host && port && port !== '0') {
+          const val = `http://${host}:${port}`
+          cachedProxy = { value: val, expiresAt: now + 300_000 }
+          return val
         }
       }
     } catch {

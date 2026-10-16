@@ -594,27 +594,45 @@ export class QuotaService {
     return ordered
   }
 
+  protected async fetchSummaryEndpoint(endpoint: string, accessToken: string, proxyUrl?: string): Promise<Response> {
+    return agyFetch(`${endpoint}/v1internal:retrieveUserQuotaSummary`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': agyUserAgent(),
+      },
+      body: JSON.stringify({}),
+    }, proxyUrl)
+  }
+
   /**
    * Fetch official multi-bucket quota summary (both weekly and 5h limit windows)
    * via v1internal:retrieveUserQuotaSummary.
    */
   async fetchQuotaSummary(accessToken: string, proxyUrl?: string): Promise<QuotaSummaryResponse | null> {
     const endpoints = this.getOrderedEndpoints()
+    let partialSummary: QuotaSummaryResponse | null = null
     for (let i = 0; i < endpoints.length; i++) {
       const endpoint = endpoints[i]!
       try {
-        const res = await agyFetch(`${endpoint}/v1internal:retrieveUserQuotaSummary`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-            'User-Agent': agyUserAgent(),
-          },
-          body: JSON.stringify({}),
-        }, proxyUrl)
+        const res = await this.fetchSummaryEndpoint(endpoint, accessToken, proxyUrl)
         if (res.ok) {
-          this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
-          return (await res.json()) as QuotaSummaryResponse
+          const summary = (await res.json()) as QuotaSummaryResponse
+          // Validate whether the summary contains the primary Gemini models group.
+          // Staging endpoints (like daily-cloudcode-pa) omit Gemini Models and only return 3P.
+          const hasGemini = summary?.groups?.some((g) => {
+            const name = (g.displayName || '').toLowerCase()
+            const desc = (g.description || '').toLowerCase()
+            return name.includes('gemini') || desc.includes('gemini')
+          })
+          if (hasGemini) {
+            this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
+            return summary
+          }
+          if (!partialSummary && summary && Array.isArray(summary.groups) && summary.groups.length > 0) {
+            partialSummary = summary
+          }
         }
         // If auth fails (401/403), the token itself is invalid/expired — no need to flood other endpoints
         if (res.status === 401 || res.status === 403) {
@@ -624,7 +642,7 @@ export class QuotaService {
         // Try next endpoint on network connection errors
       }
     }
-    return null
+    return partialSummary
   }
 
   /**
@@ -786,10 +804,17 @@ export class QuotaService {
       for (const group of summary.groups) {
         const dName = (group.displayName || '').toLowerCase()
         const desc = (group.description || '').toLowerCase()
-        const isGoogle = dName.includes('gemini') || desc.includes('gemini')
+        // Gemini 4 Argon (Pro/Ultra-only) ships as its OWN quota group with a
+        // separate weekly bucket, but its display name still contains "gemini"
+        // ("Gemini 4 Argon"). Detect argon BEFORE the generic gemini gate or
+        // the group folds into — and overwrites — the plain Gemini family.
+        const isArgon = dName.includes('argon') || desc.includes('argon')
+        const isGoogle = !isArgon && (dName.includes('gemini') || desc.includes('gemini'))
         const is3P = dName.includes('claude') || dName.includes('gpt') || desc.includes('claude') || desc.includes('gpt')
 
-        const targetFamilies: ModelFamily[] = isGoogle
+        const targetFamilies: ModelFamily[] = isArgon
+          ? ['argon']
+          : isGoogle
           ? ['google']
           : is3P
           ? ['anthropic', 'openai']
