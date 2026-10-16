@@ -15,6 +15,21 @@ import {
 } from '../common/pool-types.ts'
 import { parseResetDurationMs } from '../common/types.ts'
 
+/**
+ * Proactive rotation thresholds: an account at or below these remaining
+ * fractions is benched until its reset instead of being served
+ * (isAccountEligible / updateAccountQuotas / getEarliestAvailableCountdown).
+ *
+ * The old 2%/1% values only benched an account AFTER it had already died:
+ * 2026-10-17 01:42 — the primary sat at 4.07% (above the old gate), so the
+ * sticky affinity kept every session pinned to it while three parallel turns
+ * slammed into the wall together and stalled in agy-internal retries, with
+ * q98 idle at 100%. Benching at 10%/5% rotates while the successor still has
+ * runway; the benched account comes back at its own reset.
+ */
+export const LOW_QUOTA_5H = 0.10
+export const LOW_QUOTA_WEEKLY = 0.05
+
 export function defaultPoolDir(): string {
   const dshState = process.env.DSH_STATE_DIR || join(homedir(), '.dsh')
   return join(dshState, 'agy-accounts')
@@ -605,9 +620,10 @@ export class AccountPoolManager {
     if (!acc.enabled || acc.authRequired) return false
     const cd = acc.cooldowns?.[family]
     if (cd && cd.cooldownUntil > now) return false
-    // If 5h quota remaining is <= 2% and reset time is in future (or missing), treat as in cooldown
+    // If 5h quota remaining is at/below the proactive rotation threshold and
+    // reset time is in future (or missing), treat as in cooldown
     const quota = acc.quotas?.[family]
-    if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= 0.02) {
+    if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= LOW_QUOTA_5H) {
       if (quota.resetTime) {
         const resetMs = Date.parse(quota.resetTime)
         if (Number.isNaN(resetMs) || resetMs > now) return false
@@ -615,8 +631,9 @@ export class AccountPoolManager {
         return false
       }
     }
-    // If weekly quota remaining is <= 1% and weekly reset time is in future (or missing), treat as in cooldown
-    if (quota && typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= 0.01) {
+    // If weekly quota remaining is at/below the rotation threshold and weekly
+    // reset time is in future (or missing), treat as in cooldown
+    if (quota && typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= LOW_QUOTA_WEEKLY) {
       if (quota.weeklyResetTime) {
         const resetMs = Date.parse(quota.weeklyResetTime)
         if (Number.isNaN(resetMs) || resetMs > now) return false
@@ -760,9 +777,9 @@ export class AccountPoolManager {
     const now = Date.now()
     for (const [famKey, info] of Object.entries(quotas) as [ModelFamily, FamilyQuotaInfo][]) {
       if (!info) continue
-      const isExhausted5h = typeof info.remainingFraction === 'number' && info.remainingFraction <= 0.02 &&
+      const isExhausted5h = typeof info.remainingFraction === 'number' && info.remainingFraction <= LOW_QUOTA_5H &&
         (!info.resetTime || Number.isNaN(Date.parse(info.resetTime)) || Date.parse(info.resetTime) > now)
-      const isExhaustedWeekly = typeof info.weeklyFraction === 'number' && info.weeklyFraction <= 0.01 &&
+      const isExhaustedWeekly = typeof info.weeklyFraction === 'number' && info.weeklyFraction <= LOW_QUOTA_WEEKLY &&
         (!info.weeklyResetTime || Number.isNaN(Date.parse(info.weeklyResetTime)) || Date.parse(info.weeklyResetTime) > now)
       if (isExhausted5h || isExhaustedWeekly) {
         if (this.data.activeAccountIds?.[famKey] === id || this.data.lastActiveAccountId === id) {
@@ -943,9 +960,9 @@ export class AccountPoolManager {
       if (cd && cd.cooldownUntil > now) bump(cd.cooldownUntil)
       const quota = acc.quotas?.[family]
       if (quota === undefined) continue
-      const drained5h = typeof quota.remainingFraction === 'number' && quota.remainingFraction <= 0.02
+      const drained5h = typeof quota.remainingFraction === 'number' && quota.remainingFraction <= LOW_QUOTA_5H
         && typeof quota.resetTime === 'string' && Date.parse(quota.resetTime) > now
-      const drainedWeekly = typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= 0.01
+      const drainedWeekly = typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= LOW_QUOTA_WEEKLY
         && typeof quota.weeklyResetTime === 'string' && Date.parse(quota.weeklyResetTime) > now
       if (drained5h || drainedWeekly) bump(this.nextQuotaResetAt(acc, family))
     }

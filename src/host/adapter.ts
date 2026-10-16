@@ -1348,8 +1348,18 @@ export class AgyAdapter extends LlmAdapter {
     let sawAnyEvent = false
     /** Timestamp of the most recent stdout line — drives the silence heartbeat. */
     let lastOutputAt = 0
+    /**
+     * Generation-phase silence budget: after the first event but with NO open
+     * tool step, a hung SSE stream (quota-wall stalls hang instead of
+     * returning a 429 — observed 2026-10-17 01:17: the last
+     * streamGenerateContent simply never answered) used to sit for the full
+     * 240-minute long-tool budget because "sawAnyEvent" upgraded it. Long
+     * silence is only legitimate while a TOOL is running; bare generation
+     * gets a bounded floor so the turn can fail, classify and rotate.
+     */
+    const generationIdleMs = Math.max(cfg.timeoutMs, 15 * 60_000)
     const applyToolIdleBudget = (): void => {
-      runningProc?.noteActivity(openToolKeys.size > 0 || sawAnyEvent ? longToolIdleMs : cfg.timeoutMs)
+      runningProc?.noteActivity(openToolKeys.size > 0 ? longToolIdleMs : generationIdleMs)
     }
     // Long-tool heartbeat: while a tool step is open nothing else is
     // observable, so log its age every few minutes. A 3h silent hang used to

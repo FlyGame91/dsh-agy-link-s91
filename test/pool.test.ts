@@ -383,6 +383,42 @@ test('getActiveAccountId and proactive rotation when account enters cooldown or 
   assert.equal(pool.getActiveAccountId('google'), accA.id)
 })
 
+test('proactive rotation benches a 4% account before it dies (2026-10-17 incident)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-lowquota-'))
+  const pool = new AccountPoolManager(dir)
+  const accA = pool.getAccounts()[0]!
+  const accB = pool.createAccountSlot('Account B')
+
+  // Primary is pinned (active) and reported 4.07% remaining with a future
+  // reset. The old 2% gate called this "still eligible", so the sticky
+  // affinity kept every session pinned to it while three parallel turns
+  // slammed into the wall together — q98 sat idle at 100% the whole time.
+  const futureReset = new Date(Date.now() + 13.5 * 3600_000).toISOString()
+  // Production order: the account was IN USE (pinned active), then its quota
+  // refresh reported 4.07% — the refresh itself must rotate away from it.
+  pool.markAccountActive(accA.id)
+  pool.updateAccountQuotas(accA.id, {
+    google: {
+      remainingFraction: 0.040659066,
+      resetTime: futureReset,
+      weeklyFraction: 0.040659066,
+      weeklyResetTime: futureReset,
+      models: [],
+    },
+  })
+
+  // The quota refresh itself must rotate away from the drying account...
+  assert.equal(
+    pool.getPoolData().lastActiveAccountId,
+    accB.id,
+    'updateAccountQuotas must advance off an account below the rotation threshold',
+  )
+  // ...and the benched account stays out of sticky affinity and selection.
+  assert.equal(pool.isAccountEligible(pool.getAccount(accA.id)!, 'google'), false, '4% must be benched proactively, not served until it dies')
+  assert.equal(pool.getActiveAccountId('google'), accB.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+})
+
 test('lastActiveAccountId is cleared when the active account is deleted, disabled or requires auth', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-pool-cleanup-active-'))
   const pool = new AccountPoolManager(dir)
