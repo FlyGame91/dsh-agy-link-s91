@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.63 (2026-10-18)
+
+### English
+
+- **Fix: Prevent Mermaid post-render cleanup from deleting active diagram SVGs.**
+  - Resolved an issue where rendered flowchart SVGs were immediately removed by `cleanupTempElements` in the `finally` block due to an indiscriminate `document.getElementById(id)` query matching the newly inserted diagram SVG.
+  - Added ancestor check (`closest('[data-agy-mermaid-svg]')`) to ensure only leaked standalone temporary DOM elements outside the diagram container are purged.
+- **Fix: Enhanced Argon quota pool detection (Issue #46) and model effort support.**
+  - Added bucket-level Argon detection in quota summary parsing (`hasArgonBucket`), resolving cases where Paid Pro accounts had their Argon quota pools omitted due to varied group naming.
+  - Enabled reasoning effort folding and `--effort` parameter support for `argon`-prefixed models, and added `gemini-4-argon` to `DEFAULT_FALLBACK_MODELS`.
+- **Docs: Correct feature descriptions & refresh visual documentation.**
+  - Corrected inaccurate and exaggerated phrasing in the README feature table regarding settings consolidation, secondary parallel leases, and native context caching.
+  - Replaced dashboard screenshot with pixel-perfect mosaic redactions on all user email addresses, and enriched the documentation with real-world Token usage and 1M context metering figures.
+
+### 中文
+
+- **修复：Mermaid 流程图渲染后被清理机制误删导致内容空白消失的问题。**
+  - 修复 `cleanupTempElements` 在清理泄漏的临时 DOM 元素时，因直接通过 `document.getElementById(id)` 查找而误删了刚刚挂载到页面容器中的正式 `<svg>` 节点，导致流程图渲染后瞬间空白的问题。
+  - 增加最近祖先判断（`closest('[data-agy-mermaid-svg]')`），确保仅清理逃逸至容器外部的游离临时节点，正式图表永久保留。
+- **修复：付费 Pro 账号 Argon 额度池识别增强（Issue #46）与模型调用支持。**
+  - 在配额解析中增加 bucket 层级的 Argon 标识检测（`hasArgonBucket`），彻底解决因分组名称变体导致的付费 Pro 账号未识别 Argon 额度池的问题。
+  - 支持 `argon` 模型前缀的思维强度折叠与 `--effort` 参数传递，并在 `DEFAULT_FALLBACK_MODELS` 中补齐 `gemini-4-argon`。
+- **文档：纠正功能说明表述并升级图文文档（邮箱全面脱敏）。**
+  - 纠正 README 特性表中关于“插件页详情零冗余复用”、“同账号二次并发租赁”与“97% 缓存命中”的不准确表述，还原本质功能（设置控制台内嵌、副账号同身份并发租约、原生上下文缓存真实计量）。
+  - 全新更新控制台仪表盘截图，对所有账号邮箱实施严格的像素级马赛克脱敏，并新增真实会话 Token 用量与 1M 上下文负载的图文展示。
+
 ## 0.4.62 (2026-10-17)
 
 ### English

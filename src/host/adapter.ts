@@ -691,7 +691,7 @@ export class AgyAdapter extends LlmAdapter {
     else args.push('--mode', opts.permissionMode)
     const effectiveModel = resolveModelSlug(opts.model)
     if (effectiveModel !== '') args.push('--model', effectiveModel)
-    const isGemini = effectiveModel === '' || effectiveModel.toLowerCase().startsWith('gemini')
+    const isGemini = effectiveModel === '' || effectiveModel.toLowerCase().startsWith('gemini') || effectiveModel.toLowerCase().startsWith('argon')
     if (isGemini && opts.effort && opts.effort !== '') args.push('--effort', opts.effort)
     if (opts.conversationId) args.push('--conversation', opts.conversationId)
     for (const d of opts.addDirs ?? []) args.push('--add-dir', d)

@@ -90,6 +90,41 @@ test('cleanupTempElements sweeps leaked temp containers from DOM', async () => {
   }
 })
 
+test('cleanupTempElements preserves active rendered diagram inside data-agy-mermaid-svg mount', async () => {
+  const { cleanupTempElements } = await import('../src/client/mermaid.ts')
+  const removed: string[] = []
+  const elements = new Map<string, { id: string; remove: () => void; closest: (sel: string) => unknown }>()
+
+  const makeActiveEl = (id: string, inMount: boolean) => {
+    const el = {
+      id,
+      remove: () => {
+        removed.push(id)
+        elements.delete(id)
+      },
+      closest: (sel: string) => (inMount && sel === '[data-agy-mermaid-svg]' ? {} : null),
+    }
+    elements.set(id, el)
+    return el
+  }
+
+  makeActiveEl('dagy-mmd-2', false)
+  makeActiveEl('agy-mmd-2', true) // Active SVG inside mount!
+
+  const origDoc = (globalThis as unknown as { document?: unknown }).document
+  try {
+    ;(globalThis as unknown as { document: unknown }).document = {
+      getElementById: (id: string) => elements.get(id) ?? null,
+      querySelectorAll: () => [],
+    }
+    cleanupTempElements('agy-mmd-2')
+    assert.ok(removed.includes('dagy-mmd-2'))
+    assert.ok(!removed.includes('agy-mmd-2'), 'Active SVG inside mount must never be removed!')
+  } finally {
+    ;(globalThis as unknown as { document?: unknown }).document = origDoc
+  }
+})
+
 test('repairMermaidSource heals common LLM syntax flaws in flowcharts', async () => {
   const { repairMermaidSource } = await import('../src/client/mermaid.ts')
 

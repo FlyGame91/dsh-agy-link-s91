@@ -205,7 +205,7 @@ function fenceLang(block: HTMLElement): string {
 	const info = block.querySelector('[data-code-block-banner] [class*="infostring"]')
 		?? block.querySelector('[data-code-block-banner] [class*="language"]')
 	const text = (info?.textContent ?? '').trim().toLowerCase()
-	if (text !== '') {
+	if (text !== '' && text !== '代码块' && text !== 'code' && text !== 'code block') {
 		return text.split(/\s+/)[0] ?? ''
 	}
 
@@ -256,15 +256,27 @@ function readSource(block: HTMLElement): string {
 export function cleanupTempElements(id?: string): void {
 	if (typeof document === 'undefined') return
 	if (id) {
-		document.getElementById('d' + id)?.remove()
-		document.getElementById('i' + id)?.remove()
-		document.getElementById(id)?.remove()
+		const delD = document.getElementById('d' + id)
+		if (delD && (typeof delD.closest !== 'function' || !delD.closest('[data-agy-mermaid-svg]'))) {
+			delD.remove()
+		}
+		const delI = document.getElementById('i' + id)
+		if (delI && (typeof delI.closest !== 'function' || !delI.closest('[data-agy-mermaid-svg]'))) {
+			delI.remove()
+		}
+		const el = document.getElementById(id)
+		if (el && (typeof el.closest !== 'function' || !el.closest('[data-agy-mermaid-svg]'))) {
+			el.remove()
+		}
 	}
 	const stray = document.querySelectorAll<HTMLElement>(
 		'body > [id^="dagy-mmd"], body > [id^="iagy-mmd"], body > [id^="d_agy-mmd"], body > [id^="i_agy-mmd"], body > [id^="agy-mmd-"]'
 	)
 	for (let i = 0; i < stray.length; i++) {
-		stray[i]?.remove()
+		const s = stray[i]
+		if (s && (typeof s.closest !== 'function' || !s.closest('[data-agy-mermaid-svg]'))) {
+			s.remove()
+		}
 	}
 }
 

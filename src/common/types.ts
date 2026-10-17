@@ -111,6 +111,7 @@ export const DEFAULT_FALLBACK_MODELS: readonly FallbackModelDef[] = [
   { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', efforts: ['low', 'medium', 'high'] },
   { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', efforts: ['low', 'medium', 'high'] },
   { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', efforts: ['low', 'medium', 'high'] },
+  { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'] },
   { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (Thinking)' },
   { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (Thinking)' },
   { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },

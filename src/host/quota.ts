@@ -838,7 +838,8 @@ export class QuotaService {
         // separate weekly bucket, but its display name still contains "gemini"
         // ("Gemini 4 Argon"). Detect argon BEFORE the generic gemini gate or
         // the group folds into — and overwrites — the plain Gemini family.
-        const isArgon = dName.includes('argon') || desc.includes('argon')
+        const hasArgonBucket = Array.isArray(group.buckets) && group.buckets.some((b) => (b.bucketId || '').toLowerCase().includes('argon') || (b.displayName || '').toLowerCase().includes('argon'))
+        const isArgon = dName.includes('argon') || desc.includes('argon') || hasArgonBucket
         const isGoogle = !isArgon && (dName.includes('gemini') || desc.includes('gemini'))
         const is3P = dName.includes('claude') || dName.includes('gpt') || desc.includes('claude') || desc.includes('gpt')
 

@@ -99,7 +99,7 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
   const verbatim: CatalogEntry[] = []
   const slugSet = new Set(raw.map((r) => r.slug))
   for (const r of raw) {
-    if (!r.slug.startsWith('gemini')) {
+    if (!r.slug.startsWith('gemini') && !r.slug.startsWith('argon')) {
       verbatim.push({ id: r.slug, name: r.label, efforts: null });
       continue;
     }

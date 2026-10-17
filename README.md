@@ -31,6 +31,11 @@
   &nbsp;&nbsp;
   <img src="./docs/assets/model-picker.png" alt="DSH 模型选择器中的 Antigravity 模型列表" width="220" />
 </p>
+<p align="center">
+  <img src="./docs/assets/token-usage.png" alt="原生上下文缓存与 Token 用量统计" width="340" />
+  &nbsp;&nbsp;
+  <img src="./docs/assets/context-metering.png" alt="1M 物理上下文负载精确计量" width="340" />
+</p>
 
 ---
 
@@ -70,9 +75,9 @@
 | 能力 | 说明 |
 | ---- | ---- |
 | 🎨 **官方专属矢量 Logo** | 36×36 高质感纯矢量微标（`assets/icon.svg`），透明底自适应深浅主题；设置左侧导航菜单（`[role="dialog"] nav`）动态替换系统齿轮，呈现专属品牌标识 |
-| 🧩 **插件页详情零冗余复用** | 侧栏「插件 → dsh-agy-link」详情面板直接复用原版 `AgySettingsSection`，控制台 100% 功能对齐且列表卡片保持精简 |
-| 🚀 **同账号二次并发租赁** | Windows 凭据槽支持同账号多会话并发无锁租约，消除长任务排队饥饿；仅在跨账号身份切换时互斥串行 |
-| ⚡ **97% 缓存命中与真实上下文** | 完整映射 Google Gemini Context Caching 原生协议（`cache_read_tokens`），精确计算 97% 缓存命中率与 ~87.9K / 1M 物理上下文负载 |
+| 🧩 **设置与插件面板统一** | 在 DSH「设置 → 插件」详情页直接内嵌 Antigravity 完整控制台，账号池、配额监控与代理配置一站式操作，列表保持轻量整洁 |
+| 🚀 **副账号并发租约** | Windows 凭据槽支持同一副账号多会话共享租约并发运行，消除单账号多任务排队饥饿；仅在跨账号身份切换时串行交接 |
+| ⚡ **原生上下文缓存与真实计量** | 完整映射 Google Gemini 原生上下文缓存协议（`cache_read_tokens`），精准追踪缓存读取与物理上下文占用，深度适配 1M 超长上下文 |
 | 👥 **多账号池化轮换** | 支持主账号 + 多个备用账号；遇到 429 或配额耗尽自动平滑切换，模型族独立冷却，额度到期早的账号优先接班 |
 | 🧠 **抖动安全鉴权 (Jitter-Safe Auth)** | 基于 agy 运行日志的 keyring 传输证据区分"网络抖动"与"真登出"，抖动自动按可重试网络错误处理；粘性隔离需二次确认，杜绝误标"需重新登录" |
 | 📊 **官方多 Bucket 配额监控** | 实时拉取官方端点，同时呈现 **5h 滚动额度**、**7d 周额度**与 **Argon 独立周池**（付费 Pro/Ultra）多进度条与倒计时，单模型明细可展开 |
@@ -200,6 +205,11 @@ Bring **Google Antigravity models into DeepSeek Harness (DSH)** — featuring **
   &nbsp;&nbsp;
   <img src="./docs/assets/model-picker.png" alt="Antigravity Model Lineup in DSH Model Picker" width="220" />
 </p>
+<p align="center">
+  <img src="./docs/assets/token-usage.png" alt="Native Context Caching & Token Usage Breakdown" width="340" />
+  &nbsp;&nbsp;
+  <img src="./docs/assets/context-metering.png" alt="Accurate 1M Context Window Metering" width="340" />
+</p>
 
 ---
 
@@ -236,9 +246,9 @@ Have multiple Google Antigravity / Gemini accounts? **dsh-agy-link makes multi-a
 ## ✨ Features Overview
 
 | 🎨 **Official Vector Logo** | Clean 36×36 retina vector mark (`assets/icon.svg`) with transparent background; dynamically replaces fallback gear in DSH Settings sidebar (`[role="dialog"] nav`) |
-| 🧩 **Zero-Redundancy Console** | Plugins detail page (`plugins.bundle.config`) directly reuses the native `AgySettingsSection` console with 100% parity while keeping list summaries clean |
-| 🚀 **Secondary Parallel Leases** | Windows credential slot fast path allows same-grant secondary sessions to run in parallel without queue starvation; serializes only for cross-grant switches |
-| ⚡ **97% Cache Hit & Context Metering** | Native Google Gemini Prompt Caching (`cache_read_tokens`) forwarding; accurate 97% cache hit rate and real ~87.9K / 1M prompt occupancy |
+| 🧩 **Unified Settings & Plugin Console** | Embedded Antigravity console directly in DSH Plugins settings; configure account pool, quotas, and proxies in one place while keeping list cards clean |
+| 🚀 **Secondary Account Parallel Leases** | Windows credential slot allows concurrent sessions on the same account to share leases without queue starvation; serializes only for cross-account switches |
+| ⚡ **Native Context Caching & Token Metering** | Native Google Gemini Prompt Caching (`cache_read_tokens`) forwarding; accurate cache read tracking and real prompt occupancy across 1M context windows |
 | 👥 **Multi-Account Pool** | Primary + unlimited spare accounts with automatic Sequential Drain rotation upon rate limits; quota-expiry-first scheduling |
 | 🧠 **Jitter-Safe Auth** | Distinguishes network jitter from a real sign-out via keyring transport evidence in agy's run log; sticky quarantine requires confirmation — no false "needs re-login" flags |
 | 📊 **Multi-Bucket Quota HUD** | Real-time progress bars for the **5h rolling**, **7d weekly**, and **Argon weekly** (paid Pro/Ultra) pools with exact reset countdowns |
