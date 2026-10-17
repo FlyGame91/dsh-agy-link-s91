@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Antigravity 桥接",
+    "description": "把 Google Antigravity（agy CLI）的 Gemini / Claude / GPT-OSS 订阅接入 DSH：多账号池、实时额度大盘、思考流、工具活动与 GUI 内 Google 登录。"
+  }
+}

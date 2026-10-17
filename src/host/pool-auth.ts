@@ -248,6 +248,9 @@ export class PoolAuthFlow {
           this.pool.getAccounts().find((a) => a.systemHome) ??
           this.pool.getAccounts()[0]
         if (primary) {
+          if (flow.proxyUrl && !primary.proxyUrl) {
+            this.pool.setAccountProxy(primary.id, flow.proxyUrl)
+          }
           this.pool.updateAccountQuotas(primary.id, primary.quotas, email)
           void this.quota.refreshAccountQuota(primary).catch(() => undefined)
         }

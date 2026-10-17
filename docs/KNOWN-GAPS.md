@@ -8,17 +8,59 @@ Deliberate v1 boundaries and upstream-behavior notes.
   slot over (issue #45)** — agy on Windows resolves its Google credential from
   ONE process-global Credential Manager slot `gemini:antigravity`
   (go-keyring); `HOME`/`USERPROFILE`/`GEMINI_CLI_HOME` move files only. Rather
-  than pretending the pool is isolated, the plugin now owns the slot: the
-  primary credential is kept in a durable, identity-verified store
+  than pretending the pool is isolated, the plugin owns the slot: the primary
+  credential is kept in a durable, identity-verified store
   (`agy-accounts/.primary-credential.json`), and every run acquires the slot
-  through `acquireCredentialSlot` — a process-wide FIFO mutex that writes the
-  target account's verified credential into the slot, then restores the
-  primary's on release. `SlotUnavailableError` aborts a run instead of letting
-  it silently spend the wrong account when the primary cannot be verified.
-  Remaining boundary: the mutex is **per process**, so two DSH hosts (web +
-  headless) running agy at the same moment can still interleave slot writes;
-  keep `maxConcurrent` at 1 on Windows and avoid driving two hosts at once.
-  A cleaner upstream fix would be per-HOME keyring namespacing in agy.
+  through `acquireCredentialSlot`.
+  - **Same-identity runs are parallel (v0.4.60).** The installed identity is
+    reference-counted: the first run on an account performs the handoff and
+    keeps the mutex, later runs on the same grant join as fast leases (each
+    verifies the slot still carries that grant), and runs already QUEUED for
+    the slot join too — they poll every 100ms and take a lease as soon as their
+    own grant is installed, so a backlog drains in parallel. The LAST holder
+    persists a rotated access token and restores the primary. Only identity
+    SWITCHES serialize — a switcher registers its claim BEFORE queueing, and
+    new same-identity joins are refused while a different identity waits.
+  - `SlotUnavailableError` aborts a run instead of letting it silently spend
+    the wrong account when the primary cannot be verified.
+  - Remaining boundary: the mutex is **per process**, so two DSH hosts (web +
+    headless) running agy at the same moment can still interleave slot writes;
+    avoid driving two hosts at once.
+
+## Credential injection: what agy actually supports (verified 2026-10-17)
+
+The clean fix for the Windows boundary above would be per-process credential
+injection (each account's HOME carries its own credential, no global slot, no
+mutex, identical on macOS/Linux/Windows). It is NOT available in the current
+agy build — measured, not assumed:
+
+- **The per-HOME token file is a BACKUP, not the source.** A fresh isolated
+  HOME containing a deliberately bogus
+  `.gemini/antigravity-cli/antigravity-oauth-token` still authenticated from the
+  machine keyring and completed a prompt (exit 0, `OK`), and the bogus file was
+  left untouched. With the keyring present, writing per-account token files
+  does not isolate identities. (`fileTokenStorage` exists but is only a
+  fallback when keyring save/load times out or is unavailable.)
+- **No credential CLI flag**: `agy --help` exposes no `--api-key` /
+  `--credential*` / `--token*` option.
+- **Documented env routes are different auth products**: `AGY_ADC_AUTH`
+  (Application Default Credentials / Agent Platform), and
+  `GEMINI_API_KEY` + `"modelProvider": "gemini"` in `settings.json` (the Gemini
+  API, not Antigravity subscription quota).
+- `AGY_ACCOUNT` selects among *plugin/manager* accounts, not CLI sign-ins.
+
+Therefore a true fix must come from agy itself, either of:
+
+1. **Namespace the keyring entry by HOME** — derive the go-keyring
+   service/user from the resolved home (e.g. `gemini:antigravity:<hash>`), so
+   an isolated HOME really is an isolated credential space. Needs a migration
+   path for the existing single entry.
+2. **Accept a per-process credential** — a `--credential-file` flag (or a
+   documented env var) that points at the account's token document, bypassing
+   the keyring entirely.
+
+Either one retires `credential-slot.ts` and the dispatch queue; until then the
+reference-counted slot is the strongest isolation the plugin can provide.
 
 ## Not forwarded to agy
 

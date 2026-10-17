@@ -98,17 +98,17 @@ function parseUsage(v: unknown): RawUsage {
   const num = (x: unknown): number | undefined => (typeof x === 'number' && Number.isFinite(x) ? x : undefined)
   // Lossless-JSON boundary: never assign undefined-valued properties.
   const out: RawUsage = {}
-  const inT = num(o.input_tokens)
-  const outT = num(o.output_tokens)
+  const inT = num(o.input_tokens) ?? num(o.inputTokens) ?? num(o.prompt_tokens)
+  const outT = num(o.output_tokens) ?? num(o.outputTokens) ?? num(o.completion_tokens)
   if (inT !== undefined) out.input_tokens = inT
   if (outT !== undefined) out.output_tokens = outT
-  const t = num(o.thinking_tokens)
+  const t = num(o.thinking_tokens) ?? num(o.thinkingTokens) ?? num(o.reasoning_tokens)
   if (t !== undefined) out.thinking_tokens = t
-  const cr = num(o.cache_read_tokens)
+  const cr = num(o.cache_read_tokens) ?? num(o.cacheReadTokens) ?? num(o.cached_tokens) ?? num(o.cache_read_input_tokens)
   if (cr !== undefined) out.cache_read_tokens = cr
-  const cw = num(o.cache_write_tokens)
+  const cw = num(o.cache_write_tokens) ?? num(o.cacheWriteTokens) ?? num(o.cache_creation_input_tokens)
   if (cw !== undefined) out.cache_write_tokens = cw
-  const tot = num(o.total_tokens)
+  const tot = num(o.total_tokens) ?? num(o.totalTokens)
   if (tot !== undefined) out.total_tokens = tot
   return out
 }

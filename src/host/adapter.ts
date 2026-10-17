@@ -1794,17 +1794,17 @@ export class AgyAdapter extends LlmAdapter {
           //  - HARD server refusal (429 / quota reached): the account is spent, so
           //    it is cooled down and the sticky pointer advances; the retry is
           //    served by the next account.
-          //  - SOFT capacity signal ("model overloaded" / high traffic): nothing
-          //    was spent, so no cooldown — but the pointer still advances and the
-          //    code is retryable, because dead-ending the turn while another
-          //    account could serve it is exactly the interruption users complain
-          //    about. Worst case the retry hits the same capacity wall and the
-          //    same error surfaces ~2s later.
+          //  - SOFT capacity signal ("model overloaded" / high traffic): Google-side
+          //    capacity pressure. Nothing was spent locally, so no cooldown — and the
+          //    scheduler STAYS on the current account with backoff retry rather than rotating,
+          //    preventing temporary server bursts from burning through all healthy accounts.
           const hard = looksLikeHardRateLimit(rawErrText)
           failure = {
             kind: 'error',
             code: hard ? Err.RATE_LIMIT : Err.OVERLOADED,
-            message: 'Google Antigravity quota / rate limit reached: ' + bestMsg,
+            message: hard
+              ? 'Google Antigravity quota / rate limit reached: ' + bestMsg
+              : 'Google Antigravity quota / rate limit reached (server capacity overloaded): ' + bestMsg,
           }
         } else if (
           !transportFailure
@@ -1909,14 +1909,15 @@ export class AgyAdapter extends LlmAdapter {
         //    the pool.
         //  - AUTH: the account is marked authRequired below, which already
         //    excludes it from rotation; rotating here makes the intent explicit.
-        //  - any other non-consumable refusal that came back with a nonzero
-        // Account-scoped failures (network, capacity overload, auth) rotate
-        // away so the automatic retry can try another account.
-        // Generic process exit (code !== 0) or tool errors do NOT indicate quota
-        // exhaustion, so we MUST NOT rotate accounts and discard conversation history.
+        // Account-scoped failures that must advance the pointer so the retry tries another account:
+        //  - RATE_LIMIT: account quota spent (cooldown applied in recordFailure above)
+        //  - NETWORK / AUTH: transport blip or dead login for this specific account
+        // Server capacity overload (OVERLOADED / 503 / 529): Google-side pressure.
+        // We deliberately STAY on the current account with exponential backoff rather
+        // than rotating, protecting healthy accounts in the pool from cascaded exhaustion.
         const rotateAway = !outcome.aborted && failure.code !== Err.RATE_LIMIT
+          && failure.code !== Err.OVERLOADED
           && (failure.code === Err.NETWORK
-            || failure.code === Err.OVERLOADED
             || failure.code === Err.AUTH)
         if (rotateAway && account) this.deps.pool?.advanceAccount(account.id, family)
         // Only authoritative auth states may flag an account: the old

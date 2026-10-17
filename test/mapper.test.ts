@@ -486,12 +486,13 @@ test('mirrorCallId round-trips through parseMirrorCallId', () => {
 })
 
 test('usageFromRaw maps snake_case fields', () => {
-  const u = usageFromRaw({ input_tokens: 1, output_tokens: 2, thinking_tokens: 3, cache_read_tokens: 4, cache_write_tokens: 5 })
+  const u = usageFromRaw({ input_tokens: 1, output_tokens: 2, thinking_tokens: 3, cache_read_tokens: 4, cache_write_tokens: 5, total_tokens: 15 })
   assert.equal(u.inputTokens, 1)
   assert.equal(u.outputTokens, 2)
   assert.equal(u.reasoningTokens, 3)
   assert.equal(u.cacheReadTokens, 4)
   assert.equal(u.cacheWriteTokens, 5)
+  assert.equal(u.totalTokens, 15)
 })
 
 test('thinking-only turn without DB prose still surfaces the banner (issue #43)', () => {

@@ -730,4 +730,11 @@ test('disabled account handling: needsAuthReverify skips disabled, getActiveAcco
   assert.equal(pool.getActiveAccountId('google'), secondary.id)
 })
 
+test('getPoolData exposes systemProxy when defaultProxy is provided or system proxy is detected', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-system-proxy-'))
+  const pool = new AccountPoolManager(dir)
+  const poolData = pool.getPoolData('http://127.0.0.1:17891')
+  assert.equal(poolData.systemProxy, 'http://127.0.0.1:17891')
+})
+
 

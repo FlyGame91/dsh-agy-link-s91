@@ -7,7 +7,7 @@ import { AccountPoolManager } from '../src/host/pool.ts'
 import { QuotaService, detectEmailFromAgyLogs, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
-import { parseCredentialDoc } from '../src/host/credential-slot.ts'
+import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
 
 test('persistRefreshedToken keeps the refresh token and writes agy nested shape', () => {
   // Regression: the writer used to emit a flat `{access_token,expiry}` document
@@ -476,10 +476,10 @@ test('readSystemKeychainToken dispatches per platform (GH #8 / GH #30)', async (
   assert.ok(tok === null || typeof tok.accessToken === 'string', 'dispatch resolves without throwing')
 })
 
-test('AGY_ENDPOINTS prioritizes official production endpoint', async () => {
+test('AGY_ENDPOINTS prioritizes Antigravity endpoint', async () => {
   const { AGY_ENDPOINTS } = await import('../src/host/oauth.ts')
-  assert.equal(AGY_ENDPOINTS[0], 'https://cloudcode-pa.googleapis.com', 'official production endpoint must be first')
-  assert.ok(AGY_ENDPOINTS.includes('https://daily-cloudcode-pa.googleapis.com'), 'daily endpoint remains as fallback')
+  assert.equal(AGY_ENDPOINTS[0], 'https://daily-cloudcode-pa.googleapis.com', 'Antigravity daily endpoint must be first')
+  assert.ok(AGY_ENDPOINTS.includes('https://cloudcode-pa.googleapis.com'), 'cloudcode-pa remains as fallback')
 })
 
 test('fetchQuotaSummary falls through partial summaries omitting Gemini to complete endpoints', async () => {
@@ -779,5 +779,77 @@ test('exhausted 5h bucket: per-model weekly-boundary remaining tightens the coar
   assert.equal(quotas.google?.weeklyFraction, REAL_REMAINING)
   assert.equal(quotas.google?.weeklyResetTime, weeklyBoundaryReset)
 })
+
+test('primary account on Windows resolves email from durable store (.primary-credential.json) and rejects sibling logs', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-primary-'))
+  const pool = new AccountPoolManager(dir)
+  const primary = pool.getAccounts().find((a) => a.systemHome)!
+  assert.ok(primary)
+
+  // Secondary sibling account exists in the pool
+  const sec = pool.createAccountSlot('sibling')
+  pool.updateAccountQuotas(sec.id, {}, 'sibling@example.com')
+
+  // Durable store has the verified primary email
+  writePrimaryCredential(
+    {
+      raw: JSON.stringify({ token: { access_token: 'ya29.primary', refresh_token: '1//prim', expiry: new Date(Date.now() + 3600_000).toISOString() } }),
+      email: 'primary@example.com',
+      savedAt: Date.now(),
+    },
+    dir,
+  )
+
+  // Write a log file that contains the sibling's email to simulate sibling agy runs
+  const logDir = join(dir, '.gemini', 'antigravity-cli', 'log')
+  mkdirSync(logDir, { recursive: true })
+  writeFileSync(
+    join(logDir, 'cli-20261017_120000.log'),
+    'OAuth: authenticated successfully as sibling@example.com\n',
+    'utf8',
+  )
+
+  class PrimaryTestService extends QuotaService {
+    override async fetchUserInfo() {
+      return null
+    }
+    override async fetchQuotaSummary() {
+      return { groups: [{ displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 1.0, resetTime: '2026-10-17T12:00:00Z' }] }] } as never
+    }
+    override async fetchAvailableModels() {
+      return { models: {} } as never
+    }
+  }
+
+  const svc = new PrimaryTestService(pool)
+  await svc.refreshAccountQuota(primary, false)
+
+  const updated = pool.getAccount(primary.id)!
+  if (process.platform === 'win32') {
+    assert.equal(updated.email, 'primary@example.com', 'primary resolves email from .primary-credential.json on Windows')
+  } else {
+    assert.notEqual(updated.email, 'sibling@example.com', 'primary never adopts sibling email from logs')
+  }
+})
+
+test('normalizeLegacyPrimary self-heals primary account email from .primary-credential.json on Windows', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-selfheal-'))
+  writePrimaryCredential(
+    {
+      raw: JSON.stringify({ token: { access_token: 'ya29.primary', refresh_token: '1//prim' } }),
+      email: 'g98@example.com',
+      savedAt: Date.now(),
+    },
+    dir,
+  )
+
+  const pool = new AccountPoolManager(dir)
+  const primary = pool.getAccounts().find((a) => a.systemHome)!
+  assert.ok(primary)
+  if (process.platform === 'win32') {
+    assert.equal(primary.email, 'g98@example.com', 'primary email self-heals from durable store on Windows')
+  }
+})
+
 
 

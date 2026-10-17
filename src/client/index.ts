@@ -56,7 +56,9 @@ export interface ClientContext extends Context {
 	slots: {
 		inject(name: string, register: () => () => void): void;
 		register(
-			opts: { name: string; key?: string; id: string; order?: number; label?: string | (() => string); locale?: string },
+			// `id` for list slots (settings.section entries), `key` for keyed
+			// slots (plugins.bundle.config is keyed by package name).
+			opts: { name: string; key?: string; id?: string; order?: number; label?: string | (() => string); locale?: string },
 			Component: (props?: unknown) => unknown,
 		): () => void;
 	};
@@ -388,28 +390,288 @@ const FAMILY_BRAND: Record<'google' | 'argon' | 'anthropic' | 'openai', BrandKey
 	openai: 'openai',
 };
 
-/** Antigravity mark: gradient orb with an orbit ring (product has no public simple-icon). */
-function agyIcon(size = 14): unknown {
-	const gid = 'agy-icon-linear-gradient';
+/**
+ * Antigravity logo mark: 3D orbit sphere with specular highlight, luminous front/back rings
+ * and twin satellite nodes matching the official assets/icon.svg.
+ */
+function agyIcon(size = 16): unknown {
+	const uid = 'agy-logo';
 	return h('svg', {
-		viewBox: '0 0 24 24',
+		viewBox: '0 0 36 36',
 		width: size,
 		height: size,
+		fill: 'none',
 		'aria-hidden': true,
-		style: { display: 'inline-block', verticalAlign: '-2px', flexShrink: 0 },
+		style: { display: 'inline-block', verticalAlign: '-2.5px', flexShrink: 0 },
 	},
 		h('defs', null,
-			h('linearGradient', { id: gid, x1: '0', y1: '0', x2: '1', y2: '1' },
-				h('stop', { offset: '0', 'stop-color': '#4C8DFF' }),
-				h('stop', { offset: '1', 'stop-color': '#A96BFF' }),
+			h('linearGradient', { id: `${uid}-orb`, x1: '12', y1: '11', x2: '25', y2: '25', gradientUnits: 'userSpaceOnUse' },
+				h('stop', { offset: '0%', 'stop-color': '#38BDF8' }),
+				h('stop', { offset: '45%', 'stop-color': '#6366F1' }),
+				h('stop', { offset: '85%', 'stop-color': '#9333EA' }),
+				h('stop', { offset: '100%', 'stop-color': '#C026D3' }),
+			),
+			h('linearGradient', { id: `${uid}-rf`, x1: '6', y1: '24', x2: '31', y2: '12', gradientUnits: 'userSpaceOnUse' },
+				h('stop', { offset: '0%', 'stop-color': '#00D2FF' }),
+				h('stop', { offset: '40%', 'stop-color': '#38BDF8' }),
+				h('stop', { offset: '70%', 'stop-color': '#818CF8' }),
+				h('stop', { offset: '100%', 'stop-color': '#F43F5E' }),
+			),
+			h('linearGradient', { id: `${uid}-rb`, x1: '7', y1: '12', x2: '29', y2: '24', gradientUnits: 'userSpaceOnUse' },
+				h('stop', { offset: '0%', 'stop-color': '#38BDF8', 'stop-opacity': '0.4' }),
+				h('stop', { offset: '100%', 'stop-color': '#A855F7', 'stop-opacity': '0.4' }),
+			),
+			h('linearGradient', { id: `${uid}-hl`, x1: '14', y1: '12', x2: '19', y2: '18', gradientUnits: 'userSpaceOnUse' },
+				h('stop', { offset: '0%', 'stop-color': '#FFFFFF', 'stop-opacity': '0.65' }),
+				h('stop', { offset: '100%', 'stop-color': '#FFFFFF', 'stop-opacity': '0.05' }),
 			),
 		),
-		h('circle', { cx: 12, cy: 12, r: 6, fill: `url(#${gid})` }),
-		h('ellipse', {
-			cx: 12, cy: 12, rx: 10.4, ry: 3.9,
-			fill: 'none', stroke: `url(#${gid})`, 'stroke-width': 1.4,
-			transform: 'rotate(-18 12 12)',
+		h('path', {
+			d: 'M 6.8 14.2 C 8.2 9.6 17.8 7.2 26.2 10.8 C 28.0 11.6 29.3 12.6 30.2 13.8',
+			stroke: `url(#${uid}-rb)`,
+			'stroke-width': '2.4',
+			'stroke-linecap': 'round',
 		}),
+		h('circle', { cx: 18, cy: 18, r: 7.5, fill: `url(#${uid}-orb)` }),
+		h('path', {
+			d: 'M 13.2 15.2 A 5.5 5.5 0 0 1 21.0 13.0 A 6.2 6.2 0 0 0 14.0 18.0 Z',
+			fill: `url(#${uid}-hl)`,
+		}),
+		h('path', {
+			d: 'M 30.2 13.8 C 31.4 18.2 21.8 26.2 12.8 24.2 C 9.4 23.4 7.4 21.8 6.6 19.6',
+			stroke: `url(#${uid}-rf)`,
+			'stroke-width': '2.6',
+			'stroke-linecap': 'round',
+		}),
+		h('circle', { cx: 8.2, cy: 18.2, r: 2.2, fill: '#00D2FF' }),
+		h('circle', { cx: 8.2, cy: 18.2, r: 1.0, fill: '#FFFFFF' }),
+		h('circle', { cx: 28.4, cy: 20.4, r: 1.8, fill: '#F43F5E' }),
+		h('circle', { cx: 28.4, cy: 20.4, r: 0.8, fill: '#FFFFFF' }),
+	);
+}
+
+/**
+ * Settings dialog navigation icon replacement for Antigravity.
+ * DSH settings shell projects nav glyphs from a closed list and falls back to a generic gear
+ * for third-party sections. We dynamically inject a stylesheet matching Antigravity's section
+ * row to display the custom Antigravity brand logo.
+ */
+const NAV_ICON_MARKER = 'data-dsh-agy-nav-icon';
+const NAV_ROW_SELECTOR = '[role="dialog"] nav button, [role="dialog"] nav a, [role="dialog"] aside button, .dsh-settings-nav button';
+
+const AGY_NAV_LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" fill="none">'
+	+ '<defs>'
+	+ '<linearGradient id="an-orb" x1="12" y1="11" x2="25" y2="25" gradientUnits="userSpaceOnUse"><stop offset="0%" stop-color="#38BDF8"/><stop offset="45%" stop-color="#6366F1"/><stop offset="85%" stop-color="#9333EA"/><stop offset="100%" stop-color="#C026D3"/></linearGradient>'
+	+ '<linearGradient id="an-rf" x1="6" y1="24" x2="31" y2="12" gradientUnits="userSpaceOnUse"><stop offset="0%" stop-color="#00D2FF"/><stop offset="40%" stop-color="#38BDF8"/><stop offset="70%" stop-color="#818CF8"/><stop offset="100%" stop-color="#F43F5E"/></linearGradient>'
+	+ '<linearGradient id="an-rb" x1="7" y1="12" x2="29" y2="24" gradientUnits="userSpaceOnUse"><stop offset="0%" stop-color="#38BDF8" stop-opacity="0.4"/><stop offset="100%" stop-color="#A855F7" stop-opacity="0.4"/></linearGradient>'
+	+ '<linearGradient id="an-hl" x1="14" y1="12" x2="19" y2="18" gradientUnits="userSpaceOnUse"><stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.65"/><stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.05"/></linearGradient>'
+	+ '</defs>'
+	+ '<path d="M 6.8 14.2 C 8.2 9.6 17.8 7.2 26.2 10.8 C 28.0 11.6 29.3 12.6 30.2 13.8" stroke="url(#an-rb)" stroke-width="2.4" stroke-linecap="round"/>'
+	+ '<circle cx="18" cy="18" r="7.5" fill="url(#an-orb)"/>'
+	+ '<path d="M 13.2 15.2 A 5.5 5.5 0 0 1 21.0 13.0 A 6.2 6.2 0 0 0 14.0 18.0 Z" fill="url(#an-hl)"/>'
+	+ '<path d="M 30.2 13.8 C 31.4 18.2 21.8 26.2 12.8 24.2 C 9.4 23.4 7.4 21.8 6.6 19.6" stroke="url(#an-rf)" stroke-width="2.6" stroke-linecap="round"/>'
+	+ '<circle cx="8.2" cy="18.2" r="2.2" fill="#00D2FF"/>'
+	+ '<circle cx="8.2" cy="18.2" r="1.0" fill="#FFFFFF"/>'
+	+ '<circle cx="28.4" cy="20.4" r="1.8" fill="#F43F5E"/>'
+	+ '<circle cx="28.4" cy="20.4" r="0.8" fill="#FFFFFF"/>'
+	+ '</svg>';
+
+function agyNavLogoUrl(): string {
+	return `data:image/svg+xml,${encodeURIComponent(AGY_NAV_LOGO_SVG)}`;
+}
+
+function isOwnNavRow(rowText: string | null | undefined, wantedLabel: string): boolean {
+	const wanted = String(wantedLabel ?? '').trim().toLowerCase();
+	const text = String(rowText ?? '').trim().toLowerCase();
+	if (!wanted && !text) return false;
+	return text === wanted || text.includes('antigravity');
+}
+
+function navIconCss(logoUrl: string): string {
+	return [
+		`[${NAV_ICON_MARKER}] > svg { display: none !important; }`,
+		`[${NAV_ICON_MARKER}] > [class*="icon"] > svg { display: none !important; }`,
+		`[${NAV_ICON_MARKER}]::before {`,
+		`  content: '';`,
+		`  flex: none;`,
+		`  width: 16px;`,
+		`  height: 16px;`,
+		`  background-image: url("${logoUrl}");`,
+		`  background-repeat: no-repeat;`,
+		`  background-position: center;`,
+		`  background-size: 16px 16px;`,
+		`  opacity: 0.92;`,
+		`  transition: opacity 0.15s ease, transform 0.15s ease;`,
+		`}`,
+		`[${NAV_ICON_MARKER}]:hover::before,`,
+		`[${NAV_ICON_MARKER}][aria-selected="true"]::before,`,
+		`[${NAV_ICON_MARKER}].active::before,`,
+		`[${NAV_ICON_MARKER}][data-state="active"]::before {`,
+		`  opacity: 1;`,
+		`  transform: scale(1.08);`,
+		`}`,
+	].join('\n');
+}
+
+function installSettingsNavIcon(ctx: ClientContext, resolveLabel: () => string): () => void {
+	if (typeof document === 'undefined') return () => {};
+	const tag = document.createElement('style');
+	tag.dataset.plugin = 'dsh-agy-link';
+	tag.dataset.pluginCss = 'dsh-agy-link/settings-nav-icon';
+	tag.textContent = navIconCss(agyNavLogoUrl());
+	document.head.appendChild(tag);
+	let disposed = false;
+	let scheduled = false;
+	const sync = () => {
+		scheduled = false;
+		if (disposed) return;
+		const wanted = resolveLabel();
+		for (const row of Array.from(document.querySelectorAll(NAV_ROW_SELECTOR))) {
+			if (isOwnNavRow(row.textContent, wanted)) {
+				row.setAttribute(NAV_ICON_MARKER, '');
+			} else {
+				row.removeAttribute(NAV_ICON_MARKER);
+			}
+		}
+	};
+	const schedule = () => {
+		if (scheduled || disposed) return;
+		scheduled = true;
+		queueMicrotask(sync);
+	};
+	sync();
+	const observer = new MutationObserver(schedule);
+	observer.observe(document.body, {
+		childList: true,
+		subtree: true,
+		characterData: true,
+	});
+	return () => {
+		disposed = true;
+		observer.disconnect();
+		for (const row of Array.from(document.querySelectorAll(`[${NAV_ICON_MARKER}]`))) {
+			row.removeAttribute(NAV_ICON_MARKER);
+		}
+		tag.remove();
+	};
+}
+
+/**
+ * One family's quota block: brand mark + 5h/weekly bars with reset countdowns
+ * and cooldown notes. Module-level so the settings section and the Plugins-page
+ * dashboard render IDENTICAL quota visuals from one implementation.
+ */
+function renderFamilyQuotaBar(
+	t: (key: AgyLocaleKey) => string,
+	label: string,
+	familyKey: 'google' | 'argon' | 'anthropic' | 'openai',
+	acc: ManagedAccount,
+	isRefreshing = false,
+): unknown {
+	const info = acc.quotas[familyKey];
+	const cd = acc.cooldowns[familyKey];
+	const inCooldown = cd && cd.cooldownUntil > Date.now();
+
+	// 5-Hour limit
+	const has5h = typeof info?.remainingFraction === 'number' && Number.isFinite(info.remainingFraction);
+	const pct5h = has5h ? Math.max(0, Math.min(100, Math.round(info!.remainingFraction! * 100))) : -1;
+	// Cooldown is a LOCAL heuristic — never overwrite the server-reported
+	// fraction with 0% (a ghost cooldown used to show a 98%-full account as
+	// empty). Surface it as a note next to the reset time instead.
+	const cdNote = inCooldown ? t('account.localCooldown') : '';
+	const w5h = formatQuotaWindow(t, info?.resetTime);
+	// Full-quota rows: the backend keeps the LAST window's resetTime, so
+	// the row would go silently blank. When the time has expired but the
+	// fraction is full, say "已重置" instead — the quota is usable now.
+	const expiredFull5h = w5h.expired && has5h && pct5h >= 100;
+
+	// Weekly limit
+	const hasWeekly = typeof info?.weeklyFraction === 'number' && Number.isFinite(info.weeklyFraction);
+	const pctWeekly = hasWeekly ? Math.max(0, Math.min(100, Math.round(info!.weeklyFraction! * 100))) : -1;
+	const wWeekly = formatQuotaWindow(t, info?.weeklyResetTime);
+	const expiredFullWeekly = wWeekly.expired && hasWeekly && pctWeekly >= 100;
+
+	const getColors = (pct: number) => {
+		if (pct < 0) {
+			return {
+				bar: 'var(--agy-quota-none-border)',
+				text: 'var(--agy-quota-none-text)',
+				bg: 'var(--agy-quota-none-bg)',
+				border: 'var(--agy-quota-none-border)',
+			};
+		}
+		if (pct <= 20) {
+			return {
+				bar: 'linear-gradient(90deg, #dc2626, #ef4444)',
+				text: 'var(--agy-quota-low-text)',
+				bg: 'var(--agy-quota-low-bg)',
+				border: 'var(--agy-quota-low-border)',
+			};
+		}
+		if (pct <= 50) {
+			return {
+				bar: 'linear-gradient(90deg, #d97706, #f59e0b)',
+				text: 'var(--agy-quota-med-text)',
+				bg: 'var(--agy-quota-med-bg)',
+				border: 'var(--agy-quota-med-border)',
+			};
+		}
+		return {
+			bar: 'linear-gradient(90deg, #059669, #10b981)',
+			text: 'var(--agy-quota-high-text)',
+			bg: 'var(--agy-quota-high-bg)',
+			border: 'var(--agy-quota-high-border)',
+		};
+	};
+
+	const c5h = getColors(pct5h);
+	const cWeekly = getColors(pctWeekly);
+
+	const renderLine = (windowName: string, percent: number, c: { bar: string; text: string; bg: string; border: string }, resetStr: string) => {
+		const isShimmer = percent < 0 || isRefreshing;
+		return h('div', { style: { display: 'flex', alignItems: 'center', fontSize: '11.5px', margin: '4px 0' } },
+			h('span', { style: { width: '52px', color: 'var(--agy-text-window-label)', fontSize: '11px', fontWeight: 700, flexShrink: 0 } }, windowName),
+			h('div', {
+				className: isShimmer ? 'agy-shimmer-track' : '',
+				style: S.progressBarBg,
+			},
+				h('div', {
+					className: 'agy-progress-fill',
+					style: {
+						width: `${percent < 0 ? 100 : percent}%`,
+						height: '100%',
+						background: c.bar,
+						borderRadius: '3px',
+					},
+				}),
+			),
+			h('div', { style: { display: 'inline-flex', alignItems: 'center', gap: '8px', minWidth: '140px', justifyContent: 'flex-end', flexShrink: 0 } },
+				h('span', {
+					style: {
+						padding: '2px 7px',
+						borderRadius: '4px',
+						background: c.bg,
+						color: c.text,
+						border: `1px solid ${c.border}`,
+						fontWeight: 700,
+						fontSize: '11.5px',
+						lineHeight: 1.2,
+					},
+				}, percent < 0 ? '—' : `${percent}%`),
+				resetStr ? h('span', { style: { color: 'var(--agy-text-secondary)', fontSize: '11px', fontWeight: 500 } }, `↻ ${resetStr}`) : null,
+			),
+		);
+	};
+
+	return h('div', { style: { margin: '6px 0', padding: '8px 10px', background: 'var(--agy-bg-subbox)', borderRadius: '7px', border: '1px solid var(--agy-border-box)' } },
+		h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '12.5px', marginBottom: '5px', color: 'var(--agy-text-primary)' } },
+			brandIcon(FAMILY_BRAND[familyKey], 14),
+			h('span', null, label),
+		),
+		// Argon is a WEEKLY-only counter today: render the 5h row only when
+		// the backend actually reports one, never as a permanent "—" ghost.
+		(familyKey !== 'argon' || has5h) ? renderLine(t('quota.fiveHour'), pct5h, c5h, w5h.resetText ? w5h.resetText + cdNote : expiredFull5h ? t('quota.windowReset') + cdNote : cdNote.replace(/^ · /, '')) : null,
+		renderLine(t('quota.weekly'), pctWeekly, cWeekly, wWeekly.resetText ? wWeekly.resetText : expiredFullWeekly ? t('quota.windowReset') : ''),
 	);
 }
 
@@ -698,6 +960,22 @@ body.dark,
 }
 .agy-progress-fill {
 	transition: width 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes agy-shimmer {
+	0% { transform: translateX(-100%); }
+	100% { transform: translateX(100%); }
+}
+.agy-shimmer-track {
+	position: relative;
+	overflow: hidden;
+}
+.agy-shimmer-track::after {
+	content: '';
+	position: absolute;
+	top: 0; left: 0; right: 0; bottom: 0;
+	background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.22) 50%, transparent 100%);
+	animation: agy-shimmer 1.8s infinite ease-in-out;
+	pointer-events: none;
 }
 .agy-modal-backdrop {
 	position: fixed;
@@ -1011,6 +1289,7 @@ export function apply(ctx: ClientContext): void {
 		const [toast, setToast] = useState<ToastNotice | null>(null);
 		const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
 		const [addProxyInput, setAddProxyInput] = useState('');
+		const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
 
 
 		// Cooldown expiry and quota countdowns are Date.now()-derived while the
@@ -1166,14 +1445,23 @@ export function apply(ctx: ClientContext): void {
 		};
 
 		const setActiveAccount = async (id: string): Promise<void> => {
+			setOptimisticActiveId(id);
 			setLoadingAction(`active:${id}`);
-			const res = await postJson('/plugins/agy-link/pool/set-active', { id });
-			setLoadingAction(null);
-			if (res && res.ok) {
-				await refresh();
-				showToast(t('account.activeSet'), 'success');
-			} else {
-				showToast(res?.error || t('account.activeSetFailed'), 'error');
+			try {
+				const res = await postJson('/plugins/agy-link/pool/set-active', { id });
+				if (res && res.ok) {
+					await refresh();
+					showToast(t('account.activeSet'), 'success');
+				} else {
+					setOptimisticActiveId(null);
+					showToast(res?.error || t('account.activeSetFailed'), 'error');
+				}
+			} catch {
+				setOptimisticActiveId(null);
+				showToast(t('account.activeSetFailed'), 'error');
+			} finally {
+				setOptimisticActiveId(null);
+				setLoadingAction(null);
 			}
 		};
 
@@ -1298,113 +1586,15 @@ export function apply(ctx: ClientContext): void {
 			);
 		};
 
-		const renderQuotaBar = (label: string, familyKey: 'google' | 'argon' | 'anthropic' | 'openai', acc: ManagedAccount): unknown => {
-			const info = acc.quotas[familyKey];
-			const cd = acc.cooldowns[familyKey];
-			const inCooldown = cd && cd.cooldownUntil > Date.now();
-
-			// 5-Hour limit
-			const has5h = typeof info?.remainingFraction === 'number' && Number.isFinite(info.remainingFraction);
-			const pct5h = has5h ? Math.max(0, Math.min(100, Math.round(info!.remainingFraction! * 100))) : -1;
-			// Cooldown is a LOCAL heuristic — never overwrite the server-reported
-			// fraction with 0% (a ghost cooldown used to show a 98%-full account as
-			// empty). Surface it as a note next to the reset time instead.
-			const cdNote = inCooldown ? t('account.localCooldown') : '';
-			const w5h = formatQuotaWindow(t, info?.resetTime);
-			// Full-quota rows: the backend keeps the LAST window's resetTime, so
-			// the row would go silently blank. When the time has expired but the
-			// fraction is full, say "已重置" instead — the quota is usable now.
-			const expiredFull5h = w5h.expired && has5h && pct5h >= 100;
-
-			// Weekly limit
-			const hasWeekly = typeof info?.weeklyFraction === 'number' && Number.isFinite(info.weeklyFraction);
-			const pctWeekly = hasWeekly ? Math.max(0, Math.min(100, Math.round(info!.weeklyFraction! * 100))) : -1;
-			const wWeekly = formatQuotaWindow(t, info?.weeklyResetTime);
-			const expiredFullWeekly = wWeekly.expired && hasWeekly && pctWeekly >= 100;
-
-			const getColors = (pct: number) => {
-				if (pct < 0) {
-					return {
-						bar: 'var(--agy-quota-none-border)',
-						text: 'var(--agy-quota-none-text)',
-						bg: 'var(--agy-quota-none-bg)',
-						border: 'var(--agy-quota-none-border)',
-					};
-				}
-				if (pct <= 20) {
-					return {
-						bar: 'linear-gradient(90deg, #dc2626, #ef4444)',
-						text: 'var(--agy-quota-low-text)',
-						bg: 'var(--agy-quota-low-bg)',
-						border: 'var(--agy-quota-low-border)',
-					};
-				}
-				if (pct <= 50) {
-					return {
-						bar: 'linear-gradient(90deg, #d97706, #f59e0b)',
-						text: 'var(--agy-quota-med-text)',
-						bg: 'var(--agy-quota-med-bg)',
-						border: 'var(--agy-quota-med-border)',
-					};
-				}
-				return {
-					bar: 'linear-gradient(90deg, #059669, #10b981)',
-					text: 'var(--agy-quota-high-text)',
-					bg: 'var(--agy-quota-high-bg)',
-					border: 'var(--agy-quota-high-border)',
-				};
-			};
-
-			const c5h = getColors(pct5h);
-			const cWeekly = getColors(pctWeekly);
-
-			const renderLine = (windowName: string, percent: number, c: { bar: string; text: string; bg: string; border: string }, resetStr: string) => {
-				return h('div', { style: { display: 'flex', alignItems: 'center', fontSize: '11.5px', margin: '4px 0' } },
-					h('span', { style: { width: '52px', color: 'var(--agy-text-window-label)', fontSize: '11px', fontWeight: 700, flexShrink: 0 } }, windowName),
-					h('div', { style: S.progressBarBg },
-						h('div', {
-							className: 'agy-progress-fill',
-							style: {
-								width: `${percent < 0 ? 100 : percent}%`,
-								height: '100%',
-								background: c.bar,
-								borderRadius: '3px',
-							},
-						}),
-					),
-					h('div', { style: { display: 'inline-flex', alignItems: 'center', gap: '8px', minWidth: '140px', justifyContent: 'flex-end', flexShrink: 0 } },
-						h('span', {
-							style: {
-								padding: '2px 7px',
-								borderRadius: '4px',
-								background: c.bg,
-								color: c.text,
-								border: `1px solid ${c.border}`,
-								fontWeight: 700,
-								fontSize: '11.5px',
-								lineHeight: 1.2,
-							},
-						}, percent < 0 ? '—' : `${percent}%`),
-						resetStr ? h('span', { style: { color: 'var(--agy-text-secondary)', fontSize: '11px', fontWeight: 500 } }, `↻ ${resetStr}`) : null,
-					),
-				);
-			};
-
-			return h('div', { style: { margin: '6px 0', padding: '8px 10px', background: 'var(--agy-bg-subbox)', borderRadius: '7px', border: '1px solid var(--agy-border-box)' } },
-				h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '12.5px', marginBottom: '5px', color: 'var(--agy-text-primary)' } },
-					brandIcon(FAMILY_BRAND[familyKey], 14),
-					h('span', null, label),
-				),
-				// Argon is a WEEKLY-only counter today: render the 5h row only when
-				// the backend actually reports one, never as a permanent "—" ghost.
-				(familyKey !== 'argon' || has5h) ? renderLine(t('quota.fiveHour'), pct5h, c5h, w5h.resetText ? w5h.resetText + cdNote : expiredFull5h ? t('quota.windowReset') + cdNote : cdNote.replace(/^ · /, '')) : null,
-				renderLine(t('quota.weekly'), pctWeekly, cWeekly, wWeekly.resetText ? wWeekly.resetText : expiredFullWeekly ? t('quota.windowReset') : ''),
-			);
-		};
+		const isRefreshingQuota = loadingAction === 'refresh-quota';
+		const renderQuotaBar = (label: string, familyKey: 'google' | 'argon' | 'anthropic' | 'openai', acc: ManagedAccount): unknown =>
+			renderFamilyQuotaBar(t, label, familyKey, acc, isRefreshingQuota);
 
 		// Authoritative active account: trust pool.activeAccountId computed by
 		// the scheduler, falling back to lastActiveAccountId, activeAccountIds.google, or primaryAccountId.
-		const activeAccountId = pool?.activeAccountId ?? pool?.lastActiveAccountId ?? pool?.activeAccountIds?.google ?? pool?.primaryAccountId;
+		// Optimistic selection takes priority for instant zero-flicker feedback.
+		const authoritativeActiveId = pool?.activeAccountId ?? pool?.lastActiveAccountId ?? pool?.activeAccountIds?.google ?? pool?.primaryAccountId;
+		const activeAccountId = optimisticActiveId ?? authoritativeActiveId;
 		const renderedAccountCards = accounts.map((acc: ManagedAccount) => {
 			const isPrimary = acc.id === pool?.primaryAccountId;
 			const hasCooldown = Object.entries(acc.cooldowns).some(([, cd]) => cd && cd.cooldownUntil > Date.now());
@@ -1560,17 +1750,21 @@ export function apply(ctx: ClientContext): void {
 							},
 							title: t('status.inUse'),
 						}, uiIcon('zap', 10, '#10b981'), t('status.inUse')) : null,
-						acc.proxyUrl ? h('span', {
-							style: {
-								...S.badgeTag,
-								background: 'var(--agy-badge-proxy-bg)',
-								color: 'var(--agy-badge-proxy-text)',
-								borderColor: 'var(--agy-badge-proxy-border)',
-								gap: '4px',
-								fontSize: '10px',
-								padding: '1px 5px',
-							},
-						}, uiIcon('globe', 10, 'var(--agy-badge-proxy-text)'), t('status.proxy')) : null,
+						(() => {
+							const effectiveProxy = acc.proxyUrl || pool?.systemProxy;
+							return effectiveProxy ? h('span', {
+								style: {
+									...S.badgeTag,
+									background: 'var(--agy-badge-proxy-bg)',
+									color: 'var(--agy-badge-proxy-text)',
+									borderColor: 'var(--agy-badge-proxy-border)',
+									gap: '4px',
+									fontSize: '10px',
+									padding: '1px 5px',
+								},
+								title: effectiveProxy,
+							}, uiIcon('globe', 10, 'var(--agy-badge-proxy-text)'), t('status.proxy')) : null;
+						})(),
 						!acc.enabled ? h('span', {
 							style: {
 								...S.badgeTag,
@@ -1736,7 +1930,7 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 						h('input', {
 							style: S.input,
 							value: proxyInputs[acc.id] !== undefined ? proxyInputs[acc.id] : (acc.proxyUrl ?? ''),
-							placeholder: t('proxy.placeholder'),
+							placeholder: pool?.systemProxy ? `${t('proxy.placeholder')} (${pool.systemProxy})` : t('proxy.placeholder'),
 							'aria-label': t('aria.proxyInput'),
 							onChange: (e: { target: { value: string } }) => setProxyInputs({ ...proxyInputs, [acc.id]: e.target.value }),
 						}),
@@ -1783,7 +1977,7 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 								h('input', {
 									style: S.input,
 									value: addProxyInput,
-									placeholder: t('account.proxyPlaceholder'),
+									placeholder: pool?.systemProxy ? `${t('account.proxyPlaceholder')} (${pool.systemProxy})` : t('account.proxyPlaceholder'),
 									'aria-label': t('aria.proxyInput'),
 									onChange: (e: { target: { value: string } }) => setAddProxyInput(e.target.value),
 								}),
@@ -1859,7 +2053,7 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 		return h('div', { style: S.container },
 			h('div', { style: S.headerCard },
 				h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-					agyIcon(16),
+					agyIcon(18),
 					h('span', { style: { fontWeight: 700, fontSize: '14px', color: 'var(--agy-text-primary)' } }, 'Antigravity'),
 					h('span', { style: isAuthed ? S.badgeReady : S.badgeUnready }, isAuthed ? t('status.ready') : t('status.needsAuth')),
 				),
@@ -2159,6 +2353,36 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 		return dispose;
 	});
 
+	// Plugins page (sidebar → 插件 → dsh-agy-link): the bundle's detail panel.
+	// Directly reuses the identical Antigravity management console (AgySettingsSection),
+	// providing 100% feature parity and zero redundancy.
+	// When view === "summary", returns null to keep plugin list cards compact and clean.
+	ctx.slots.inject('plugins.bundle.config', () => {
+		const dispose = ctx.slots.register(
+			{ name: 'plugins.bundle.config', key: 'dsh-agy-link', locale: NS },
+			(ownerProps?: unknown) => {
+				const view = (ownerProps as { view?: string } | undefined)?.view;
+				if (view === 'summary') return null;
+				return h(AgySettingsSection, { isModal: false });
+			},
+		);
+		return dispose;
+	});
+
+	// Also register row config for the agy-link row, so clicking through row
+	// items renders the identical Antigravity management console.
+	ctx.slots.inject('plugins.row.config', () => {
+		const dispose = ctx.slots.register(
+			{ name: 'plugins.row.config', key: 'dsh-agy-link#agy-link', locale: NS },
+			(ownerProps?: unknown) => {
+				const view = (ownerProps as { view?: string } | undefined)?.view;
+				if (view === 'summary') return null;
+				return h(AgySettingsSection, { isModal: false });
+			},
+		);
+		return dispose;
+	});
+
 	// Native tool-card rendering for the agy_tool mirror (DSH >= 0.1.5):
 	// the browser conversation UI keys tool cards by wire name; registering
 	// `tool.call.toolview` for `agy_tool` makes every mirrored agy step render
@@ -2179,4 +2403,7 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 
 	// Interactive user decision & choice chips (recovered working tree).
 	ctx.effect(() => installDecisionChips());
+
+	// Custom Antigravity brand icon inside Settings dialog nav list
+	ctx.effect(() => installSettingsNavIcon(ctx, () => locale.bind(NS)('section.label')));
 }

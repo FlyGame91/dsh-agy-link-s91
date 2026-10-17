@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.4.62 (2026-10-17)
+
+### English
+
+- **Feat: Capacity vs. Account exhaustion separation & stay-on-capacity backoff.**
+  - **Decoupled Capacity vs. Account**: Added `looksLikeCapacityExhaustion` to distinguish upstream datacenter/cluster overload (503/529, "high demand", "capacity exceeded", "resource temporarily exhausted") from per-account rate limits (429 per-token/per-request exhaustion).
+  - **Stay Strategy**: Capacity overloads now surface as retryable `Err.OVERLOADED` (preserving `rate limit (server capacity overloaded)` for downstream compatibility). `rotateAway` skips account rotation when capacity is overloaded, avoiding rapid, fruitless churn through the entire account pool during regional Google outages.
+- **Feat: Windows cross-process slot lock with `process.kill(pid, 0)` liveness detection & instant self-healing.**
+  - **Liveness Detection**: Implemented `isProcessAlive(pid)` leveraging `process.kill(pid, 0)` with proper platform-level `ESRCH` and `EPERM` error code handling.
+  - **Instant Stale Lock Reclamation**: In `acquireCrossProcessSlotLock` for Windows multi-process slot arbitration, stale locks from abruptly killed or crashed processes are detected immediately upon PID verification and cleanly removed, eliminating unneeded blocking waits.
+- **Feat: Zero-flicker optimistic account switching & shimmer loading animation.**
+  - **Optimistic Account Switch**: Switching accounts in `AgySettingsSection` triggers an immediate 0ms UI update (`optimisticActiveId`) with graceful rollback on error, eliminating UI redraw jitter and perception latency.
+  - **Quota Shimmer Effect**: Integrated CSS shimmer animation (`@keyframes agy-shimmer` & `.agy-shimmer-track`) into quota progress bars during refresh and pending states, delivering a polished, modern look.
+- **Fix: Unified proxy indicator badge & system proxy inheritance for primary account.**
+  - **Inherited Proxy Visibility**: The proxy tag (`[globe] Proxy`) now resolves effective proxy configuration (`acc.proxyUrl || pool.systemProxy`). When accounts rely on global/system proxy settings, the proxy badge is reliably shown on the primary account alongside other accounts instead of silently omitting it.
+  - **Proxy Tooltip & Placeholder**: Hovering on the proxy tag now shows the effective proxy URL (`title: effectiveProxy`), and modal/input placeholders dynamically reflect the inherited system/global proxy URL.
+
+### 中文
+
+- **新功能：容量过载与账号配额耗尽精准解耦，机房压力下实行原地退避（Stay）。**
+  - **过载类型分离**：引入 `looksLikeCapacityExhaustion`，精准区分 Google 机房级/区域级容量瓶颈（503/529、"high demand"、"capacity exceeded"、"resource temporarily exhausted"）与单个账号的 429 频率超限。
+  - **原地退避调度（Stay）**：容量压力统一抛出可重试的 `Err.OVERLOADED`（错误信息保留 `rate limit (server capacity overloaded)` 以向下兼容）。`rotateAway` 遇到容量过载时跳过轮换、留在当前账号，彻底杜绝在机房整体拥堵时盲目将全号池快速轮换耗尽的恶性循环。
+- **新功能：Windows 跨进程凭证锁与 `process.kill(pid, 0)` 进程存活探测秒级自愈。**
+  - **进程存活性探测**：实现高可靠的 `isProcessAlive(pid)`，基于 `process.kill(pid, 0)` 准确识别 `ESRCH`（进程不存在）与 `EPERM`（跨权限存活进程）。
+  - **崩溃孤儿锁秒级清理**：在 Windows 多进程凭证槽互斥锁（`acquireCrossProcessSlotLock`）中，当持锁 PID 意外崩溃或被强杀时，竞争进程通过存活探测瞬间判定孤儿锁并自愈重置，无需冗长的超时等待。
+- **新功能：前端账号切换 0ms 乐观响应防闪烁与配额微光（Shimmer）动效。**
+  - **0ms 乐观切换**：在 `AgySettingsSection` 控制台切换账号时立即通过 `optimisticActiveId` 刷新界面状态并带有错误自动回滚保护，彻底消除切换等待过程中的白屏闪烁与延迟感。
+  - **配额微光流光动效**：配额条（`renderFamilyQuotaBar`）在刷新或等待就绪时接入平滑流光动效（`@keyframes agy-shimmer` 与 `.agy-shimmer-track`），交互反馈更具质感。
+- **修复：统一代理标识展示与主账号系统/全局代理继承识别。**
+  - **继承代理完整透出**：代理徽标（`[globe] 代理`）统一解析账号生效代理（`acc.proxyUrl || pool.systemProxy`）。当主账号继承使用系统/全局代理设置时，与号池副账号一样稳定展示代理徽标，消除“主账号缺少代理标识”的疑惑。
+  - **代理悬浮提示与输入框占位符**：鼠标悬停在“代理”徽标上可直接查看完整生效代理 URL；代理编辑框与新建账号对话框动态展示当前继承的系统代理地址。
+
+## 0.4.61 (2026-10-17)
+
+### English
+
+- **Feat: Official vector logo redesign & zero-redundancy console reuse across DSH.**
+  - **Redesigned Vector Logo** (`assets/icon.svg` & `./icon.svg` + `package.json` `icon`): Clean, transparent-background 36x36 retina vector icon featuring a vibrant antigravity orb gradient (`#38BDF8` → `#6366F1` → `#9333EA` → `#C026D3`), front/back occluded orbital rings, specular crescent highlight, and dual satellite bridge nodes (cyan & magenta). Pinned by `test/client-plugin-meta.test.ts`.
+  - **Settings & Navigation Brand Icons**:
+    - Upgraded `agyIcon` in Settings section header and Modal Console dialog to render the full official vector logo geometry.
+    - Added `installSettingsNavIcon` dynamically targeting the Settings dialog navigation sidebar (`[role="dialog"] nav button`), replacing DSH's fallback gear icon with the official Antigravity logo.
+  - **Zero-Redundancy Plugin Page Console**: Directly reuses the identical `AgySettingsSection` console in the plugins bundle/row view (`plugins.bundle.config` & `plugins.row.config`), eliminating duplicate dashboard code while keeping list card summaries clean.
+  - **Display Metadata**: Localized title and description in `locale/{en,zh,es,pt-BR}.json` ("Antigravity 桥接").
+
+### 中文
+
+- **新功能：官方矢量 Logo 视觉重构与 DSH 全场景控制台零冗余复用。**
+  - **矢量 Logo 全新设计**（`assets/icon.svg` 与 `./icon.svg` + `package.json` `icon` 字段）：采用纯透明背景、36x36 视网膜矢量微标，包含反重力渐变球体（`#38BDF8` → `#6366F1` → `#9333EA` → `#C026D3`）、前后立体穿插引力环、月牙镜面液态高光与双子引力光节点（天青与洋红）；通过 `test/client-plugin-meta.test.ts` 强校验。
+  - **设置界面与左侧导航图标全面接入 Logo**：
+    - 设置面板顶部与控制台弹窗标题的 `agyIcon` 升级为官方矢量微标几何体。
+    - 新增 `installSettingsNavIcon`，动态匹配设置对话框左侧导航菜单（`[role="dialog"] nav button`），将系统默认齿轮图标替换为专属 Antigravity Logo。
+  - **插件详情页零冗余复用**：侧边栏插件页（`plugins.bundle.config` 与 `plugins.row.config`）在详情页面中直接复用原版 `AgySettingsSection` 控制台，列表摘要卡片保持纯粹轻量，彻底避免界面冗余与代码重复。
+  - **展示元数据**：`locale/{en,zh,es,pt-BR}.json` 注入本地化展示元数据（"Antigravity 桥接"）。
+
+## 0.4.60 (2026-10-17)
+
+### English
+
+- **Fix: same-grant runs on a SECONDARY pool account now run in parallel — only identity SWITCHES serialize (cardboard-empire starvation, 2026-10-17).**
+  - **Incident**: the active pool account was a secondary (`elegantmanco@…`); only the primary account had a fast path, so every secondary run held the machine-global Windows credential slot EXCLUSIVELY for its whole run. One long agy run (the quota-investigation session, 12:34:30–12:44:18, 79 mirrored steps) starved all other sessions: three cardboard-empire turns sat at `request/context` for 8m50s+ with zero tokens even though their `request/header` had already been logged. When the long run exited the queue drained 16s later (first token 12:44:34) — the slot, not agy, was the bottleneck.
+  - **Change** (`credential-slot.ts`): the installed SECONDARY identity is now reference-counted. The first run performs the exclusive handoff and keeps the mutex; later runs on the SAME grant join as fast leases after proving the slot still carries that grant (`sameCredentialGrant` on every join, so an external slot takeover is never joined). **Runs already queued for the slot also join**: while waiting they poll every 100ms and take a lease the moment their own grant is installed, so a backlog of turns drains in parallel instead of one whole run at a time (the exact incident shape). The LAST holder persists a rotated access token and restores the primary. `fastPathRunCount()` now reports primary fast runs + live same-identity secondary holders, and `/agy status` shows the combined number.
+  - **Anti-starvation invariant preserved**: a run that needs a DIFFERENT identity (or the primary) registers a switch claim BEFORE queueing on the mutex; new same-identity joins are refused while any claim is outstanding (the single `slotSwitchPending` boolean became a `pendingSwitchClaims` counter), so a switcher can no longer be postponed indefinitely. Same-grant refreshes remain safe: refresh tokens are not single-use, and every joiner verifies the grant before running.
+  - **Tests** (`credential-slot.test.ts`): same-identity secondary runs share one installed identity and run in parallel (the mutex stays held by the owner until the last peer exits); an identity switch waits for EVERY peer; a pending switch refuses new peers (no starvation); a peer does not join an installed identity the slot no longer carries; last-holder rotated-token write-back; `parallel: false` still restores full exclusivity; existing corruption guards unchanged (26/26 pass).
+- **Fix: live Gemini quota synchronization & accurate 5h / weekly limit display.**
+  - **Root Cause**:
+    1. `AGY_ENDPOINTS` placed `https://cloudcode-pa.googleapis.com` ahead of `https://daily-cloudcode-pa.googleapis.com`. `cloudcode-pa` is the Cloud Code for VS Code legacy PA endpoint, returning a separate quota pool (which showed 4% @ 15:07).
+    2. `src/host/quota.ts` hardcoded `agyUserAgent` default to `1.1.15`. Google's Antigravity backend (`daily-cloudcode-pa.googleapis.com`) checks client versions and omits the entire `Gemini Models` group when receiving `1.1.15`, returning only third-party models. With `2.24.0` (matching Antigravity IDE 2.24.0), it immediately returns both Gemini Models and Claude/GPT groups with live 5-hour and weekly buckets.
+    3. Reordered `AGY_ENDPOINTS` to prioritize Antigravity's native `https://daily-cloudcode-pa.googleapis.com` endpoint, and updated `agyUserAgent` default version to `2.24.0`.
+  - **Result**: "刷新额度" and "同步" immediately display accurate Gemini 5-hour and weekly limits matching Antigravity IDE (e.g. 99% / 99% with correct reset countdowns) instead of getting stuck at 4%.
+- **Fix: primary account on Windows self-heals from durable verified store and prevents sibling account log pollution.**
+  - **Issue**: On Windows, the primary account (`systemHome`) could display a secondary account's email (e.g. `elegantmanco@…` instead of `g98…`) after background quota polls. The background quota poller read `detectEmailFromAgyLogs` from `~/.gemini/antigravity-cli/log`, where secondary accounts executing in the shared CLI home wrote auth success log lines.
+  - **Fix**: The primary account on Windows now binds directly to the durable verified store (`.primary-credential.json`, written only from live Google token verification). `normalizeLegacyPrimary` self-heals on startup/reload, and `detectEmailFromAgyLogs` rejects any email belonging to sibling accounts in the pool.
+
+### 中文
+
+- **修复：同一授权下的次级账号运行现在可以真正并行——只有「身份切换」才串行（cardboard-empire 饿死事件，2026-10-17）。**
+  - **事件**：当时生效的是号池里的次级账号（`elegantmanco@…`），而快路径只给系统主账号，于是每个次级运行都要独占机器级 Windows 凭据槽直到整个 run 结束。一个长 agy 运行（额度排查会话，12:34:30–12:44:18，79 个镜像步骤）把其它会话全部饿死：三个 cardboard-empire 回合停在 `request/context` 8 分 50 秒以上、零 token，而它们的 `request/header` 早已记录。长运行退出后 16 秒内队列就动了起来（12:44:34 首个 token）——证明瓶颈是凭据槽而不是 agy。
+  - **改动**（`credential-slot.ts`）：次级账号装入槽位的身份改为**引用计数**。第一个 run 完成独占交接并持有互斥锁；之后**同一授权**的 run 通过 `sameCredentialGrant` 校验槽位仍携带该凭据后直接加入（外部改写槽位时不会误加入）。**已经排队等槽的 run 也会加入**：排队期间每 100ms 轮询一次，一旦自己的授权被装入就立刻转成并行租约——这样一整批积压回合会并行排空，而不是一个 run 接一个 run 地串（正是本次事件形态）。**最后一个 holder** 才回写轮换后的 access token 并还原主账号。`fastPathRunCount()` = 主账号快路径 + 次级同身份在跑数，`/agy status` 展示合并值。
+  - **防饿死不变量保留**：需要切换身份（或切回主账号）的运行会在排队**之前**登记切换声明；只要有声明未完成，新的同身份 run 一律拒绝加入（原来的单个 `slotSwitchPending` 布尔改为 `pendingSwitchClaims` 计数），切换者不会再被无限推迟。同授权并发刷新是安全的（refresh token 非一次性），且每个加入者都会先校验授权。
+  - **测试**：同身份次级并行（互斥锁由所有者持有直到最后一个 peer 退出）、身份切换等待全部 peer、切换待定时拒绝新 peer（防饿死）、槽位被外部改写时不加入、最后持有者回写轮换 token、`parallel: false` 仍完全串行、原有防损坏守卫不变（26/26 通过）。
+- **修复：Gemini 额度显示 4% 卡死及刷新/同步无效问题，还原真实的 5 小时与周额度。**
+  - **根本原因**：
+    1. `AGY_ENDPOINTS` 此前误将 `https://cloudcode-pa.googleapis.com`（Cloud Code PA 遗留端点）置于首位，导致请求命中了非 Antigravity 的老配额周期（显示为 4.06% ↺ 15:07）。
+    2. `src/host/quota.ts` 中的 `agyUserAgent` 默认写死了版本号 `1.1.15`。Google Antigravity 后端（`daily-cloudcode-pa.googleapis.com`）对客户端版本有特性拦截：当 UA 为 1.x 时，响应中直接剔除 `Gemini Models` 额度组，导致此前测试误以为该端点缺失 Gemini 数据。更新为 `2.24.0`（与 Antigravity IDE 2.24.0 官方客户端一致）后，后端即刻完整返回 Gemini Models 的 5 小时与周额度。
+    3. 将 `AGY_ENDPOINTS` 调整为优先请求 Antigravity 原生端点 `https://daily-cloudcode-pa.googleapis.com`，并将 `agyUserAgent` 默认版本升级为 `2.24.0`。
+  - **效果**：点击「刷新」或「同步」后，插件面板即刻正确呈现与 Antigravity IDE 一致的真实额度（如 99% 5 小时额度与 99% 周额度及各自正确的重置倒计时），不再卡死在 4%。
+- **修复：Windows 主账号身份自愈并防御副账号日志污染（主账号显示为副账号邮箱问题）。**
+  - **问题**：在 Windows 单槽位多账号环境下，后台每 15 分钟的额度轮询通过 `detectEmailFromAgyLogs` 扫描全局 CLI 日志目录；当副账号（如 `elegantmanco@…`）在本地运行留下认证日志后，主账号邮箱被误覆盖为副账号，导致控制面板主账号显示错误。
+  - **修复**：主账号在 Windows 下权威绑定持久化验证凭据（`.primary-credential.json`），启动与重新载入时通过 `normalizeLegacyPrimary` 自动自愈；日志探测增加兄弟账号守卫（Sibling Account Guard），坚决忽略已在号池中的副账号邮箱，杜绝反向污染。
+
 ## 0.4.59 (2026-10-16)
 
 ### English

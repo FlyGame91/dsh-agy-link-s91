@@ -342,6 +342,145 @@ export class WaitTimeoutError extends Error {
 
 export const credentialSlotMutex = new AsyncMutex()
 
+// ---- cross-process slot lock with process liveness probing -----------------
+
+/**
+ * Detect whether an external process by PID is currently running.
+ * Uses process.kill(pid, 0) which tests for process existence without sending a signal.
+ * - Returns true if the process exists (including EPERM when owned by another user).
+ * - Returns false if ESRCH (process does not exist / exited), or if the PID is invalid.
+ */
+export function isProcessAlive(pid: number | undefined | null): boolean {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code
+    if (code === 'EPERM') return true
+    return false
+  }
+}
+
+export const SLOT_LOCK_NAME = '.credential-slot.lock'
+export const SLOT_LOCK_STALE_MS = 45_000
+
+export function slotLockFilePath(baseDir: string): string {
+  return join(baseDir, SLOT_LOCK_NAME)
+}
+
+export interface SlotLockData {
+  pid: number
+  acquiredAt: number
+  holder?: string
+}
+
+/**
+ * Acquire a cross-process lock for the Windows credential slot.
+ * Inspects any existing lock's PID via `process.kill(pid, 0)`.
+ * If the recorded holder process has crashed/exited, the dead lock is reclaimed
+ * immediately instead of stalling for timeout.
+ */
+export async function acquireCrossProcessSlotLock(
+  baseDir: string,
+  options: {
+    timeoutMs?: number
+    pollIntervalMs?: number
+    signal?: AbortSignal
+    log?: (msg: string) => void
+    holder?: string
+  } = {},
+): Promise<() => void> {
+  const lockFile = slotLockFilePath(baseDir)
+  const timeoutMs = options.timeoutMs ?? 15_000
+  const pollMs = options.pollIntervalMs ?? 50
+  const log = options.log ?? ((): void => {})
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0
+
+  try {
+    mkdirSync(baseDir, { recursive: true })
+  } catch {
+    // ignore
+  }
+
+  for (;;) {
+    if (options.signal?.aborted) {
+      throw new AbortedWaitError('aborted while waiting for cross-process slot lock')
+    }
+
+    if (existsSync(lockFile)) {
+      let isStale = false
+      let holderPid: number | undefined
+      try {
+        const content = readFileSync(lockFile, 'utf8')
+        const parsed = JSON.parse(content) as SlotLockData
+        holderPid = parsed.pid
+        if (typeof holderPid === 'number') {
+          if (!isProcessAlive(holderPid)) {
+            isStale = true
+            log(`[agy-link] removing stale slot lock from dead process ${holderPid} (instant self-heal)`)
+          } else if (Date.now() - (parsed.acquiredAt || 0) > SLOT_LOCK_STALE_MS) {
+            isStale = true
+            log(`[agy-link] removing stale slot lock exceeding ${SLOT_LOCK_STALE_MS}ms timeout`)
+          }
+        } else {
+          isStale = true
+        }
+      } catch {
+        isStale = true
+      }
+
+      if (isStale) {
+        try {
+          unlinkSync(lockFile)
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    // Try atomic write of temporary file and rename
+    const payload: SlotLockData = {
+      pid: process.pid,
+      acquiredAt: Date.now(),
+      holder: options.holder,
+    }
+    const tempFile = lockFile + '.tmp-' + process.pid + '-' + Date.now()
+    try {
+      writeFileSync(tempFile, JSON.stringify(payload), { flag: 'wx', encoding: 'utf8' })
+      renameSync(tempFile, lockFile)
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        try {
+          if (existsSync(lockFile)) {
+            const raw = readFileSync(lockFile, 'utf8')
+            const parsed = JSON.parse(raw) as SlotLockData
+            if (parsed.pid === process.pid) {
+              unlinkSync(lockFile)
+            }
+          }
+        } catch {
+          // best-effort cleanup
+        }
+      }
+    } catch {
+      try {
+        unlinkSync(tempFile)
+      } catch {
+        // ignore
+      }
+    }
+
+    if (deadline > 0 && Date.now() >= deadline) {
+      throw new WaitTimeoutError('timed out waiting for cross-process slot lock')
+    }
+
+    await new Promise((r) => setTimeout(r, pollMs))
+  }
+}
+
 // ---- platform seam ---------------------------------------------------------
 
 /**
@@ -575,29 +714,76 @@ export class SlotUnavailableError extends Error {
 // ONLY thing that must stay exclusive on Windows is the machine-global
 // credential slot, and only when its IDENTITY has to change:
 //
-//   * Runs on the identity ALREADY in the slot (the sticky primary — the
-//     common case) only ever READ the credential. Google refresh tokens are
-//     not single-use, so parallel token refreshes on one grant produce
-//     multiple valid access tokens — no conflict. These runs bypass the mutex
-//     entirely (FAST PATH) and are pure parallelism.
-//   * A run that needs a DIFFERENT identity in the slot (a secondary account)
-//     must first wait out every fast-path run: swapping the slot under a live
-//     process would feed it the wrong credential on its next in-run token
-//     refresh — the exact corruption class this module exists to prevent.
-//     While a switch is pending, new fast paths are refused so the switcher
-//     cannot starve (they fall back to the serialized slow path).
+//   * Runs on the identity ALREADY in the slot only ever READ the credential.
+//     Google refresh tokens are not single-use, so parallel token refreshes on
+//     one grant produce multiple valid access tokens — no conflict. These runs
+//     bypass the mutex entirely (FAST PATH) and are pure parallelism.
+//   * A run that needs a DIFFERENT identity in the slot must first wait out
+//     every same-identity run: swapping the slot under a live process would
+//     feed it the wrong credential on its next in-run token refresh — the
+//     exact corruption class this module exists to prevent. While a switch
+//     waits, new fast paths are refused so the switcher cannot starve.
+//
+// A SECONDARY account's installed identity is reference-counted: the first run
+// performs the exclusive handoff and keeps the mutex, later runs on the same
+// grant join it as fast leases, and the LAST holder persists any rotated token
+// and restores the primary. Before this existed every secondary run held the
+// slot exclusively (only the primary had a fast path), so one long agy run on
+// the active pool account starved every other session — three cardboard-empire
+// turns parked ~9 minutes behind a single run on 2026-10-17.
 
 let primaryFastRuns = 0
-let slotSwitchPending = false
 
-/** Live fast-path (same-account) run count — exported for diagnostics. */
-export function fastPathRunCount(): number {
-  return primaryFastRuns
+interface InstalledIdentity {
+  /** Credential grant currently installed in the Windows slot. */
+  fingerprint: string
+  /** Runs relying on it: the handoff owner plus same-identity fast leases. */
+  holders: number
+  /** Persist a rotated token, restore the primary, release the mutex. */
+  finish: () => void
 }
 
-/** True while a secondary account is waiting to swap the slot identity. */
+/** The secondary identity currently installed in the slot, if any. */
+let installedIdentity: InstalledIdentity | null = null
+
+/**
+ * Identities that waiting runs want installed, keyed by grant fingerprint
+ * (`'primary'` for the system account). Same-identity peers may still join
+ * while a key for their OWN grant is pending; joins are refused as soon as a
+ * DIFFERENT identity waits, so a switcher can never be postponed forever.
+ */
+const pendingSwitchTargets = new Map<string, number>()
+
+function claimSwitchTarget(key: string): void {
+  pendingSwitchTargets.set(key, (pendingSwitchTargets.get(key) ?? 0) + 1)
+}
+
+function releaseSwitchTarget(key: string): void {
+  const left = (pendingSwitchTargets.get(key) ?? 0) - 1
+  if (left > 0) pendingSwitchTargets.set(key, left)
+  else pendingSwitchTargets.delete(key)
+}
+
+/** Live same-identity run count — exported for diagnostics. */
+export function fastPathRunCount(): number {
+  return primaryFastRuns + (installedIdentity?.holders ?? 0)
+}
+
+/** True while a run is waiting for (or performing) a slot identity switch. */
 export function isSlotSwitchPending(): boolean {
-  return slotSwitchPending
+  return pendingSwitchTargets.size > 0
+}
+
+/**
+ * Leave a reference-counted secondary identity. The last holder completes the
+ * handoff: persist a rotated token, restore the primary, release the mutex.
+ */
+function leaveInstalledIdentity(state: InstalledIdentity): void {
+  if (state.holders <= 0) return
+  state.holders -= 1
+  if (state.holders > 0) return
+  if (installedIdentity === state) installedIdentity = null
+  state.finish()
 }
 
 /**
@@ -607,12 +793,14 @@ export function isSlotSwitchPending(): boolean {
  * Non-Windows platforms have no shared slot (per-account Keychain isolation
  * works), so this is a no-op there.
  *
- * Same-account runs (the sticky primary — the common case) take a FAST PATH:
- * when the slot already provably holds this account's credential and no slot
- * switch is pending, the run starts IMMEDIATELY without the mutex, so
- * multiple sessions on one account run truly in parallel (agy is a stateless
- * CLI and handles concurrent processes natively). Only identity SWITCHES
- * serialize.
+ * Same-identity runs take a FAST PATH: when the slot provably holds THIS
+ * account's credential and no switch is pending, the run starts IMMEDIATELY
+ * without the mutex, so multiple sessions on one account run truly in parallel
+ * (agy is a stateless CLI and handles concurrent processes natively). For a
+ * secondary account the first run performs the handoff and later runs on the
+ * same grant join it — including runs that were already QUEUED for the slot,
+ * which poll and join as soon as their own grant is installed. The last holder
+ * restores the primary. Only identity SWITCHES serialize.
  *
  * @param options.signal  cancels the wait for the slot — without it a turn
  *   queued behind another session's long run ignored Stop entirely (the
@@ -643,7 +831,7 @@ export async function acquireCredentialSlot(
 
   // -- FAST PATH: same-account, slot identity already correct ---------------
   // No mutex, no wait: N sessions on the primary account run in parallel.
-  if (parallel && isPrimarySlot && !slotSwitchPending && !options.signal?.aborted) {
+  if (parallel && isPrimarySlot && !isSlotSwitchPending() && !options.signal?.aborted) {
     const stored = readPrimaryCredential(baseDir)
     if (stored && sameCredentialGrant(io.readSlot(), stored.raw)) {
       primaryFastRuns += 1
@@ -668,21 +856,141 @@ export async function acquireCredentialSlot(
     }
   }
 
+  // Requested identity (cheap file read): needed both to join an identity that
+  // is already installed and to register this run's switch intent while queued.
+  const requestedFile = isPrimarySlot ? null : accountTokenFilePath(account, homeDir)
+  const requestedRaw = requestedFile === null ? null : readTokenFileRaw(requestedFile)
+  const requestedFingerprint = isPrimarySlot ? null : credentialFingerprint(requestedRaw)
+  const switchKey = isPrimarySlot ? 'primary' : (requestedFingerprint ?? 'unknown')
+
+  // -- FAST PATH: reuse a secondary identity ALREADY installed --------------
+  // The first run on a secondary account wrote its credential into the slot and
+  // owns the handoff mutex until its LAST same-identity peer exits. A later run
+  // on the same grant needs no switch at all: it only has to prove the slot
+  // still carries that grant (an external writer may have replaced it), then it
+  // joins as a fast lease. Google refresh tokens are not single-use, so
+  // concurrent in-run refreshes on one grant are harmless.
+  const joinInstalled = (): SlotLease | null => {
+    if (!parallel || isPrimarySlot || requestedRaw === null || requestedFingerprint === null) return null
+    if (options.signal?.aborted) return null
+    const state = installedIdentity
+    if (state === null || state.fingerprint !== requestedFingerprint) return null
+    // Refuse to extend an installed identity while ANOTHER identity waits to
+    // switch in — that guard is what keeps the switcher from starving.
+    for (const key of pendingSwitchTargets.keys()) {
+      if (key !== switchKey) return null
+    }
+    // Prove the slot still carries this grant: never join an identity the
+    // machine no longer holds (another host may have replaced it).
+    if (!sameCredentialGrant(io.readSlot(), requestedRaw)) return null
+    state.holders += 1
+    return {
+      identity: account.email,
+      release: (): void => leaveInstalledIdentity(state),
+    }
+  }
+
+  const immediate = joinInstalled()
+  if (immediate) {
+    log("[agy-link] same-identity fast path: slot already holds this account's credential — running without exclusivity")
+    return immediate
+  }
+
+  // -- SWITCH GUARD: register the intent BEFORE queueing --------------------
+  // Without this, same-identity peers could keep joining and hold the installed
+  // identity forever (the 2026-10-17 starvation shape).
+  let claimSwitch = false
+  const claim = (): void => {
+    if (claimSwitch || !parallel) return
+    claimSwitch = true
+    claimSwitchTarget(switchKey)
+  }
+  const releaseClaim = (): void => {
+    if (!claimSwitch) return
+    claimSwitch = false
+    releaseSwitchTarget(switchKey)
+  }
+  claim()
+
   // -- SLOW PATH: serialized handoff (identity switch or slot repair) ------
-  const releaseMutex = await credentialSlotMutex.acquire({
-    signal: options.signal,
-    timeoutMs: options.dispatchTimeoutMs,
-    // Heal a lost wakeup within seconds instead of parking the turn forever.
-    pollMs: 5_000,
-    shouldProceed: () => true,
-  })
+  // While queued, poll for a join opportunity: another run on this SAME grant
+  // may install the identity first, and joining it is how a backlog of sessions
+  // drains in parallel instead of one whole run at a time. Aborting the mutex
+  // wait is safe — AsyncMutex removes the waiter and wakes the next one.
+  const joinAbort = new AbortController()
+  const waitSignal = options.signal
+    ? AbortSignal.any([options.signal, joinAbort.signal])
+    : joinAbort.signal
+  let joinLease: SlotLease | null = null
+  const joinPoll = setInterval(() => {
+    if (joinLease !== null) return
+    const lease = joinInstalled()
+    if (lease !== null) {
+      joinLease = lease
+      joinAbort.abort()
+    }
+  }, 100)
+  joinPoll.unref?.()
+
+  let releaseMutex: (() => void) | null = null
+  try {
+    releaseMutex = await credentialSlotMutex.acquire({
+      signal: waitSignal,
+      timeoutMs: options.dispatchTimeoutMs,
+      // Heal a lost wakeup within seconds instead of parking the turn forever.
+      pollMs: 5_000,
+      shouldProceed: () => true,
+    })
+  } catch (err) {
+    clearInterval(joinPoll)
+    if (joinLease !== null) {
+      const lease = joinLease
+      releaseClaim()
+      log('[agy-link] queued run joined an installed same-identity slot lease — running in parallel')
+      return lease
+    }
+    releaseClaim()
+    throw err
+  }
+  clearInterval(joinPoll)
+  if (joinLease !== null) {
+    // Both paths won in the same tick: keep the join, hand the mutex back.
+    const lease = joinLease
+    joinLease = null
+    releaseMutex()
+    releaseClaim()
+    log('[agy-link] queued run joined an installed same-identity slot lease — running in parallel')
+    return lease
+  }
+  const releaseMutexSlot = releaseMutex
+
+  let releaseFileLock: (() => void) | null = null
+  if (io.platform === 'win32') {
+    try {
+      releaseFileLock = await acquireCrossProcessSlotLock(baseDir, {
+        timeoutMs: options.dispatchTimeoutMs,
+        signal: options.signal,
+        log,
+        holder: account.alias || account.id,
+      })
+    } catch (err) {
+      releaseClaim()
+      releaseMutexSlot()
+      throw err
+    }
+  }
 
   let released = false
   const done = (): void => {
     if (released) return
     released = true
-    slotSwitchPending = false
-    releaseMutex()
+    try {
+      releaseFileLock?.()
+    } catch {
+      // best-effort cleanup
+    }
+    releaseClaim()
+    releaseMutexSlot()
   }
 
   // An abort that landed in the same tick as the grant must not run a turn
@@ -711,6 +1019,8 @@ export async function acquireCredentialSlot(
         log('[agy-link] re-asserting the primary credential into the Windows credential slot')
         io.writeSlot(primary.raw)
       }
+      // The identity is installed: same-account peers may fast-path again.
+      releaseClaim()
       return {
         identity: primary.email,
         release: (): void => {
@@ -735,29 +1045,27 @@ export async function acquireCredentialSlot(
       }
     }
 
-    // -- Secondary run: identity SWITCH — drain fast-path runs first ------
+    // -- Secondary run: identity SWITCH — drain same-identity runs first --
     // Swapping the slot under a live primary process would feed it THIS
-    // account's credential on its next in-run token refresh.
+    // account's credential on its next in-run token refresh. The switch claim
+    // registered above already refuses NEW fast paths; this loop waits out the
+    // ones that were live when the claim landed.
     if (parallel && primaryFastRuns > 0) {
-      slotSwitchPending = true
       const deadline = options.dispatchTimeoutMs !== undefined && options.dispatchTimeoutMs > 0
         ? Date.now() + options.dispatchTimeoutMs
         : 0
       log(`[agy-link] waiting for ${primaryFastRuns} same-account run(s) to finish before switching the credential slot to ${account.alias || account.id}`)
       while (primaryFastRuns > 0) {
         if (options.signal?.aborted) {
-          slotSwitchPending = false
           throw new AbortedWaitError('aborted while waiting for same-account runs to finish')
         }
         if (deadline !== 0 && Date.now() > deadline) {
-          slotSwitchPending = false
           throw new WaitTimeoutError(
             `timed out waiting for ${primaryFastRuns} same-account run(s) to finish before switching the credential slot`,
           )
         }
         await new Promise((r) => setTimeout(r, 200))
       }
-      slotSwitchPending = false
     }
 
     if (!accountRaw) {
@@ -787,10 +1095,15 @@ export async function acquireCredentialSlot(
     }
 
     io.writeSlot(accountRaw)
-
-    return {
-      identity: account.email,
-      release: (): void => {
+    // This account's identity is installed and STAYS installed while any
+    // same-identity peer is live: the mutex this lease holds is handed back by
+    // the LAST holder, which also restores the primary. Until then agy may
+    // rotate the access token in place as often as it likes — the grant (and
+    // therefore the identity) is unchanged.
+    const state: InstalledIdentity = {
+      fingerprint: accountFingerprint,
+      holders: 1,
+      finish: (): void => {
         try {
           const afterRaw = io.readSlot()
           const afterFingerprint = credentialFingerprint(afterRaw)
@@ -817,6 +1130,14 @@ export async function acquireCredentialSlot(
           }
         }
       },
+    }
+    installedIdentity = state
+    // Identity installed: peers on this grant may join now. A queued switcher
+    // keeps its own claim, so this only releases THIS run's guard.
+    releaseClaim()
+    return {
+      identity: account.email,
+      release: (): void => leaveInstalledIdentity(state),
     }
   } catch (err) {
     done()

@@ -1461,29 +1461,29 @@ test('a NEW (steered) prompt preempts a live run instead of debouncing', async (
   }
 })
 
-test('soft rate limit signal (model overloaded) becomes a retryable OVERLOADED and rotates', async () => {
+test('soft rate limit signal (model overloaded) becomes a retryable OVERLOADED and stays on current account', async () => {
   const prevMode = process.env.FAKE_AGY_MODE
   const invocationFile = join(workDir, `invocations-overload-${Date.now()}.txt`)
   process.env.FAKE_AGY_MODE = 'real-fail'
   process.env.FAKE_AGY_INVOCATION_FILE = invocationFile
   const pool = new AccountPoolManager(join(workDir, `pool-soft-overload-${Date.now()}`))
   pool.createAccountSlot('Second')
+  const initialActive = pool.getActiveAccountId('google')
   try {
     const { adapter } = makeAdapter({}, { pool })
     const res = await runTurn(adapter, [msg('user', 'Say hello')], { sessionId: 'sess-ratelimit' as never })
     const finish = res.chunks[res.chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string; message: string } } }
     assert.equal(finish.type, 'finish')
     assert.equal(finish.reason.kind, 'error')
-    // Soft capacity refusals used to be a deterministic AGY_ERROR, so the turn
-    // died while another account was idle. They are now account-scoped for the
-    // retry: retryable, pointer rotated, and NO cooldown (nothing was spent).
+    // Server capacity refusals (model overloaded / 503 / 529): retryable OVERLOADED,
+    // NO cooldown (nothing spent locally), and STAYS on current account to prevent
+    // cascading load onto healthy backup accounts.
     assert.equal(finish.reason.failure?.code, Err.OVERLOADED)
     assert.ok(finish.reason.failure?.message.includes('rate limit'))
     assert.ok(adapter.providerRetryPolicy('agy').retryableCodes.includes(Err.OVERLOADED), 'overload must be retryable')
-    // The refusal is repeated for every account by the fake, so the useful
-    // assertion is that the retry did NOT stay on the same account.
     const spawns = readFileSync(invocationFile, 'utf8').split('\n').filter(Boolean).length
     assert.ok(spawns >= 2, `expected a failover spawn, got ${spawns}`)
+    assert.equal(pool.getActiveAccountId('google'), initialActive, 'capacity overload must stay on current account, not rotate')
     for (const acc of pool.getAccounts()) {
       assert.equal(acc.cooldowns.google, undefined, 'a capacity signal must never cool an account down')
     }

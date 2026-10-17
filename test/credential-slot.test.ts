@@ -5,7 +5,7 @@
 // row reported the same identity. The guards below make that impossible.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -14,16 +14,20 @@ import {
   SlotUnavailableError,
   WaitTimeoutError,
   acquireCredentialSlot,
+  acquireCrossProcessSlotLock,
   credentialFingerprint,
   credentialSlotMutex,
   fastPathRunCount,
   findDuplicateCredentialIdentities,
+  isProcessAlive,
   isSlotSwitchPending,
   parseCredentialDoc,
   readPrimaryCredential,
   resolvePrimaryCredential,
+  slotLockFilePath,
   writePrimaryCredential,
   type SlotIo,
+  type SlotLease,
 } from '../src/host/credential-slot.ts'
 
 function tmp(prefix: string): string {
@@ -462,6 +466,290 @@ test('new same-account runs queue behind a pending slot switch instead of starvi
   }
 })
 
+// ---- reference-counted secondary identity (2026-10-17 starvation) ----------
+//
+// Until 2026-10-17 only the PRIMARY account had a fast path: every secondary
+// run held the slot exclusively, so one long agy run on the active pool account
+// starved every other session (three cardboard-empire turns parked ~9 minutes
+// behind a single run). Same-grant secondary runs now share one installed
+// identity; only identity SWITCHES serialize.
+
+function secondaryPool(): never {
+  return primaryPool()
+}
+
+test('same-account SECONDARY runs share one installed identity and run in parallel', async () => {
+  const baseDir = tmp('agy-sec-par-')
+  const homeDir = tmp('agy-sec-par-home-')
+  const accDir = tmp('agy-sec-par-acc-')
+  const accountFile = join(accDir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token')
+  let owner: SlotLease | undefined
+  let joined: SlotLease | undefined
+  try {
+    writePrimaryCredential({ raw: tokenDoc('PRIMARY'), email: 'me@example.com', savedAt: 1 }, baseDir)
+    writeAccountToken(accDir, tokenDoc('SECOND', 'access-second'))
+    const io = memoryIo(tokenDoc('PRIMARY'))
+    const q98 = account('q98', accDir, { email: 'q98@example.com' })
+
+    owner = await acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} })
+    assert.ok(owner)
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND', 'the first run installs its identity')
+
+    // The second run on the same grant must join immediately instead of queueing
+    // behind the whole first run — that queueing was the starvation.
+    joined = await Promise.race([
+      acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('same-identity join waited')), 1_000)),
+    ])
+    assert.ok(joined)
+    assert.equal(fastPathRunCount(), 2, 'both same-identity runs are tracked as live')
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND', 'the identity stays installed')
+
+    // agy rotates the access token in place; the grant identity is unchanged.
+    io.writeSlot(tokenDoc('SECOND', 'access-rotated'))
+
+    owner.release()
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND', 'the primary is NOT restored while a peer is live')
+    assert.equal(credentialSlotMutex.pending, 1, 'the handoff mutex stays held by the live peer')
+    assert.equal(isSlotSwitchPending(), false)
+
+    // The LAST holder persists the rotated token and restores the primary.
+    joined.release()
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:PRIMARY', 'the last holder restores the primary')
+    assert.equal(parseCredentialDoc(readFileSync(accountFile, 'utf8'))?.accessToken, 'access-rotated')
+    assert.equal(credentialSlotMutex.pending, 0)
+    assert.equal(fastPathRunCount(), 0)
+  } finally {
+    joined?.release()
+    owner?.release()
+    for (const d of [baseDir, homeDir, accDir]) rmSync(d, { recursive: true, force: true })
+  }
+})
+
+test('an identity switch waits for every same-identity peer before swapping the slot', async () => {
+  const baseDir = tmp('agy-sec-drain-')
+  const homeDir = tmp('agy-sec-drain-home-')
+  const accDir = tmp('agy-sec-drain-acc-')
+  const daoDir = tmp('agy-sec-drain-dao-')
+  let owner: SlotLease | undefined
+  let joined: SlotLease | undefined
+  let daoLease: SlotLease | undefined
+  try {
+    writePrimaryCredential({ raw: tokenDoc('PRIMARY'), email: 'me@example.com', savedAt: 1 }, baseDir)
+    writeAccountToken(accDir, tokenDoc('SECOND'))
+    writeAccountToken(daoDir, tokenDoc('THIRD'))
+    const io = memoryIo(tokenDoc('PRIMARY'))
+    const q98 = account('q98', accDir, { email: 'q98@example.com' })
+    const dao = account('dao', daoDir, { email: 'dao@example.com' })
+
+    owner = await acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} })
+    assert.ok(owner)
+    joined = await acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} })
+    assert.ok(joined)
+
+    let daoDone = false
+    const daoP = acquireCredentialSlot(dao, secondaryPool(), { baseDir, homeDir, io, log: () => {} }).then((l) => {
+      daoLease = l
+      daoDone = true
+      return l
+    })
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(isSlotSwitchPending(), true, 'the pending switch is visible')
+    assert.equal(daoDone, false, 'the switch waits for the live peers')
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND', 'no swap while peers are live')
+
+    owner.release()
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(daoDone, false, 'one peer exiting is not enough')
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND')
+
+    joined.release()
+    const lease = await Promise.race([
+      daoP,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('drain deadline passed')), 2_000)),
+    ])
+    assert.ok(lease)
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:THIRD', 'the switcher owns the slot after the drain')
+
+    lease.release()
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:PRIMARY', 'the primary is restored after the switch')
+    assert.equal(credentialSlotMutex.pending, 0)
+    assert.equal(isSlotSwitchPending(), false)
+    assert.equal(fastPathRunCount(), 0)
+  } finally {
+    daoLease?.release()
+    joined?.release()
+    owner?.release()
+    for (const d of [baseDir, homeDir, accDir, daoDir]) rmSync(d, { recursive: true, force: true })
+  }
+})
+
+test('a pending identity switch refuses new same-identity peers (no starvation)', async () => {
+  const baseDir = tmp('agy-sec-starve-')
+  const homeDir = tmp('agy-sec-starve-home-')
+  const accDir = tmp('agy-sec-starve-acc-')
+  const daoDir = tmp('agy-sec-starve-dao-')
+  let owner: SlotLease | undefined
+  let joined: SlotLease | undefined
+  let daoLease: SlotLease | undefined
+  let lateLease: SlotLease | undefined
+  try {
+    writePrimaryCredential({ raw: tokenDoc('PRIMARY'), email: 'me@example.com', savedAt: 1 }, baseDir)
+    writeAccountToken(accDir, tokenDoc('SECOND'))
+    writeAccountToken(daoDir, tokenDoc('THIRD'))
+    const io = memoryIo(tokenDoc('PRIMARY'))
+    const q98 = account('q98', accDir, { email: 'q98@example.com' })
+    const dao = account('dao', daoDir, { email: 'dao@example.com' })
+
+    owner = await acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} })
+    joined = await acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} })
+    assert.ok(owner)
+    assert.ok(joined)
+
+    // A different identity wants the slot: it registers a switch claim and
+    // queues on the mutex held by the live peers.
+    const daoP = acquireCredentialSlot(dao, secondaryPool(), { baseDir, homeDir, io, log: () => {} })
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(isSlotSwitchPending(), true)
+
+    // A late same-identity peer must NOT join (that would postpone the switch
+    // forever); it queues behind the pending switch instead.
+    let lateSettled = false
+    const lateP = acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} }).then((l) => {
+      lateLease = l
+      lateSettled = true
+      return l
+    })
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(lateSettled, false, 'the peer queues behind the pending switch')
+
+    // Drain the peers: the switcher finally proceeds.
+    owner.release()
+    joined.release()
+    const switchLease = await Promise.race([
+      daoP,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('switch deadline passed')), 2_000)),
+    ])
+    assert.ok(switchLease)
+    daoLease = switchLease
+    await new Promise((r) => setTimeout(r, 60))
+    assert.equal(lateSettled, false, 'the peer still waits behind the switcher lease')
+
+    switchLease.release()
+    const late = await Promise.race([
+      lateP,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('latecomer deadline passed')), 2_000)),
+    ])
+    assert.ok(late)
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND', 'the peer reinstalls its own identity')
+    late.release()
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:PRIMARY')
+    assert.equal(credentialSlotMutex.pending, 0)
+    assert.equal(isSlotSwitchPending(), false)
+    assert.equal(fastPathRunCount(), 0)
+  } finally {
+    lateLease?.release()
+    daoLease?.release()
+    joined?.release()
+    owner?.release()
+    for (const d of [baseDir, homeDir, accDir, daoDir]) rmSync(d, { recursive: true, force: true })
+  }
+})
+
+test('a peer does not join an installed identity the slot no longer carries', async () => {
+  const baseDir = tmp('agy-sec-stale-')
+  const homeDir = tmp('agy-sec-stale-home-')
+  const accDir = tmp('agy-sec-stale-acc-')
+  const accountFile = join(accDir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token')
+  let owner: SlotLease | undefined
+  let lateLease: SlotLease | undefined
+  try {
+    writePrimaryCredential({ raw: tokenDoc('PRIMARY'), email: 'me@example.com', savedAt: 1 }, baseDir)
+    writeAccountToken(accDir, tokenDoc('SECOND', 'access-second'))
+    const io = memoryIo(tokenDoc('PRIMARY'))
+    const q98 = account('q98', accDir, { email: 'q98@example.com' })
+
+    owner = await acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} })
+    assert.ok(owner)
+
+    // Another DSH host (or any external writer) replaces the slot mid-run.
+    io.writeSlot(tokenDoc('INTRUDER'))
+
+    let lateSettled = false
+    const lateP = acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} }).then((l) => {
+      lateLease = l
+      lateSettled = true
+      return l
+    })
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(lateSettled, false, 'a peer must not join an identity the slot no longer carries')
+
+    // The owner exits: the foreign credential is never copied into the account
+    // file, the primary is restored, and the queued peer reinstalls its own.
+    owner.release()
+    const lease = await Promise.race([
+      lateP,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('latecomer deadline passed')), 2_000)),
+    ])
+    assert.ok(lease)
+    assert.equal(parseCredentialDoc(readFileSync(accountFile, 'utf8'))?.accessToken, 'access-second')
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND', 'the peer reinstalls its own identity')
+    lease.release()
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:PRIMARY')
+    assert.equal(credentialSlotMutex.pending, 0)
+  } finally {
+    lateLease?.release()
+    owner?.release()
+    for (const d of [baseDir, homeDir, accDir]) rmSync(d, { recursive: true, force: true })
+  }
+})
+
+test('a backlog of same-account runs joins the installer instead of serializing', async () => {
+  // The 2026-10-17 shape: several turns were already queued for the slot when
+  // the previous long run ended. The first queued run installs the identity and
+  // the REST must join it while queued — otherwise they still run one whole run
+  // at a time (every step waits for the previous agy process to exit).
+  const baseDir = tmp('agy-backlog-')
+  const homeDir = tmp('agy-backlog-home-')
+  const accDir = tmp('agy-backlog-acc-')
+  const leases: SlotLease[] = []
+  try {
+    writePrimaryCredential({ raw: tokenDoc('PRIMARY'), email: 'me@example.com', savedAt: 1 }, baseDir)
+    writeAccountToken(accDir, tokenDoc('SECOND'))
+    const io = memoryIo(tokenDoc('PRIMARY'))
+    const q98 = account('q98', accDir, { email: 'q98@example.com' })
+
+    const all = await Promise.race([
+      Promise.all([
+        acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} }),
+        acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} }),
+        acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} }),
+      ]),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('backlog did not converge')), 2_000)),
+    ])
+    for (const lease of all) {
+      assert.ok(lease)
+      leases.push(lease)
+    }
+    assert.equal(fastPathRunCount(), 3, 'all three queued runs are live in parallel')
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND', 'one handoff serves the whole backlog')
+
+    leases[0]?.release()
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:SECOND', 'the primary is not restored while peers run')
+    assert.equal(credentialSlotMutex.pending, 1, 'the handoff mutex is still held by the remaining peers')
+
+    leases[1]?.release()
+    leases[2]?.release()
+    assert.equal(credentialFingerprint(io.readSlot()), 'r:PRIMARY', 'the last holder restores the primary')
+    assert.equal(credentialSlotMutex.pending, 0)
+    assert.equal(fastPathRunCount(), 0)
+    assert.equal(isSlotSwitchPending(), false)
+  } finally {
+    for (const lease of leases) lease.release()
+    for (const d of [baseDir, homeDir, accDir]) rmSync(d, { recursive: true, force: true })
+  }
+})
+
 test('parallel: false restores full-run exclusivity (one agy process at a time)', async () => {
   const baseDir = tmp('agy-noparallel-')
   try {
@@ -708,4 +996,53 @@ test('non-Windows platforms do not take the slot mutex', async () => {
   const lease = await acquireCredentialSlot(account('q98', '/tmp/x'), undefined, { io })
   assert.equal(lease, undefined)
   assert.equal(credentialSlotMutex.pending, 0)
+})
+
+test('isProcessAlive accurately detects live process and dead PID', () => {
+  assert.equal(isProcessAlive(process.pid), true, 'current process must be alive')
+  assert.equal(isProcessAlive(0), false, 'pid 0 is not a valid positive pid')
+  assert.equal(isProcessAlive(-1), false, 'negative pid must return false')
+  assert.equal(isProcessAlive(null), false, 'null pid must return false')
+  assert.equal(isProcessAlive(undefined), false, 'undefined pid must return false')
+  // PID 99999999 almost certainly does not exist on this machine
+  assert.equal(isProcessAlive(99999999), false, 'non-existent pid must return false')
+})
+
+test('acquireCrossProcessSlotLock acquires, releases, and instantly recovers from dead holder pid', async () => {
+  const baseDir = tmp('agy-crosslock-')
+  const lockFile = slotLockFilePath(baseDir)
+  try {
+    // 1. Acquire and release normally
+    const release1 = await acquireCrossProcessSlotLock(baseDir, { timeoutMs: 2000 })
+    assert.equal(existsSync(lockFile), true, 'lock file must exist while held')
+    release1()
+    assert.equal(existsSync(lockFile), false, 'lock file must be cleaned up on release')
+
+    // 2. Simulate a stale lock from a dead process (e.g. pid 99999999)
+    mkdirSync(baseDir, { recursive: true })
+    writeFileSync(
+      lockFile,
+      JSON.stringify({ pid: 99999999, acquiredAt: Date.now() - 5000, holder: 'dead-agent' }),
+      'utf8',
+    )
+    assert.equal(existsSync(lockFile), true)
+
+    // 3. New acquire should instantly detect the dead PID and self-heal without timeout
+    let logged = ''
+    const t0 = Date.now()
+    const release2 = await acquireCrossProcessSlotLock(baseDir, {
+      timeoutMs: 3000,
+      log: (msg: string) => { logged += msg },
+    })
+    const elapsed = Date.now() - t0
+    assert.ok(elapsed < 1000, `expected instant recovery under 1s, got ${elapsed}ms`)
+    assert.ok(logged.includes('dead process 99999999'), 'should log dead process removal')
+    assert.equal(existsSync(lockFile), true)
+    const lockContent = JSON.parse(readFileSync(lockFile, 'utf8'))
+    assert.equal(lockContent.pid, process.pid, 'new lock must belong to current process')
+    release2()
+    assert.equal(existsSync(lockFile), false)
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true })
+  }
 })

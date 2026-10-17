@@ -79,7 +79,7 @@ export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
 export const OAUTH_USERINFO_URL = 'https://www.googleapis.com/oauth2/v1/userinfo'
 
 /** Platform-faithful agy User-Agent (hardcoding darwin/arm64 on Windows is a bad fingerprint). */
-export function agyUserAgent(version = '1.1.15'): string {
+export function agyUserAgent(version = '2.24.0'): string {
   const os = process.platform === 'win32' ? 'windows' : process.platform
   const arch = process.arch === 'x64' ? 'amd64' : process.arch
   return `antigravity/${version} ${os}/${arch}`
@@ -621,7 +621,7 @@ export class QuotaService {
         if (res.ok) {
           const summary = (await res.json()) as QuotaSummaryResponse
           // Validate whether the summary contains the primary Gemini models group.
-          // Staging endpoints (like daily-cloudcode-pa) omit Gemini Models and only return 3P.
+          // Older clients or endpoints omitting Gemini models fall through to the next endpoint.
           const hasGemini = summary?.groups?.some((g) => {
             const name = (g.displayName || '').toLowerCase()
             const desc = (g.description || '').toLowerCase()
@@ -720,11 +720,30 @@ export class QuotaService {
     }
 
     let email = account.email
-    // For primary/systemHome account or when email is missing, always detect
-    // the latest email from logs to immediately catch account switching outside DSH.
-    if (account.systemHome || !email) {
+    // On Windows, the primary account rides the durable store (.primary-credential.json)
+    // whose identity is verified directly against Google. That verified identity
+    // wins over stale account labels and never relies on ambiguous log scraping.
+    if ((account.systemHome || !account.dir) && process.platform === 'win32') {
+      const stored = readPrimaryCredential(this.pool.dir)
+      if (stored?.email) {
+        email = stored.email
+      }
+    }
+
+    // Only inspect logs when the email is completely missing. Never adopt a
+    // sibling account's email: log scraping can pick up secondary account runs
+    // that temporarily executed under the same profile.
+    if (!email) {
       const detected = detectEmailFromAgyLogs(home)
-      if (detected) email = detected
+      const siblingEmails = new Set(
+        this.pool
+          .getAccounts()
+          .filter((a) => a.id !== account.id && a.email)
+          .map((a) => a.email!),
+      )
+      if (detected && !siblingEmails.has(detected)) {
+        email = detected
+      }
     }
 
     const accessToken = await this.getValidAccessToken(account)
@@ -741,7 +760,15 @@ export class QuotaService {
     // the zero-network log-scan path below.
     if (force) {
       const info = await this.fetchUserInfo(accessToken, this.proxyFor(account))
-      if (info?.email) email = info.email
+      if (info?.email) {
+        email = info.email
+        if ((account.systemHome || !account.dir) && process.platform === 'win32') {
+          const stored = readPrimaryCredential(this.pool.dir)
+          if (stored && stored.email !== info.email) {
+            writePrimaryCredential({ ...stored, email: info.email, savedAt: Date.now() }, this.pool.dir)
+          }
+        }
+      }
     }
 
     // External re-login: the slot now hosts a DIFFERENT Google account.
@@ -941,7 +968,23 @@ export class QuotaService {
         const flagged = acc.authRequired || Object.values(acc.cooldowns ?? {}).some((cd) => cd && cd.cooldownUntil > now)
         if (!acc.systemHome || !flagged) continue
         const home = acc.systemHome || !acc.dir ? homedir() : acc.dir
-        const detected = detectEmailFromAgyLogs(home)
+        let detected: string | undefined
+        if (process.platform === 'win32') {
+          const stored = readPrimaryCredential(this.pool.dir)
+          if (stored?.email) detected = stored.email
+        }
+        if (!detected) {
+          const fromLogs = detectEmailFromAgyLogs(home)
+          const siblingEmails = new Set(
+            this.pool
+              .getAccounts()
+              .filter((a) => a.id !== acc.id && a.email)
+              .map((a) => a.email!),
+          )
+          if (fromLogs && !siblingEmails.has(fromLogs)) {
+            detected = fromLogs
+          }
+        }
         if (detected && detected !== acc.email) {
           this.pool.resetAccountIdentity(acc.id, detected)
         }

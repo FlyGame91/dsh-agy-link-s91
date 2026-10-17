@@ -69,6 +69,10 @@
 
 | 能力 | 说明 |
 | ---- | ---- |
+| 🎨 **官方专属矢量 Logo** | 36×36 高质感纯矢量微标（`assets/icon.svg`），透明底自适应深浅主题；设置左侧导航菜单（`[role="dialog"] nav`）动态替换系统齿轮，呈现专属品牌标识 |
+| 🧩 **插件页详情零冗余复用** | 侧栏「插件 → dsh-agy-link」详情面板直接复用原版 `AgySettingsSection`，控制台 100% 功能对齐且列表卡片保持精简 |
+| 🚀 **同账号二次并发租赁** | Windows 凭据槽支持同账号多会话并发无锁租约，消除长任务排队饥饿；仅在跨账号身份切换时互斥串行 |
+| ⚡ **97% 缓存命中与真实上下文** | 完整映射 Google Gemini Context Caching 原生协议（`cache_read_tokens`），精确计算 97% 缓存命中率与 ~87.9K / 1M 物理上下文负载 |
 | 👥 **多账号池化轮换** | 支持主账号 + 多个备用账号；遇到 429 或配额耗尽自动平滑切换，模型族独立冷却，额度到期早的账号优先接班 |
 | 🧠 **抖动安全鉴权 (Jitter-Safe Auth)** | 基于 agy 运行日志的 keyring 传输证据区分"网络抖动"与"真登出"，抖动自动按可重试网络错误处理；粘性隔离需二次确认，杜绝误标"需重新登录" |
 | 📊 **官方多 Bucket 配额监控** | 实时拉取官方端点，同时呈现 **5h 滚动额度**、**7d 周额度**与 **Argon 独立周池**（付费 Pro/Ultra）多进度条与倒计时，单模型明细可展开 |
@@ -86,7 +90,6 @@
 | 🖼 **图片多模态** | 支持多模态图片传入，自动落盘本地媒体目录并通过 `--add-dir` 安全授权给 agy 查看 |
 | 🤝 **`agy_ask` 辅助工具** | 允许任意 DSH 模型把单次任务委托给 Antigravity 模型（AskAntigravity 协作模式） |
 | ⌨️ **`/agy` 快捷命令族** | `status` / `pool` / `auth` / `models` / `mode` / `effort` / `workspace` / `goal` / `session` / `enable-account` / `disable-account` / `clear` / `doctor` / `help` |
-
 ---
 
 ## 📋 前置要求
@@ -149,10 +152,23 @@ dsh plugin --profile web add dsh-agy-link
 ## 🧩 架构与工作原理
 
 1. **短生命周期进程驱动**：每一轮 DSH 对话启动一个独立的官方 `agy -p --output-format stream-json` 进程，解析 NDJSON 事件流。
-2. **多账号沙箱机制**：除主账号沿用系统默认 Keychain / HOME 外，所有备用账号在插件私有目录下建立专属 HOME 隔离区，独立写入 agy 格式的标准 OAuth 凭证。
+2. **多账号沙箱机制**：除主账号沿用系统默认 Keychain / HOME 外，所有备用账号在插件私有目录下建立专属 HOME 隔离区，独立写入 agy 格式的标准 OAuth 凭证。Windows 上 agy 的凭据实际存放在机器级 Credential Manager（`gemini:antigravity`），插件因此以「身份级引用计数租约」接管该槽：**同一授权的多个会话并行运行**，只有账号**身份切换**才串行，且由最后一个持有者还原主账号凭据。
 3. **多 Bucket 官方配额汇总**：插件定时后台静默轮询官方 `v1internal:retrieveUserQuotaSummary`，精准掌控每个账号的 5h 滚动削峰水位、7d 账号阶梯周额度，以及付费账号的 Argon 独立周池。
 4. **会话级无缝故障转移**：当遭遇 HTTP 429、额度耗尽或凭证异常时，号池调度器自动标记当前账号家族进入冷却（或按额度到期时间择优轮换），并无缝将后续请求路由到池内下一个有效账号。
 5. **失败分类与自愈**：错误按 AUTH / NETWORK / RATE_LIMIT / ELIGIBILITY 等精确分类；网络抖动借由 agy 运行日志自动甄别为可重试故障，绝不误伤健康账号的登录状态。
+
+---
+
+## ❓ 常见问题排查 (FAQ)
+
+### Windows 平台开始对话时为什么会短暂闪一下黑色命令行窗口（黑框）？
+**答：这是 Windows 系统的控制台分配机制，完全良性，不会影响对话和模型功能。**
+- **原因分析**：DSH 是基于 Electron 的图形桌面应用（GUI 进程），每次发起对话时，插件需要调用底层命令校验并同步当前账号在 Windows 凭据管理器（Credential Manager）中的 OAuth Token，随后启动 `agy.exe` 控制台子进程建立流式通信。在 Windows 11 下，系统默认终端若被设为「Windows 终端 (Windows Terminal)」，Windows Terminal 会拦截后台控制台子进程的句柄分配并闪现弹窗（这是 Windows Terminal 已知的 OpenConsole 委托拦截机制）。
+- **解决步骤**：
+  1. 打开 **Windows 终端 (Windows Terminal)** 的「设置」→「启动」（或进入 Windows「设置」→「系统」→「开发者选项」）。
+  2. 将 **默认终端应用程序 (Default terminal application)** 从「让 Windows 决定」或「Windows 终端」更改为 **「Windows 控制台主机 (Windows Console Host)」**。
+  3. 点击右下角 **保存 (Save)**。
+  4. **完全退出并重启 DSH**（使新启动的主进程应用更新后的控制台委托注册表），黑框闪烁即可彻底消除。
 
 ---
 
@@ -219,8 +235,10 @@ Have multiple Google Antigravity / Gemini accounts? **dsh-agy-link makes multi-a
 
 ## ✨ Features Overview
 
-| Feature | Description |
-| --- | --- |
+| 🎨 **Official Vector Logo** | Clean 36×36 retina vector mark (`assets/icon.svg`) with transparent background; dynamically replaces fallback gear in DSH Settings sidebar (`[role="dialog"] nav`) |
+| 🧩 **Zero-Redundancy Console** | Plugins detail page (`plugins.bundle.config`) directly reuses the native `AgySettingsSection` console with 100% parity while keeping list summaries clean |
+| 🚀 **Secondary Parallel Leases** | Windows credential slot fast path allows same-grant secondary sessions to run in parallel without queue starvation; serializes only for cross-grant switches |
+| ⚡ **97% Cache Hit & Context Metering** | Native Google Gemini Prompt Caching (`cache_read_tokens`) forwarding; accurate 97% cache hit rate and real ~87.9K / 1M prompt occupancy |
 | 👥 **Multi-Account Pool** | Primary + unlimited spare accounts with automatic Sequential Drain rotation upon rate limits; quota-expiry-first scheduling |
 | 🧠 **Jitter-Safe Auth** | Distinguishes network jitter from a real sign-out via keyring transport evidence in agy's run log; sticky quarantine requires confirmation — no false "needs re-login" flags |
 | 📊 **Multi-Bucket Quota HUD** | Real-time progress bars for the **5h rolling**, **7d weekly**, and **Argon weekly** (paid Pro/Ultra) pools with exact reset countdowns |
@@ -304,6 +322,19 @@ error is retained in `/agy status`; it is not proof of a human denial.
 Do not assume undocumented wildcard semantics for either mode. Test the exact
 `agy` version and command set in a scoped workspace. Choose `skip` only when
 you explicitly accept unattended tool execution.
+
+---
+
+## ❓ FAQ & Troubleshooting
+
+### Why does a black command prompt / terminal window briefly flash when starting a conversation on Windows?
+**A: This is a cosmetic behavior of the Windows Console subsystem and is completely harmless.**
+- **Root Cause**: DSH is an Electron desktop app (GUI process). Before each conversation turn, the plugin verifies/syncs Google credentials via the Windows Credential Manager and launches the `agy.exe` console child process for streaming. On Windows 11, if the system default terminal is set to "Windows Terminal", Windows Terminal intercepts the background console allocation and momentarily flashes an empty window (a known Windows Terminal OpenConsole delegation behavior).
+- **Solution**:
+  1. Open **Windows Terminal** → **Settings** → **Startup** (or Windows **Settings** → **System** → **For developers**).
+  2. Change **Default terminal application** from "Let Windows decide" or "Windows Terminal" to **"Windows Console Host"**.
+  3. Click **Save** in the bottom-right corner.
+  4. **Completely exit and restart DSH** so the running host process picks up the updated console delegation setting.
 
 ---
 

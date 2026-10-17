@@ -435,7 +435,7 @@ async function handle(deps: CommandDeps, raw: string, invocation?: CommandInvoca
           `- 硬超时：**${cap}**（重试次数 ${cfg.dispatchRetries}${cfg.dispatchTimeoutMinutes > 0 ? `，总坚持 ≈ ${(1 + cfg.dispatchRetries) * cfg.dispatchTimeoutMinutes} 分钟` : ''}）`,
           '- 同账号并行：**' + (cfg.parallelSameAccount ? '开（快路径，多会话并行跑同一账号）' : '关（同一时刻仅 1 个 agy 进程）') + '**',
           `- 并发上限：**${cfg.maxConcurrent > 0 ? cfg.maxConcurrent + ' 个流' : '不限制（原生并发）'}**`,
-          `- 当前凭据槽位队列：**${mutex.waiting} 个等待者 / ${mutex.pending - mutex.waiting} 个持有者**，同账号快路径活跃 **${fastPathRunCount()}** 个`,
+          `- 当前凭据槽位队列：**${mutex.waiting} 个等待者 / ${mutex.pending - mutex.waiting} 个持有者**，同身份并行活跃 **${fastPathRunCount()}** 个（主账号快路径 + 次级同授权租约）`,
           `- 排队期间：Stop 随时可停；丢失唤醒 5 秒内自愈；每 2 分钟心跳日志`,
           `- 修改：/agy dispatch <分钟|off>　/agy dispatch-retries <次数>　/agy parallel <on|off>`,
         ]

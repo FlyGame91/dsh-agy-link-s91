@@ -680,7 +680,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       }
     }})
     reg({ kind: 'exact', path: '/plugins/agy-link/pool', handler: (_req, res) => {
-      sendJson(res as RawRes, 200, pool.getPoolData())
+      sendJson(res as RawRes, 200, pool.getPoolData(getConfig().proxyUrl.trim() || undefined))
     }})
     reg({ kind: 'exact', path: '/plugins/agy-link/pool/begin-add', handler: (req, res) => {
       void (async () => {

@@ -14,6 +14,7 @@ import {
   type ModelFamily,
 } from '../common/pool-types.ts'
 import { parseResetDurationMs } from '../common/types.ts'
+import { detectSystemProxy } from './wincred.ts'
 
 /**
  * Proactive rotation thresholds: an account at or below these remaining
@@ -192,12 +193,14 @@ export class AccountPoolManager {
     const hasSystemHome = this.data.accounts.some((a) => a.systemHome)
     if (hasSystemHome) return
 
+    const sysProxy = detectSystemProxy()
     const primary: ManagedAccount = {
       id: 'acc_primary',
       alias: 'Primary account (system sign-in)',
       defaultAlias: true,
       dir: '',
       systemHome: true,
+      ...(sysProxy ? { proxyUrl: sysProxy } : {}),
       enabled: true,
       createdAt: Date.now(),
       cooldowns: {},
@@ -216,22 +219,44 @@ export class AccountPoolManager {
    * The stale directory is left untouched (never deletes user data).
    */
   private normalizeLegacyPrimary(): void {
-    const primary = this.data.accounts.find((a) => a.id === 'acc_primary')
+    const primary = this.data.accounts.find((a) => a.id === 'acc_primary' || a.systemHome)
     if (!primary) return
+    let changed = false
     // Locale changes must not rewrite existing account data.
-    if (primary.systemHome) return
-    primary.dir = ''
-    primary.systemHome = true
-    primary.alias = 'Primary account (system sign-in)'
-    primary.defaultAlias = true
-    this.data.primaryAccountId = primary.id
-    this.persist()
+    if (!primary.systemHome || primary.dir) {
+      primary.dir = ''
+      primary.systemHome = true
+      primary.alias = 'Primary account (system sign-in)'
+      primary.defaultAlias = true
+      this.data.primaryAccountId = primary.id
+      changed = true
+    }
+    // On Windows, self-heal primary email from durable .primary-credential.json if present
+    if (process.platform === 'win32') {
+      try {
+        const credFile = join(this.baseDir, '.primary-credential.json')
+        if (existsSync(credFile)) {
+          const parsed = JSON.parse(readFileSync(credFile, 'utf8')) as { email?: string }
+          if (parsed && typeof parsed.email === 'string' && parsed.email && primary.email !== parsed.email) {
+            primary.email = parsed.email
+            changed = true
+          }
+        }
+      } catch {
+        // best-effort
+      }
+    }
+    if (changed) {
+      this.persist()
+    }
   }
 
-  getPoolData(): Readonly<AccountPoolData> {
+  getPoolData(defaultProxy?: string): Readonly<AccountPoolData> {
+    const sysProxy = defaultProxy || detectSystemProxy()
     return {
       ...this.data,
       activeAccountId: this.getActiveAccountId('google'),
+      ...(sysProxy ? { systemProxy: sysProxy } : {}),
     }
   }
 

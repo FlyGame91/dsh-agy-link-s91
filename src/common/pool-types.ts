@@ -177,6 +177,8 @@ export interface AccountPoolData {
   lastActiveAccountId?: string
   /** Authoritative currently active account ID computed by the pool scheduler */
   activeAccountId?: string
+  /** Detected system-wide or plugin-configured default proxy URL */
+  systemProxy?: string
   accounts: ManagedAccount[]
 }
 

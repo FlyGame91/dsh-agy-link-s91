@@ -37,6 +37,7 @@ export function usageFromRaw(raw: RawUsage): TokenUsage {
   if (raw.cache_read_tokens !== undefined) usage.cacheReadTokens = raw.cache_read_tokens
   if (raw.cache_write_tokens !== undefined) usage.cacheWriteTokens = raw.cache_write_tokens
   if (raw.thinking_tokens !== undefined) usage.reasoningTokens = raw.thinking_tokens
+  if (raw.total_tokens !== undefined) usage.totalTokens = raw.total_tokens
   return usage
 }
 

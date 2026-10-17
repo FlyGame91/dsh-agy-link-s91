@@ -410,16 +410,23 @@ export function isAccountScopedFailure(code: string | undefined): boolean {
 }
 
 /**
+ * Capacity exhaustion / server-side pressure signals (model overloaded / 503 / 529 / high traffic).
+ * Distinct from account-level quota exhaustion (429): Google's backend capacity is shared across
+ * accounts, so rotating accounts on a server capacity refusal burns every healthy account's turn
+ * for nothing. The scheduler should STAY on the current account with backoff retry rather than rotating.
+ */
+export function looksLikeCapacityExhaustion(text?: string): boolean {
+  if (!text) return false
+  return /model (?:is )?overloaded|experiencing high traffic|is overloaded|capacity (?:exhausted|unavailable)|temporarily (?:overloaded|unavailable)|server (?:is )?busy|overloaded and unable to|503\s+Service\s+Unavailable|529\s+Overloaded/i.test(text)
+}
+
+/**
  * Soft heuristic adds capacity signals (model overloaded / high traffic).
  * Shapes the user-facing error message only — NEVER cools an account down.
- * The adapter still ROTATES on these: nothing was spent locally, and ending a
- * turn while an idle account could serve it is the interruption users report.
  */
 export function looksLikeRateLimit(text?: string): boolean {
   if (!text) return false
-  return (
-    looksLikeHardRateLimit(text) || /model overloaded|experiencing high traffic|is overloaded|capacity (?:exhausted|unavailable)|temporarily overloaded/i.test(text)
-  )
+  return looksLikeHardRateLimit(text) || looksLikeCapacityExhaustion(text)
 }
 
 /**
