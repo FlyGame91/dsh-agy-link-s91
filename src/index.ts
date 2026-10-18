@@ -195,7 +195,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       return { stdout: out.stdout, stderr: out.stderrTail }
     },
     getConfig().fallbackModels,
-    300_000,
+    getConfig().modelsCacheTtlMs,
     notifyPicker,
   )
   const auth = new AuthHelper(bin)
@@ -203,6 +203,12 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const runs = new RunRegistry()
 
   // Boot hygiene: remove staging dirs and purge old historical logs
+  try {
+    const validAccIds = new Set(pool.getAccounts().map((a) => a.id))
+    store.cleanupStaleAccounts(validAccIds)
+  } catch {
+    // best-effort hygiene
+  }
   const swept = pool.sweepStaleStaging()
   if (swept > 0) log('swept ' + swept + ' stale staging dir(s)')
   const logsSwept = pool.sweepOldLogs(getConfig().logRetentionDays)
@@ -985,7 +991,6 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     if (!getConfig().enabled) return () => undefined
     const refresh = (): void => {
       void quota.refreshAllQuotas().catch(() => undefined)
-      void catalog.refreshIfNeeded().catch(() => undefined)
     }
     const boot = setTimeout(refresh, 5_000)
     boot.unref?.()

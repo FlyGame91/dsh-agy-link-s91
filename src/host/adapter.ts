@@ -903,6 +903,8 @@ export class AgyAdapter extends LlmAdapter {
           if (boundAcc) {
             mostRecentAccount = boundAcc
             latestUpdated = b.updatedAt
+          } else {
+            this.deps.store.delete(k)
           }
         }
       }

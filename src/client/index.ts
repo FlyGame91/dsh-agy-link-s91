@@ -627,8 +627,11 @@ function renderFamilyQuotaBar(
 	const c5h = getColors(pct5h);
 	const cWeekly = getColors(pctWeekly);
 
-	const renderLine = (windowName: string, percent: number, c: { bar: string; text: string; bg: string; border: string }, resetStr: string) => {
+	const renderLine = (windowName: string, percent: number, c: { bar: string; text: string; bg: string; border: string }, resetStr: string, rawFraction?: number, rawReset?: string) => {
 		const isShimmer = percent < 0 || isRefreshing;
+		const tooltipText = typeof rawFraction === 'number'
+			? `${(rawFraction * 100).toFixed(1)}% (raw: ${rawFraction})${rawReset ? ` · reset: ${rawReset}` : ''}`
+			: resetStr ? `↻ ${resetStr}` : undefined;
 		return h('div', { style: { display: 'flex', alignItems: 'center', fontSize: '11.5px', margin: '4px 0' } },
 			h('span', { style: { width: '52px', color: 'var(--agy-text-window-label)', fontSize: '11px', fontWeight: 700, flexShrink: 0 } }, windowName),
 			h('div', {
@@ -647,6 +650,7 @@ function renderFamilyQuotaBar(
 			),
 			h('div', { style: { display: 'inline-flex', alignItems: 'center', gap: '8px', minWidth: '140px', justifyContent: 'flex-end', flexShrink: 0 } },
 				h('span', {
+					title: tooltipText,
 					style: {
 						padding: '2px 7px',
 						borderRadius: '4px',
@@ -656,6 +660,7 @@ function renderFamilyQuotaBar(
 						fontWeight: 700,
 						fontSize: '11.5px',
 						lineHeight: 1.2,
+						cursor: tooltipText ? 'help' : 'default',
 					},
 				}, percent < 0 ? '—' : `${percent}%`),
 				resetStr ? h('span', { style: { color: 'var(--agy-text-secondary)', fontSize: '11px', fontWeight: 500 } }, `↻ ${resetStr}`) : null,
@@ -670,8 +675,8 @@ function renderFamilyQuotaBar(
 		),
 		// Argon is a WEEKLY-only counter today: render the 5h row only when
 		// the backend actually reports one, never as a permanent "—" ghost.
-		(familyKey !== 'argon' || has5h) ? renderLine(t('quota.fiveHour'), pct5h, c5h, w5h.resetText ? w5h.resetText + cdNote : expiredFull5h ? t('quota.windowReset') + cdNote : cdNote.replace(/^ · /, '')) : null,
-		renderLine(t('quota.weekly'), pctWeekly, cWeekly, wWeekly.resetText ? wWeekly.resetText : expiredFullWeekly ? t('quota.windowReset') : ''),
+		(familyKey !== 'argon' || has5h) ? renderLine(t('quota.fiveHour'), pct5h, c5h, w5h.resetText ? w5h.resetText + cdNote : expiredFull5h ? t('quota.windowReset') + cdNote : cdNote.replace(/^ · /, ''), info?.remainingFraction, info?.resetTime) : null,
+		renderLine(t('quota.weekly'), pctWeekly, cWeekly, wWeekly.resetText ? wWeekly.resetText : expiredFullWeekly ? t('quota.windowReset') : '', info?.weeklyFraction, info?.weeklyResetTime),
 	);
 }
 

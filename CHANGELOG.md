@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.65 (2026-10-19)
+
+### English
+
+- **Fix: Paid Pro Argon Quota Pool Recognition & Metric Display (Fixes #46).**
+  - Added support for top-level `summary.buckets` parsing and model-level quota metrics via `/v1internal:retrieveUserQuota`.
+  - Automatically backfills `weeklyFraction` and `weeklyResetTime` when Argon models are detected in model catalog, resolving empty quota pills and dashes in `/agy pool`.
+  - Updated `/agy pool` display formatting to seamlessly fallback to `remainingFraction` when `weeklyFraction` is unset.
+- **Fix: Eliminate 15-Minute Flashing Black Terminal Window on Windows (Fixes #47).**
+  - Removed redundant `catalog.refreshIfNeeded()` background spawn from the 15-minute periodic watchdog timer, ensuring background heartbeats strictly execute HTTPS network queries without launching `agy` CLI sub-processes.
+  - Models now refresh cleanly on startup and on-demand upon model picker access.
+  - Fixed `ModelCatalog` cache TTL initialization to accurately honor `getConfig().modelsCacheTtlMs`.
+- **Fix: Quota Parity with `agy` CLI, Stale 5h Bucket Detection & Session Cleanup (Fixes #48).**
+  - Integrated official `/v1internal:retrieveUserQuota` model-level quota metrics into `refreshAccountQuota`, matching the exact figures reported by the `agy` CLI.
+  - Added `isStale5hBucket` heuristic to detect unmetered production endpoint placeholders (`remainingFraction === 1.0` with `resetTime ≈ now + 5h`) and overwrite them with active window model-level quota data.
+  - Fixed endpoint fallback behavior in `fetchQuotaSummary` so `preferredEndpointIndex` is not locked to the production endpoint when endpoint 0 (`daily-cloudcode-pa.googleapis.com`) responds normally with partial groups.
+  - Added unrounded quota percentage preview in frontend pill tooltips (`title="... (raw: 0.9711094)"`) for precise verification against raw API responses.
+  - Added automatic cleanup of stale account bindings in `sessions.json` upon engine startup and session selection.
+
+### 中文
+
+- **修复：付费 Pro 账号 Argon 额度池识别与展示（修复 #46）。**
+  - 增强额度解析，支持后端顶层 `summary.buckets` 以及通过 `/v1internal:retrieveUserQuota` 获取模型级别额度数据。
+  - 模型探测阶段发现 Argon 模型时自动补充 `weeklyFraction` 与 `weeklyResetTime`，彻底解决客户端胶囊与 `/agy pool` 中显示空白破折号（`—`）的问题。
+  - `/agy pool` 命令兼容展示 `weeklyFraction ?? remainingFraction`。
+- **修复：彻底解决 Windows 环境下每 15 分钟闪烁黑终端窗口问题（修复 #47）。**
+  - 从 15 分钟周期的后台刷新任务中移除了 `catalog.refreshIfNeeded()` 调用，使后台心跳严格保持在无外部进程的纯 HTTPS 网络请求，杜绝 Windows 终端弹窗。
+  - 模型目录在启动和模型选择器打开时按需刷新，并修复了 `ModelCatalog` 构造时硬编码 TTL 的问题（接入 `getConfig().modelsCacheTtlMs`）。
+- **修复：面板额度与 agy CLI 保持严格一致、识别 5h 虚假占位符并清理残留失效账号（修复 #48）。**
+  - 对接官方 agy CLI 相同的 `/v1internal:retrieveUserQuota` 接口，将模型级实际 WTUS 额度纳入账户额度刷新体系。
+  - 实现 `isStale5hBucket` 智能检测机制，识别生产域未记账的 5 小时虚假占位符（`remainingFraction === 1.0` 且 `resetTime ≈ now + 5h`），并由真实生效窗口数据覆盖替换。
+  - 修复 `fetchQuotaSummary` 端点降级逻辑，在 daily 域仅返回部分组别时进行多组结果合并，不再将全局端点锁死到不记账的生产域。
+  - 客户端胶囊悬浮气泡增加原始未舍入比例（例如 `97.1% (raw: 0.9711094)`）与 ISO 重置时间，方便与 agy 命令行及 API 返回对比。
+  - 启动及选择账号时自动清理 `sessions.json` 中已不存在的失效废弃账号引用。
+
 ## 0.4.64 (2026-10-18)
 
 ### English

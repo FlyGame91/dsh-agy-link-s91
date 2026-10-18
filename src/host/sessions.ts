@@ -82,6 +82,29 @@ export class SessionStore {
   }
 
   /**
+   * Purge bindings associated with accounts that no longer exist in the pool.
+   * Prevents deleted account ids from lingering in sessions.json.
+   */
+  cleanupStaleAccounts(validAccountIds: Set<string>): void {
+    let changed = false;
+    for (const key of Object.keys(this.data)) {
+      const colon = key.indexOf(':');
+      if (colon >= 0) {
+        const accId = key.slice(colon + 1);
+        if (accId && !validAccountIds.has(accId)) {
+          delete this.data[key];
+          this.dirty.delete(key);
+          this.removed.add(key);
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      this.persist();
+    }
+  }
+
+  /**
    * Atomic write: tmp file + rename, MERGING with whatever another host
    * process wrote in the meantime (web + headless share this file). Only the
    * keys this process touched are overwritten and only the keys it deleted are

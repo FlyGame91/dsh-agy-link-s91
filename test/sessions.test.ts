@@ -57,3 +57,25 @@ test('a concurrent writer does not lose the other host bindings (dirty-key merge
   assert.equal(new SessionStore(mergeFile).get('session-a'), undefined)
   assert.equal(new SessionStore(mergeFile).get('session-b')?.conversationId, 'cb')
 })
+
+test('cleanupStaleAccounts removes deleted account IDs from sessions.json', () => {
+  const cleanupFile = join(dir, 'cleanup.json')
+  rmSync(cleanupFile, { force: true })
+  const store = new SessionStore(cleanupFile)
+  store.set('sess1:acc_valid', { conversationId: 'c1', lastMessageCount: 1, updatedAt: 100 })
+  store.set('sess1:acc_deleted', { conversationId: 'c2', lastMessageCount: 2, updatedAt: 200 })
+  store.set('sess2:acc_deleted', { conversationId: 'c3', lastMessageCount: 3, updatedAt: 300 })
+  store.set('sess2:acc_valid', { conversationId: 'c4', lastMessageCount: 4, updatedAt: 400 })
+
+  store.cleanupStaleAccounts(new Set(['acc_valid']))
+
+  assert.ok(store.get('sess1:acc_valid'))
+  assert.ok(store.get('sess2:acc_valid'))
+  assert.equal(store.get('sess1:acc_deleted'), undefined)
+  assert.equal(store.get('sess2:acc_deleted'), undefined)
+
+  // Verify on disk persistence
+  const reloaded = new SessionStore(cleanupFile)
+  assert.ok(reloaded.get('sess1:acc_valid'))
+  assert.equal(reloaded.get('sess1:acc_deleted'), undefined)
+})

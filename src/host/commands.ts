@@ -98,9 +98,9 @@ async function handle(deps: CommandDeps, raw: string, invocation?: CommandInvoca
         // Gemini 4 Argon (Pro/Ultra only): a weekly-only counter. Append the
         // column ONLY when the backend reported one — accounts without the
         // argon permission keep the classic three-family line.
-        const qA = a.quotas.argon?.weeklyFraction
+        const qA = a.quotas.argon?.weeklyFraction ?? a.quotas.argon?.remainingFraction
         const quotaLine = `   - Quota: Gemini ${qG} | Claude ${qC} | GPT-OSS ${qO}` +
-          (qA !== undefined ? ` | Argon ${Math.round(qA * 100)}% (weekly)` : '')
+          (qA !== undefined ? ` | Argon ${Math.round(qA * 100)}%` : '')
         const cds: string[] = []
         for (const [fam, cd] of Object.entries(a.cooldowns)) {
           if (cd && cd.cooldownUntil > Date.now()) {

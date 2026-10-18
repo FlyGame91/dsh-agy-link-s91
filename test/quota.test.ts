@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
-import { QuotaService, detectEmailFromAgyLogs, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
+import { QuotaService, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
@@ -850,6 +850,194 @@ test('normalizeLegacyPrimary self-heals primary account email from .primary-cred
   if (process.platform === 'win32') {
     assert.equal(primary.email, 'g98@example.com', 'primary email self-heals from durable store on Windows')
   }
+})
+
+test('isStale5hBucket correctly identifies unmetered placeholder 5h buckets', () => {
+  const now = Date.now()
+  // Exactly 5h away and remainingFraction = 1.0 -> stale placeholder
+  assert.equal(isStale5hBucket(1.0, new Date(now + 5 * 3600_000).toISOString(), now), true)
+  assert.equal(isStale5hBucket(1.0, new Date(now + 4.9 * 3600_000).toISOString(), now), true)
+  // Active window in progress (e.g. 2h remaining or 30 mins) -> NOT stale
+  assert.equal(isStale5hBucket(1.0, new Date(now + 2 * 3600_000).toISOString(), now), false)
+  // Partially consumed fraction (< 1.0) -> NOT stale (it is actively billing)
+  assert.equal(isStale5hBucket(0.97, new Date(now + 5 * 3600_000).toISOString(), now), false)
+  // Missing reset time or fraction -> NOT stale
+  assert.equal(isStale5hBucket(undefined, new Date(now + 5 * 3600_000).toISOString(), now), false)
+  assert.equal(isStale5hBucket(1.0, undefined, now), false)
+})
+
+test('stale 5h summary placeholder with 100% and now+5h is replaced by live model quota (#48)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-stale5h-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('stale5h-user')
+
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.stale5h', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  const now = Date.now()
+  const stale5hReset = new Date(now + 5 * 3600_000).toISOString()
+  const liveActiveReset = '2026-10-18T21:14:37Z'
+
+  class StaleService extends QuotaService {
+    override async fetchUserInfo() {
+      return { email: 'stale@example.com' }
+    }
+    override async fetchQuotaSummary() {
+      return {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            buckets: [
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1.0, resetTime: stale5hReset },
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.92, resetTime: '2026-10-24T11:11:37Z' },
+            ],
+          },
+        ],
+      } as never
+    }
+    override async fetchAvailableModels() {
+      return {
+        models: {
+          'gemini-2.5-flash': {
+            displayName: 'Gemini 2.5 Flash',
+            quotaInfo: {
+              remainingFraction: 0.9711094,
+              resetTime: liveActiveReset,
+            },
+          },
+        },
+      } as never
+    }
+  }
+
+  const svc = new StaleService(pool)
+  const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+  assert.ok(quotas)
+  // Stale 1.0 / now+5h was replaced by live model fraction (0.9711094) and live reset time!
+  assert.equal(quotas.google?.remainingFraction, 0.9711094)
+  assert.equal(quotas.google?.resetTime, liveActiveReset)
+  assert.equal(quotas.google?.weeklyFraction, 0.92)
+  assert.equal(quotas.google?.weeklyResetTime, '2026-10-24T11:11:37Z')
+})
+
+test('fetchUserQuota integrates /v1internal:retrieveUserQuota per-model buckets (#48)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-retrieve-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('retrieve-user')
+
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.retrieve', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  const now = Date.now()
+  const stale5hReset = new Date(now + 5 * 3600_000).toISOString()
+  const activeReset = '2026-10-18T21:14:37Z'
+
+  class RetrieveService extends QuotaService {
+    override async fetchUserInfo() {
+      return { email: 'ret@example.com' }
+    }
+    override async fetchQuotaSummary() {
+      return {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            buckets: [
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1.0, resetTime: stale5hReset },
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.92, resetTime: '2026-10-24T11:11:37Z' },
+            ],
+          },
+        ],
+      } as never
+    }
+    override async fetchAvailableModels() {
+      // Empty model catalog from models endpoint
+      return { models: {} } as never
+    }
+    override async fetchUserQuota() {
+      // retrieveUserQuota returns the 12 gemini buckets
+      return {
+        buckets: [
+          {
+            modelId: 'gemini-2.5-flash',
+            tokenType: 'WTUS',
+            remainingFraction: 0.9711094,
+            resetTime: activeReset,
+          },
+        ],
+      }
+    }
+  }
+
+  const svc = new RetrieveService(pool)
+  const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+  assert.ok(quotas)
+  assert.equal(quotas.google?.remainingFraction, 0.9711094)
+  assert.equal(quotas.google?.resetTime, activeReset)
+  assert.equal(quotas.google?.models?.length, 1)
+  assert.equal(quotas.google?.models?.[0]?.modelId, 'gemini-2.5-flash')
+})
+
+test('Argon model quota populates weeklyFraction when summary has no weekly argon group (#46)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-argonmodel-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('argon-model-user')
+
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.argonmodel', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  class ArgonModelService extends QuotaService {
+    override async fetchUserInfo() {
+      return { email: 'argonmodel@example.com' }
+    }
+    override async fetchQuotaSummary() {
+      // Only plain Gemini in summary; Argon is missing from summary
+      return {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            buckets: [
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.9, resetTime: '2026-10-20T12:00:00Z' },
+            ],
+          },
+        ],
+      } as never
+    }
+    override async fetchAvailableModels() {
+      return {
+        models: {
+          'gemini-4-argon': {
+            displayName: 'Gemini 4 Argon',
+            quotaInfo: {
+              remainingFraction: 0.85,
+              resetTime: '2026-10-25T12:00:00Z',
+            },
+          },
+        },
+      } as never
+    }
+  }
+
+  const svc = new ArgonModelService(pool)
+  const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+  assert.ok(quotas)
+  assert.ok(quotas.argon, 'argon family should be discovered from models')
+  assert.equal(quotas.argon?.weeklyFraction, 0.85, 'Argon weeklyFraction should be populated from model quota')
+  assert.equal(quotas.argon?.weeklyResetTime, '2026-10-25T12:00:00Z')
 })
 
 

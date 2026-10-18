@@ -167,6 +167,7 @@ interface QuotaSummaryBucket {
   resetTime?: string
   description?: string
   remainingFraction?: number
+  remainingAmount?: number
 }
 
 interface QuotaSummaryGroup {
@@ -177,7 +178,32 @@ interface QuotaSummaryGroup {
 
 interface QuotaSummaryResponse {
   groups?: QuotaSummaryGroup[]
+  buckets?: QuotaSummaryBucket[]
   description?: string
+}
+
+export interface UserQuotaBucket {
+  modelId?: string
+  tokenType?: string
+  remainingFraction?: number
+  remainingAmount?: number
+  resetTime?: string
+}
+
+export interface UserQuotaResponse {
+  buckets?: UserQuotaBucket[]
+}
+
+/**
+ * Detects whether a 5-hour quota bucket from retrieveUserQuotaSummary is an
+ * unmetered placeholder (remainingFraction = 1.0 and resetTime = now + ~5h).
+ * In unmetered environments (e.g. Cloud Code PA prod for free tier), the window
+ * never starts billing and stays frozen at 100% forever.
+ */
+export function isStale5hBucket(remainingFraction?: number, resetTime?: string, now = Date.now()): boolean {
+  if (remainingFraction !== 1 || !resetTime) return false
+  const resetMs = Date.parse(resetTime) - now
+  return resetMs > 4.5 * 3600_000 && resetMs < 5.2 * 3600_000
 }
 
 /**
@@ -628,7 +654,21 @@ export class QuotaService {
             return name.includes('gemini') || desc.includes('gemini')
           })
           if (hasGemini) {
-            this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
+            if (partialSummary && Array.isArray(partialSummary.groups)) {
+              // Merge groups: keep 3P groups from daily endpoint, add Gemini models from fallback
+              const existingNames = new Set(partialSummary.groups.map((g) => (g.displayName || '').toLowerCase()))
+              for (const g of summary.groups || []) {
+                const name = (g.displayName || '').toLowerCase()
+                if (!existingNames.has(name)) {
+                  partialSummary.groups.push(g)
+                  existingNames.add(name)
+                }
+              }
+              return partialSummary
+            }
+            if (i > 0 && !partialSummary) {
+              this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
+            }
             return summary
           }
           if (!partialSummary && summary && Array.isArray(summary.groups) && summary.groups.length > 0) {
@@ -644,6 +684,40 @@ export class QuotaService {
       }
     }
     return partialSummary
+  }
+
+  protected async fetchUserQuotaEndpoint(endpoint: string, accessToken: string, proxyUrl?: string): Promise<Response> {
+    return agyFetch(`${endpoint}/v1internal:retrieveUserQuota`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': agyUserAgent(),
+      },
+      body: JSON.stringify({}),
+    }, proxyUrl)
+  }
+
+  /**
+   * Fetch per-model live user quota via v1internal:retrieveUserQuota.
+   */
+  async fetchUserQuota(accessToken: string, proxyUrl?: string): Promise<UserQuotaResponse | null> {
+    const endpoints = this.getOrderedEndpoints()
+    for (let i = 0; i < endpoints.length; i++) {
+      const endpoint = endpoints[i]!
+      try {
+        const res = await this.fetchUserQuotaEndpoint(endpoint, accessToken, proxyUrl)
+        if (res.ok) {
+          return (await res.json()) as UserQuotaResponse
+        }
+        if (res.status === 401 || res.status === 403) {
+          break
+        }
+      } catch {
+        // Try next endpoint
+      }
+    }
+    return null
   }
 
   /**
@@ -802,9 +876,10 @@ export class QuotaService {
       this.pool.resetAccountIdentity(account.id, email)
     }
 
-    const [summary, discovered] = await Promise.all([
+    const [summary, discovered, userQuota] = await Promise.all([
       this.fetchQuotaSummary(accessToken, this.proxyFor(account)),
       this.fetchAvailableModels(accessToken, this.proxyFor(account)),
+      this.fetchUserQuota(accessToken, this.proxyFor(account)).catch(() => null),
     ])
 
     // Query the userinfo endpoint ONLY when the email is still unknown.
@@ -816,7 +891,29 @@ export class QuotaService {
       if (info?.email) email = info.email
     }
 
-    if (!summary && (!discovered || !discovered.models)) {
+    const modelsCatalog: Record<string, DiscoveredModelEntry> = {
+      ...(discovered?.models || {}),
+    }
+    if (userQuota && Array.isArray(userQuota.buckets)) {
+      for (const b of userQuota.buckets) {
+        if (!b.modelId) continue
+        const frac = typeof b.remainingFraction === 'number' && Number.isFinite(b.remainingFraction)
+          ? Math.min(1, Math.max(0, b.remainingFraction))
+          : undefined
+        if (frac !== undefined) {
+          const existing = modelsCatalog[b.modelId]
+          modelsCatalog[b.modelId] = {
+            ...existing,
+            quotaInfo: {
+              remainingFraction: frac,
+              resetTime: b.resetTime || existing?.quotaInfo?.resetTime,
+            },
+          }
+        }
+      }
+    }
+
+    if (!summary && Object.keys(modelsCatalog).length === 0) {
       return null
     }
 
@@ -828,10 +925,22 @@ export class QuotaService {
     }
 
     const familyQuotas: Partial<Record<ModelFamily, FamilyQuotaInfo>> = {}
+    const stale5hFamilies = new Set<ModelFamily>()
 
     // 1. Ingest official weekly & 5h limits from retrieveUserQuotaSummary
-    if (summary && Array.isArray(summary.groups)) {
-      for (const group of summary.groups) {
+    const summaryGroups: QuotaSummaryGroup[] = []
+    if (summary) {
+      if (Array.isArray(summary.groups)) summaryGroups.push(...summary.groups)
+      if (Array.isArray(summary.buckets) && summary.buckets.length > 0) {
+        summaryGroups.push({
+          displayName: summary.description || 'Quota',
+          buckets: summary.buckets,
+        })
+      }
+    }
+
+    if (summaryGroups.length > 0) {
+      for (const group of summaryGroups) {
         const dName = (group.displayName || '').toLowerCase()
         const desc = (group.description || '').toLowerCase()
         // Gemini 4 Argon (Pro/Ultra-only) ships as its OWN quota group with a
@@ -874,6 +983,9 @@ export class QuotaService {
         }
 
         for (const fam of targetFamilies) {
+          if (isStale5hBucket(fiveHourFrac, fiveHourReset, now)) {
+            stale5hFamilies.add(fam)
+          }
           familyQuotas[fam] = {
             remainingFraction: fiveHourFrac,
             resetTime: fiveHourReset,
@@ -886,10 +998,10 @@ export class QuotaService {
       }
     }
 
-    // 2. Ingest detailed model list from fetchAvailableModels
+    // 2. Ingest detailed model list from fetchAvailableModels / retrieveUserQuota
     const familyModels: Partial<Record<ModelFamily, ModelQuotaInfo[]>> = {}
-    if (discovered && discovered.models) {
-      for (const [modelId, entry] of Object.entries(discovered.models)) {
+    if (Object.keys(modelsCatalog).length > 0) {
+      for (const [modelId, entry] of Object.entries(modelsCatalog)) {
         const fam = modelFamilyOf(modelId)
         if (fam === 'unknown') continue
         const rawRemaining = entry.quotaInfo?.remainingFraction
@@ -910,6 +1022,7 @@ export class QuotaService {
           resetTime,
         })
 
+        const isStale = stale5hFamilies.has(fam)
         // Fallback for family fraction if summary was unavailable.
         if (!familyQuotas[fam]) {
           familyQuotas[fam] = mergeFallbackFamilyQuota(account.quotas[fam], {
@@ -917,21 +1030,25 @@ export class QuotaService {
             resetTime,
             updatedAt: now,
           })
+          if (fam === 'argon' && familyQuotas[fam]!.weeklyFraction === undefined) {
+            familyQuotas[fam]!.weeklyFraction = remaining
+            familyQuotas[fam]!.weeklyResetTime = resetTime
+          }
         } else {
           // The binding constraint is the LOWEST reported remaining across all
-          // sources, full stop. The previous is5hWindow gate (only merge
-          // per-model rows whose reset lands within 6h) mislabeled the real
-          // signal: when the 5h bucket is exhausted, Google reports the NEXT
-          // reset as the weekly boundary (14+ hours out) — the gate then
-          // skipped the merge and the UI showed the coarse summary's
-          // meaningless "100%, resets in now+5h" placeholder while the account
-          // was actually down to 4% (observed live, 2026-10-17 00:37).
-          // A lower remaining is by definition more consumed — tighten to it
-          // and adopt its reset; the weekly row stays visible separately.
+          // sources, full stop. A lower remaining is by definition more consumed —
+          // tighten to it and adopt its reset. If the coarse summary returned an
+          // unmetered 5h placeholder (stale 100% with now+5h), the live model
+          // window overrides it so the UI displays authentic numbers.
           const curRemaining = familyQuotas[fam]!.remainingFraction ?? 1
-          if (remaining < curRemaining) {
+          if (remaining < curRemaining || isStale) {
             familyQuotas[fam]!.remainingFraction = remaining
             familyQuotas[fam]!.resetTime = resetTime
+            stale5hFamilies.delete(fam)
+          }
+          if (fam === 'argon' && familyQuotas[fam]!.weeklyFraction === undefined) {
+            familyQuotas[fam]!.weeklyFraction = remaining
+            familyQuotas[fam]!.weeklyResetTime = resetTime
           }
         }
       }
