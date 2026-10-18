@@ -38,6 +38,7 @@
 //     detected and refused, so it can never silently spend the primary's quota.
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { EventEmitter } from 'node:events'
 import type { ManagedAccount } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { defaultPoolDir } from './pool.ts'
@@ -746,6 +747,10 @@ interface InstalledIdentity {
 /** The secondary identity currently installed in the slot, if any. */
 let installedIdentity: InstalledIdentity | null = null
 
+/** Event bus to immediately wake queued same-identity runs when an identity is installed. */
+const slotEvents = new EventEmitter()
+slotEvents.setMaxListeners(500)
+
 /**
  * Identities that waiting runs want installed, keyed by grant fingerprint
  * (`'primary'` for the system account). Same-identity peers may still join
@@ -922,6 +927,18 @@ export async function acquireCredentialSlot(
     ? AbortSignal.any([options.signal, joinAbort.signal])
     : joinAbort.signal
   let joinLease: SlotLease | null = null
+
+  const onSlotInstalled = (fp: string) => {
+    if ((fp === switchKey || fp === 'any') && joinLease === null) {
+      const lease = joinInstalled()
+      if (lease !== null) {
+        joinLease = lease
+        joinAbort.abort()
+      }
+    }
+  }
+  slotEvents.on('installed', onSlotInstalled)
+
   const joinPoll = setInterval(() => {
     if (joinLease !== null) return
     const lease = joinInstalled()
@@ -943,6 +960,7 @@ export async function acquireCredentialSlot(
     })
   } catch (err) {
     clearInterval(joinPoll)
+    slotEvents.off('installed', onSlotInstalled)
     if (joinLease !== null) {
       const lease = joinLease
       releaseClaim()
@@ -953,6 +971,7 @@ export async function acquireCredentialSlot(
     throw err
   }
   clearInterval(joinPoll)
+  slotEvents.off('installed', onSlotInstalled)
   if (joinLease !== null) {
     // Both paths won in the same tick: keep the join, hand the mutex back.
     const lease = joinLease
@@ -980,15 +999,20 @@ export async function acquireCredentialSlot(
     }
   }
 
+  const releaseLockFileNow = (): void => {
+    try {
+      releaseFileLock?.()
+      releaseFileLock = null
+    } catch {
+      // best-effort cleanup
+    }
+  }
+
   let released = false
   const done = (): void => {
     if (released) return
     released = true
-    try {
-      releaseFileLock?.()
-    } catch {
-      // best-effort cleanup
-    }
+    releaseLockFileNow()
     releaseClaim()
     releaseMutexSlot()
   }
@@ -1019,8 +1043,10 @@ export async function acquireCredentialSlot(
         log('[agy-link] re-asserting the primary credential into the Windows credential slot')
         io.writeSlot(primary.raw)
       }
+      releaseLockFileNow()
       // The identity is installed: same-account peers may fast-path again.
       releaseClaim()
+      slotEvents.emit('installed', 'primary')
       return {
         identity: primary.email,
         release: (): void => {
@@ -1095,6 +1121,7 @@ export async function acquireCredentialSlot(
     }
 
     io.writeSlot(accountRaw)
+    releaseLockFileNow()
     // This account's identity is installed and STAYS installed while any
     // same-identity peer is live: the mutex this lease holds is handed back by
     // the LAST holder, which also restores the primary. Until then agy may
@@ -1135,6 +1162,7 @@ export async function acquireCredentialSlot(
     // Identity installed: peers on this grant may join now. A queued switcher
     // keeps its own claim, so this only releases THIS run's guard.
     releaseClaim()
+    slotEvents.emit('installed', accountFingerprint)
     return {
       identity: account.email,
       release: (): void => leaveInstalledIdentity(state),

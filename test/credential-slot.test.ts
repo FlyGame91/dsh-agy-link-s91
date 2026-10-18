@@ -29,6 +29,7 @@ import {
   type SlotIo,
   type SlotLease,
 } from '../src/host/credential-slot.ts'
+import { invalidateWindowsCredentialCache, readWindowsCredentialRaw } from '../src/host/wincred.ts'
 
 function tmp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix))
@@ -1046,3 +1047,45 @@ test('acquireCrossProcessSlotLock acquires, releases, and instantly recovers fro
     rmSync(baseDir, { recursive: true, force: true })
   }
 })
+
+test('readWindowsCredentialRaw uses short-lived in-memory cache and avoids redundant reads', () => {
+  invalidateWindowsCredentialCache()
+  if (process.platform !== 'win32') {
+    assert.equal(readWindowsCredentialRaw(), null)
+    return
+  }
+  const t0 = Date.now()
+  const val1 = readWindowsCredentialRaw()
+  const d1 = Date.now() - t0
+
+  const t1 = Date.now()
+  const val2 = readWindowsCredentialRaw()
+  const d2 = Date.now() - t1
+
+  assert.equal(val1, val2)
+  assert.ok(d2 < 50, `cached read must be practically instant (<50ms), took ${d2}ms (first read was ${d1}ms)`)
+})
+
+test('acquireCredentialSlot releases cross-process file lock immediately after slot write so peers are not blocked by disk lock', async () => {
+  const baseDir = tmp('agy-lockfree-')
+  const homeDir = tmp('agy-lockfree-home-')
+  const accDir = tmp('agy-lockfree-acc-')
+  const lockFile = slotLockFilePath(baseDir)
+  let lease: SlotLease | undefined
+  try {
+    writePrimaryCredential({ raw: tokenDoc('PRIMARY'), email: 'me@example.com', savedAt: 1 }, baseDir)
+    writeAccountToken(accDir, tokenDoc('SECOND'))
+    const io = memoryIo(tokenDoc('PRIMARY'))
+    const q98 = account('q98', accDir, { email: 'q98@example.com' })
+
+    lease = await acquireCredentialSlot(q98, secondaryPool(), { baseDir, homeDir, io, log: () => {} })
+    assert.ok(lease)
+    // Even though lease is still active (the turn is running!), the disk lock file must NOT linger
+    assert.equal(existsSync(lockFile), false, 'cross-process file lock must be released immediately after slot write')
+  } finally {
+    lease?.release()
+    for (const d of [baseDir, homeDir, accDir]) rmSync(d, { recursive: true, force: true })
+  }
+})
+
+

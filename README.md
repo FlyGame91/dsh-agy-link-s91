@@ -245,6 +245,8 @@ Have multiple Google Antigravity / Gemini accounts? **dsh-agy-link makes multi-a
 
 ## ✨ Features Overview
 
+| Feature | Description |
+| --- | --- |
 | 🎨 **Official Vector Logo** | Clean 36×36 retina vector mark (`assets/icon.svg`) with transparent background; dynamically replaces fallback gear in DSH Settings sidebar (`[role="dialog"] nav`) |
 | 🧩 **Unified Settings & Plugin Console** | Embedded Antigravity console directly in DSH Plugins settings; configure account pool, quotas, and proxies in one place while keeping list cards clean |
 | 🚀 **Secondary Account Parallel Leases** | Windows credential slot allows concurrent sessions on the same account to share leases without queue starvation; serializes only for cross-account switches |

@@ -322,12 +322,15 @@ export function mirrorCallId(runId: string, eventIndex: number): string {
 export function parseMirrorCallId(callId: string): { runId: string; eventIndex: number } | null {
   if (!callId.startsWith(AGY_CALL_PREFIX)) return null
   const rest = callId.slice(AGY_CALL_PREFIX.length)
+  // Strip any collision-disambiguation suffix (#toolName) before extracting coordinates
+  const hashIdx = rest.indexOf('#')
+  const baseRest = hashIdx >= 0 ? rest.slice(0, hashIdx) : rest
   // runId is a uuid (hyphens included), so split from the RIGHT: the last
   // hyphen separates the event index.
-  const idx = rest.lastIndexOf('-')
+  const idx = baseRest.lastIndexOf('-')
   if (idx <= 0) return null
-  const runId = rest.slice(0, idx)
-  const n = Number(rest.slice(idx + 1))
+  const runId = baseRest.slice(0, idx)
+  const n = Number(baseRest.slice(idx + 1))
   if (!Number.isSafeInteger(n) || n < 0) return null
   return { runId, eventIndex: n }
 }

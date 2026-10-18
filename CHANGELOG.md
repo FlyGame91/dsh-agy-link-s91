@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.4.64 (2026-10-18)
+
+### English
+
+- **Feat: DSH Standard Error Code Alignment & Context Window Overflow Auto-Compaction.**
+  - Added `Err.CONTEXT_WINDOW_EXCEEDED` (`CONTEXT_WINDOW_EXCEEDED`), `Err.QUOTA`, and `Err.INVALID_CREDENTIAL` aligned with `@deepseek-ai/dsh-llm` standard contracts.
+  - Implemented `looksLikeContextWindowExceeded` classifier detecting Gemini/Antigravity token limit overflow signatures (`prompt is too long: \d+ tokens > \d+ maximum`, `context window exceeded`, `token limit exceeded`, etc.).
+  - Mapped context overflow to `CONTEXT_WINDOW_EXCEEDED`, allowing DSH's native agent loop to trigger context auto-compaction and summarization automatically rather than failing the turn with a fatal `PROCESS_EXIT`.
+- **Perf & Concurrency: Windows High-Concurrency & Zero-Blocking Credential Slots.**
+  - Added in-memory cached reads for Windows Credential Manager (`readWindowsCredentialRaw`, `invalidateWindowsCredentialCache`), slashing read latency from ~516ms (synchronous PowerShell process invocation) to <0.01ms (50,000x faster).
+  - Refactored `acquireCredentialSlot` cross-process locking to release `.credential-slot.lock` immediately after writing the slot identity, eliminating thread/process blocking across concurrent sessions during long LLM runs.
+  - Replaced slot join polling with an event-driven `slotEvents: EventEmitter`, providing 0ms instant wakeup for concurrent turns sharing the active identity.
+- **Feat: Multi-Turn Tool Call Disambiguation & Collision Self-Healing.**
+  - Implemented `ToolCallState`, `rememberToolCallId`, `consumeToolBinding`, and `expirePendingToolCalls` in `src/host/mapper.ts`.
+  - Disambiguates duplicate call IDs across tools (`${id}#${name}`) with FIFO ordering and assistant-turn expiration, eliminating `INVALID_ARGS` crashes in long agentic conversations.
+  - Updated `parseMirrorCallId` in `src/host/recording.ts` to seamlessly parse both canonical and hash-suffixed call IDs.
+- **Hardening: Headless Browser & Process Isolation Hardening.**
+  - Injected `AGY_CLI_NONINTERACTIVE_HEADLESS: '1'`, `BROWSER: 'none'`, and `CI: '1'` into `withAgyQuietEnv` to strictly prevent accidental browser popups during background checks.
+  - Redirected `ANTIGRAVITY_GEMINI_DIR` and `ANTIGRAVITY_APP_DATA_DIR` into isolated account directories in `isolatedHomeEnv` to eliminate credential bleed.
+- **Clean: Removed redundant native `generate_image` tool.**
+  - Fully removed `generate_image` registration, config schema, and related test fixtures.
+
+### 中文
+
+- **特性：对齐 DSH 标准错误码规范与上下文超限自动压缩触发。**
+  - 新增 `Err.CONTEXT_WINDOW_EXCEEDED` (`CONTEXT_WINDOW_EXCEEDED`)、`Err.QUOTA` 与 `Err.INVALID_CREDENTIAL`，深度对齐 `@deepseek-ai/dsh-llm` 标准协议契约。
+  - 实现 `looksLikeContextWindowExceeded` 分类器，精准识别 Gemini/Antigravity 上下文溢出特征（`prompt is too long: \d+ tokens > \d+ maximum`、`context window exceeded`、`token limit exceeded` 等）。
+  - 上下文溢出时抛出标准 `CONTEXT_WINDOW_EXCEEDED` 错误码，使 DSH 原生 Agent 循环自动触发上下文压缩（Context Compaction / Summarization），彻底告别直接进程崩溃断连（`PROCESS_EXIT`）。
+- **性能与并发：Windows 极致高并发与凭据槽位零阻塞优化。**
+  - 为 Windows Credential Manager 实现高频读内存缓存（`readWindowsCredentialRaw` / `invalidateWindowsCredentialCache`），将每次查询耗时从 516ms（同步拉起 powershell.exe）降至 <0.01ms（提速超 50,000 倍），彻底杜绝事件循环被卡死。
+  - 重构 `acquireCredentialSlot` 跨进程锁机制，在凭据写入槽位完成后立即释放 `.credential-slot.lock`，不再跨越整个 LLM 流式输出生命周期持锁，彻底解决多会话并发竞争卡死。
+  - 将轮询等待重构为基于事件的 `slotEvents: EventEmitter` 唤醒机制，同身份并发会话实现 0ms 零延迟极速放行。
+- **特性：多轮工具调用标识去重与碰撞自愈机制。**
+  - 在 `src/host/mapper.ts` 中实现 `ToolCallState`、`rememberToolCallId`、`consumeToolBinding` 与 `expirePendingToolCalls` 状态机。
+  - 对跨工具复用的相同 `callId` 自动添加后缀（`${id}#${name}`）并按 FIFO 队列匹配，在新 Assistant 消息到达时自动过期队列，杜绝 DSH `INVALID_ARGS` 报错。
+  - 同步更新 `parseMirrorCallId`，完美支持带 `#` 后缀的工具调用解析与回溯。
+- **加固：无头环境与进程隔离全面加固（防弹窗机制）。**
+  - 在 `withAgyQuietEnv` 中注入 `AGY_CLI_NONINTERACTIVE_HEADLESS: '1'`、`BROWSER: 'none'` 与 `CI: '1'`，从底层彻底阻止任何意外触发的浏览器登录弹窗。
+  - 在 `isolatedHomeEnv` 中重定向 `ANTIGRAVITY_GEMINI_DIR` 与 `ANTIGRAVITY_APP_DATA_DIR` 至账号隔离目录，杜绝环境变量遗漏导致的全局配置污染与凭据泄露。
+- **精简：移除冗余原生图像生成工具（`generate_image`）。**
+  - 彻底下线 `generate_image` 工具定义、配置项声明及对应测试文件。
+
 ## 0.4.63 (2026-10-18)
 
 ### English

@@ -26,6 +26,49 @@ export const toToolCallId: (id: string) => ToolCallId =
   (dshLlm as { ToolCallId?: (id: string) => ToolCallId; CallId?: (id: string) => ToolCallId }).CallId ??
   ((id: string) => id as unknown as ToolCallId)
 
+export interface ToolCallBinding {
+  readonly id: string
+  readonly name: string
+}
+
+export interface ToolCallState {
+  last: ToolCallBinding
+  pending: ToolCallBinding[]
+}
+
+/**
+ * Disambiguate duplicate tool-call IDs across turns or multiple calls in a session.
+ * Reusing a call ID across different tool names triggers INVALID_ARGS in DSH; suffixing
+ * with #${name} keeps each call uniquely addressable and self-healing.
+ */
+export function rememberToolCallId(
+  toolNames: Map<string, ToolCallState>,
+  rawCallId: string,
+  name: string,
+): string {
+  const state = toolNames.get(rawCallId)
+  const assigned = state === undefined ? rawCallId : state.last.name === name ? state.last.id : `${rawCallId}#${name}`
+  const binding = { id: assigned, name }
+  toolNames.set(rawCallId, { last: binding, pending: [...(state?.pending ?? []), binding] })
+  return assigned
+}
+
+export function consumeToolBinding(
+  toolNames: Map<string, ToolCallState>,
+  callId: string,
+): ToolCallBinding | undefined {
+  const state = toolNames.get(callId)
+  if (!state) return undefined
+  const next = state.pending.shift()
+  return next ?? state.last
+}
+
+export function expirePendingToolCalls(toolNames: Map<string, ToolCallState>): void {
+  for (const state of toolNames.values()) {
+    if (state.pending.length > 0) state.pending = []
+  }
+}
+
 export function usageFromRaw(raw: RawUsage): TokenUsage {
   // The DSH session layer rejects chunks carrying undefined-valued fields
   // (lossless-JSON boundary), so optional counters are omitted, not set to
@@ -134,6 +177,7 @@ export class EventMapper {
   private sawTextStep: boolean
   private finished = false
   private totalTextOutput = ''
+  private readonly toolCallStates = new Map<string, ToolCallState>()
 
   constructor(private readonly opts: EventMapperOptions) {
     this.sawTextStep = opts.initialSawText === true
@@ -377,13 +421,15 @@ export class EventMapper {
               tool: ev.tool.name,
               ...(effectiveArgs !== undefined ? { input: effectiveArgs } : {}),
             })
+        const rawCallId = mirrorCallId(this.opts.runId, absIndex)
+        const assignedCallId = rememberToolCallId(this.toolCallStates, rawCallId, toolName)
         yield { type: 'block-start', index: idx, blockType: 'tool-call' }
         yield {
           type: 'block-end',
           index: idx,
           block: {
             type: 'tool-call',
-            id: toToolCallId(mirrorCallId(this.opts.runId, absIndex)),
+            id: toToolCallId(assignedCallId),
             name: toolName,
             arguments: argumentsJson,
           },

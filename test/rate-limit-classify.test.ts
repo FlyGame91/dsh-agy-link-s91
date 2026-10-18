@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { looksLikeRateLimit, looksLikeHardRateLimit, looksLikeEligibilityFailure, looksLikeNetworkError, shouldMarkAuthRequired } from '../src/common/types.ts'
+import { looksLikeRateLimit, looksLikeHardRateLimit, looksLikeEligibilityFailure, looksLikeNetworkError, shouldMarkAuthRequired, looksLikeContextWindowExceeded } from '../src/common/types.ts'
 
 // Captured verbatim from a real incident: a cortex tool / permission error
 // that the old loose classifier (bare `429` / bare `rate limit`) sometimes saw
@@ -86,3 +86,20 @@ test('looksLikeNetworkError recognises transport-shaped auth failures', () => {
   assert.equal(shouldMarkAuthRequired('AUTH', 'keyringAuth: token validation failed due to network error: EOF'), false)
   assert.equal(shouldMarkAuthRequired('AUTH', 'invalid_grant: the token has been revoked'), true)
 })
+
+test('looksLikeContextWindowExceeded matches token limit and context overflow signatures', () => {
+  assert.equal(looksLikeContextWindowExceeded('prompt is too long: 1204000 tokens > 1048576 maximum'), true)
+  assert.equal(looksLikeContextWindowExceeded('INVALID_ARGUMENT: prompt is too long: 2000000 tokens > 1000000 maximum'), true)
+  assert.equal(looksLikeContextWindowExceeded('The request exceeded the model context window.'), true)
+  assert.equal(looksLikeContextWindowExceeded('context length exceeded: maximum context length is 1048576'), true)
+  assert.equal(looksLikeContextWindowExceeded('token limit exceeded for this turn'), true)
+  assert.equal(looksLikeContextWindowExceeded('input is too large for the model context window'), true)
+  assert.equal(looksLikeContextWindowExceeded('prompt is too long for this model context'), true)
+
+  // Incident & unrelated errors must NOT match
+  assert.equal(looksLikeContextWindowExceeded(''), false)
+  assert.equal(looksLikeContextWindowExceeded(REAL_TOOL_ERROR), false)
+  assert.equal(looksLikeContextWindowExceeded('model overloaded, please try again'), false)
+  assert.equal(looksLikeContextWindowExceeded('rate limit reached: resets in 20m'), false)
+})
+

@@ -8,7 +8,7 @@
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
-import { Err, isAccountScopedFailure, isAuthoritativeAuthError, looksLikeAuthFailure, looksLikeAuthVerificationJitter, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeNetworkError, looksLikeRateLimit, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
+import { Err, isAccountScopedFailure, isAuthoritativeAuthError, looksLikeAuthFailure, looksLikeAuthVerificationJitter, looksLikeContextWindowExceeded, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeNetworkError, looksLikeRateLimit, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
 import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { conversationsDirFor, diffConversations, snapshotConversations } from './discovery.ts'
@@ -1805,6 +1805,13 @@ export class AgyAdapter extends LlmAdapter {
             message: hard
               ? 'Google Antigravity quota / rate limit reached: ' + bestMsg
               : 'Google Antigravity quota / rate limit reached (server capacity overloaded): ' + bestMsg,
+          }
+        } else if (looksLikeContextWindowExceeded(rawErrText) || looksLikeContextWindowExceeded(parser.stats.lastResultError ?? '')) {
+          const detail = parser.stats.lastResultError || (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'Prompt exceeds context window limit')
+          failure = {
+            kind: 'error',
+            code: Err.CONTEXT_WINDOW_EXCEEDED,
+            message: 'Google Antigravity context window exceeded: ' + detail,
           }
         } else if (
           !transportFailure

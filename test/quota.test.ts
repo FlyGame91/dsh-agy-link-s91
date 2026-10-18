@@ -8,6 +8,7 @@ import { QuotaService, detectEmailFromAgyLogs, mergeFallbackFamilyQuota, normali
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
+import { detectSystemProxy } from '../src/host/wincred.ts'
 
 test('persistRefreshedToken keeps the refresh token and writes agy nested shape', () => {
   // Regression: the writer used to emit a flat `{access_token,expiry}` document
@@ -850,6 +851,7 @@ test('normalizeLegacyPrimary self-heals primary account email from .primary-cred
     assert.equal(primary.email, 'g98@example.com', 'primary email self-heals from durable store on Windows')
   }
 })
+
 
 
 

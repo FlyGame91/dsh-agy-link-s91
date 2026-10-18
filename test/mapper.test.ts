@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
-import { EventMapper, rewriteImageMarkdown, suffixDelta, usageFromRaw } from '../src/host/mapper.ts'
+import { EventMapper, rewriteImageMarkdown, suffixDelta, usageFromRaw, rememberToolCallId, consumeToolBinding, expirePendingToolCalls, type ToolCallState } from '../src/host/mapper.ts'
 import { mirrorCallId, parseMirrorCallId } from '../src/host/recording.ts'
 import { parseMirrorInvocation } from '../src/host/mirror-tool.ts'
 
@@ -657,4 +657,55 @@ test('EventMapper emits exit_plan_mode tool-call when in plan mode', () => {
   const fin = chunks.find((c) => c.type === 'finish') as any
   assert.equal(fin.reason.kind, 'tool-calls')
 })
+
+test('ToolCallState: rememberToolCallId disambiguates call ID collisions across different tool names', () => {
+  const map = new Map<string, ToolCallState>()
+
+  // First call for call_0 under 'run_command'
+  const id1 = rememberToolCallId(map, 'call_0', 'run_command')
+  assert.equal(id1, 'call_0')
+
+  // Second call for call_0 under SAME tool name keeps the original ID
+  const id2 = rememberToolCallId(map, 'call_0', 'run_command')
+  assert.equal(id2, 'call_0')
+
+  // Third call for call_0 under DIFFERENT tool name 'write_to_file' suffixes with #name
+  const id3 = rememberToolCallId(map, 'call_0', 'write_to_file')
+  assert.equal(id3, 'call_0#write_to_file')
+
+  // consumeToolBinding consumes in FIFO order
+  const b1 = consumeToolBinding(map, 'call_0')
+  assert.equal(b1?.id, 'call_0')
+  assert.equal(b1?.name, 'run_command')
+
+  const b2 = consumeToolBinding(map, 'call_0')
+  assert.equal(b2?.id, 'call_0')
+  assert.equal(b2?.name, 'run_command')
+
+  const b3 = consumeToolBinding(map, 'call_0')
+  assert.equal(b3?.id, 'call_0#write_to_file')
+  assert.equal(b3?.name, 'write_to_file')
+
+  // expirePendingToolCalls clears pending list
+  rememberToolCallId(map, 'call_1', 'tool_a')
+  expirePendingToolCalls(map)
+  const bAfterExpire = consumeToolBinding(map, 'call_1')
+  // falls back to last
+  assert.equal(bAfterExpire?.name, 'tool_a')
+})
+
+test('parseMirrorCallId supports both canonical and hash-disambiguated call IDs', () => {
+  const parsedPlain = parseMirrorCallId('agytc-550e8400-e29b-41d4-a716-446655440000-12')
+  assert.deepEqual(parsedPlain, {
+    runId: '550e8400-e29b-41d4-a716-446655440000',
+    eventIndex: 12,
+  })
+
+  const parsedHashed = parseMirrorCallId('agytc-550e8400-e29b-41d4-a716-446655440000-12#agy_tool')
+  assert.deepEqual(parsedHashed, {
+    runId: '550e8400-e29b-41d4-a716-446655440000',
+    eventIndex: 12,
+  })
+})
+
 

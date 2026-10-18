@@ -594,7 +594,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           askTool: cfg.askTool,
           auth: auth.status(),
           poolAuth: poolAuth.status(),
-          pool: pool.getPoolData(),
+          pool: pool.getPoolData(cfg.proxyUrl?.trim() || undefined),
           catalog: { source: cat.source, count: cat.models.length, lastError: cat.lastError ?? null },
           // Full sanitized catalog + the current deny-list so the settings UI's
           // model-visibility toggles show every known model, hidden ones included.

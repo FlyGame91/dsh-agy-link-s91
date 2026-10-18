@@ -130,9 +130,12 @@ export function windowsQuote(arg: string): string {
  * platforms for its .gemini dir.
  */
 export function isolatedHomeEnv(dir: string): Record<string, string> {
+  const geminiDir = join(dir, '.gemini')
   const env: Record<string, string> = {
     HOME: dir,
-    GEMINI_CLI_HOME: join(dir, '.gemini'),
+    GEMINI_CLI_HOME: geminiDir,
+    ANTIGRAVITY_GEMINI_DIR: geminiDir,
+    ANTIGRAVITY_APP_DATA_DIR: join(geminiDir, 'antigravity-cli'),
   }
   if (IS_WIN) {
     env.USERPROFILE = dir
@@ -566,6 +569,9 @@ export function withAgyQuietEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Pr
     ...env,
     AGY_CLI_DISABLE_AUTO_UPDATE: env.AGY_CLI_DISABLE_AUTO_UPDATE ?? '1',
     AGY_CLI_INTERACTIVE_HEADLESS: env.AGY_CLI_INTERACTIVE_HEADLESS ?? '1',
+    AGY_CLI_NONINTERACTIVE_HEADLESS: env.AGY_CLI_NONINTERACTIVE_HEADLESS ?? '1',
+    BROWSER: env.BROWSER ?? 'none',
+    CI: env.CI ?? '1',
   };
 }
 

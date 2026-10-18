@@ -252,9 +252,30 @@ export function shouldMarkAuthRequired(code: string | undefined, message: string
 }
 
 
+/** Sentinel used to bypass Google Cloud 400 INVALID_ARGUMENT when function calls lack a thought signature. */
+export const SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator'
+
+/**
+ * Recognize context-overflow and token limit exceeded errors from Google Antigravity / agy CLI.
+ * Aligns with DSH's CONTEXT_WINDOW_EXCEEDED_CODE contract so the agent loop triggers context
+ * auto-compaction instead of terminating the turn with a fatal process exit.
+ */
+export function looksLikeContextWindowExceeded(message: string): boolean {
+  if (!message) return false
+  if (/prompt is too long:\s*\d+\s*tokens\s*>\s*\d+\s*maximum/i.test(message)) return true
+  if (/context[\s_-]*(?:length|window)[\s_-]*(?:exceeded|overflow|limit[\s_-]*exceeded)/i.test(message)) return true
+  if (/\b(?:maximum|max)(?:\s+(?:allowed|supported))?\s+context\s+(?:length|window)\b/i.test(message)) return true
+  if (/\b(?:request|prompt|input|messages?)\s+(?:is\s+|are\s+)?too\s+(?:large|long)\s+for\s+(?:(?:this|the)\s+)?(?:model(?:'s)?\s+)?context(?:\s+window)?\b/i.test(message)) return true
+  if (/\btoken[\s_-]*limit[\s_-]*exceeded\b/i.test(message)) return true
+  if (/\bexceed(?:s|ed|ing)?\b.{0,40}\b(?:model(?:'s)?\s+)?context(?:\s+(?:length|window))?\b/i.test(message)) return true
+  if (/\b(?:model(?:'s)?\s+)?context(?:\s+(?:length|window))?\b.{0,40}\bexceed(?:s|ed|ing)?\b/i.test(message)) return true
+  return false
+}
+
 // Stable LlmError codes surfaced by the adapter (spec error table).
 export const Err = {
   AUTH: 'AUTH',
+  INVALID_CREDENTIAL: 'INVALID_CREDENTIAL',
   AGY_NOT_INSTALLED: 'AGY_NOT_INSTALLED',
   AGY_VERSION_UNSUPPORTED: 'AGY_VERSION_UNSUPPORTED',
   AGY_ERROR: 'AGY_ERROR',
@@ -265,6 +286,7 @@ export const Err = {
    * deterministic AGY_ERRORs (bad region, empty request, dead pool).
    */
   RATE_LIMIT: 'RATE_LIMIT',
+  QUOTA: 'QUOTA',
   /**
    * Google-side region / account eligibility refusal ("User location is not
    * supported for the API use"). Account-level, so it is retryable: the
@@ -294,6 +316,11 @@ export const Err = {
   UNSUPPORTED_REASONING_EFFORT: 'UNSUPPORTED_REASONING_EFFORT',
   AUX_DISABLED: 'AUX_DISABLED',
   BUSY: 'BUSY',
+  /**
+   * Canonical provider-neutral code for context window overflow.
+   * Enables DSH agent loop to trigger context auto-compaction rather than aborting.
+   */
+  CONTEXT_WINDOW_EXCEEDED: 'CONTEXT_WINDOW_EXCEEDED',
 } as const
 
 // Raw usage object as emitted by agy stream-json (snake_case).

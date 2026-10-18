@@ -114,13 +114,24 @@ function runWinCredPs(target: string, user: string, action: string, payload = ''
   ).trim()
 }
 
-/** Read raw UTF-8 credential blob from Windows Credential Manager. */
-export function readWindowsCredentialRaw(target = 'gemini:antigravity'): string | null {
+let cachedWinCredRaw: { target: string; val: string | null; time: number } | null = null
+
+export function invalidateWindowsCredentialCache(): void {
+  cachedWinCredRaw = null
+}
+
+/** Read raw UTF-8 credential blob from Windows Credential Manager (with short-lived in-memory caching). */
+export function readWindowsCredentialRaw(target = 'gemini:antigravity', maxAgeMs = 2500): string | null {
   if (!IS_WIN) return null
+  const now = Date.now()
+  if (cachedWinCredRaw && cachedWinCredRaw.target === target && (now - cachedWinCredRaw.time) < maxAgeMs) {
+    return cachedWinCredRaw.val
+  }
   try {
     const out = runWinCredPs(target, 'antigravity', 'read')
-    if (!out) return null
-    return Buffer.from(out, 'base64').toString('utf8')
+    const val = out ? Buffer.from(out, 'base64').toString('utf8') : null
+    cachedWinCredRaw = { target, val, time: now }
+    return val
   } catch {
     return null
   }
@@ -136,7 +147,11 @@ export function writeWindowsCredentialRaw(
   try {
     const b64 = Buffer.from(secret, 'utf8').toString('base64')
     const out = runWinCredPs(target, userName, 'write', b64)
-    return out.toLowerCase() === 'true'
+    const ok = out.toLowerCase() === 'true'
+    if (ok) {
+      cachedWinCredRaw = { target, val: secret, time: Date.now() }
+    }
+    return ok
   } catch {
     return false
   }
@@ -147,7 +162,11 @@ export function deleteWindowsCredentialRaw(target = 'gemini:antigravity'): boole
   if (!IS_WIN) return false
   try {
     const out = runWinCredPs(target, 'antigravity', 'delete')
-    return out.toLowerCase() === 'true'
+    const ok = out.toLowerCase() === 'true'
+    if (ok) {
+      cachedWinCredRaw = { target, val: null, time: Date.now() }
+    }
+    return ok
   } catch {
     return false
   }
