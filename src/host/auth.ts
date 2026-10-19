@@ -38,7 +38,11 @@ export class AuthHelper {
   private signedInCache: { value: boolean | null; at: number } | null = null
   private signedInFlight: Promise<boolean | null> | null = null
 
-  constructor(private readonly bin: () => string | null) {}
+  constructor(
+    private readonly bin: () => string | null,
+    /** Issue #49: pre-empt agy's auto-updater before probe/login spawns. */
+    private readonly preemptAutoUpdate: () => boolean = () => true,
+  ) {}
 
   status(): AuthStatus {
     return { ...this.state };
@@ -65,7 +69,7 @@ export class AuthHelper {
       let value: boolean | null = null
       try {
         const env = homeDir ? { ...process.env, HOME: homeDir } : process.env
-        const out = await probeProcess(bin, ['models'], 15_000, undefined, env)
+        const out = await probeProcess(bin, ['models'], 15_000, undefined, env, this.preemptAutoUpdate())
         const tail = out.stderrTail + '\n' + out.stdout.slice(0, 2000)
         if (out.code === 0 && !looksLikeAuthFailure(out.stdout)) value = true
         else if (out.code !== 0 && looksLikeAuthFailure(tail)) value = false
@@ -112,6 +116,7 @@ export class AuthHelper {
       // A browser login is legitimately silent on stdout for minutes; let
       // agy's stderr chatter keep the idle watchdog fed (run-scoped only).
       stderrKeepalive: true,
+      preemptAutoUpdate: this.preemptAutoUpdate(),
       env,
       onLine: (line) => {
         if (this.capturedUrl) return;

@@ -151,6 +151,7 @@ dsh plugin --profile web add dsh-agy-link
 | `timeoutMs` | `DSH_AGY_TIMEOUT_MS` | `600000` | 单轮活跃看门狗超时（毫秒） |
 | `longToolIdleMinutes` | `DSH_AGY_LONG_TOOL_IDLE_MINUTES` | `240` | 存在未完成工具步骤（ACTIVE）时的空闲预算（分钟）；`0` = 不抬高预算，卡死的工具按 `timeoutMs` 快速失败 |
 | `workspaceRoot` | `DSH_AGY_WORKSPACE_ROOT` | 会话 cwd | agy 工作区根目录（默认跟随当前会话工作区） |
+| `suppressAgyAutoUpdate` | `DSH_AGY_SUPPRESS_AUTOUPDATE` | Windows `true`，其他平台 `false` | 每次 spawn 前刷新 agy 的更新检查时间戳，阻断 `--bg-updater` 子进程链（Windows 闪窗根因）。关闭后 agy 恢复自动更新检查 |
 
 ---
 
@@ -174,6 +175,16 @@ dsh plugin --profile web add dsh-agy-link
   2. 将 **默认终端应用程序 (Default terminal application)** 从「让 Windows 决定」或「Windows 终端」更改为 **「Windows 控制台主机 (Windows Console Host)」**。
   3. 点击右下角 **保存 (Save)**。
   4. **完全退出并重启 DSH**（使新启动的主进程应用更新后的控制台委托注册表），黑框闪烁即可彻底消除。
+
+### agy 自己的自动更新子进程也会闪窗（0.4.66 修复）
+除了上面那种控制台委托导致的闪窗，`agy` **自己**还会在距上次更新检查满 15 分钟后派生一条 `--bg-updater` → `agy --version` 的子进程链，**这条链由 agy 内部创建，会自行分配可见控制台**，父进程的 `windowsHide` 和 `AGY_CLI_DISABLE_AUTO_UPDATE=1` 都来不及生效（这就是 Issue #49 实测确认的结论）。
+
+0.4.66 起的处理方式：每次 spawn agy 之前，插件把 agy 更新检查的 fast-path 时间戳（`<agy home>/last_check.timestamp`）刷新为当前时间。agy 的检查逻辑是「距上次检查 < 15 分钟就直接跳过且不派生子进程」，于是这条可见窗口链根本不会被创建——对话、冷启动探测、模型选择器刷新、登录探测全部覆盖。
+
+- **代价**：插件所使用的那个 agy home 不再自动检查更新；手动 `agy update` 完全不受影响。
+- **开关**：`suppressAgyAutoUpdate`（环境变量 `DSH_AGY_SUPPRESS_AUTOUPDATE`）。Windows 上默认开启，其他平台默认关闭；设为 `false` 即回到 agy 原本的自动更新行为。
+- **旧版本用户的手动 workaround**：把 `%USERPROFILE%\.gemini\antigravity-cli\updater\update.lock` 设为只读（`attrib +R ...`），agy 拿不到更新锁就会跳过检查。代价是手动 `agy update` 会报 `update already in progress`，需要先 `attrib -R`。
+
 
 ---
 
@@ -318,6 +329,7 @@ dsh plugin --profile web add dsh-agy-link
 | `timeoutMs` | `DSH_AGY_TIMEOUT_MS` | `600000` | Activity watchdog timeout in milliseconds |
 | `longToolIdleMinutes` | `DSH_AGY_LONG_TOOL_IDLE_MINUTES` | `240` | Idle budget while a tool step is ACTIVE (minutes); `0` keeps the normal `timeoutMs` budget so wedged tools fail fast |
 | `workspaceRoot` | `DSH_AGY_WORKSPACE_ROOT` | session cwd | Working directory root |
+| `suppressAgyAutoUpdate` | `DSH_AGY_SUPPRESS_AUTOUPDATE` | `true` on Windows, `false` elsewhere | Refreshes agy's update-check timestamp before every spawn so its `--bg-updater` child chain (the Windows console-flash root cause) never starts. `false` restores agy's own auto-update checks |
 
 ---
 
@@ -347,6 +359,29 @@ you explicitly accept unattended tool execution.
   2. Change **Default terminal application** from "Let Windows decide" or "Windows Terminal" to **"Windows Console Host"**.
   3. Click **Save** in the bottom-right corner.
   4. **Completely exit and restart DSH** so the running host process picks up the updated console delegation setting.
+
+### agy's own auto-updater also flashes a window (fixed in 0.4.66)
+On top of the console-delegation flash above, `agy` itself spawns a
+`--bg-updater` → `agy --version` child chain once its last update check is more
+than 15 minutes old. **That chain is created inside agy and allocates its own
+visible console**, so the parent's `windowsHide` and `AGY_CLI_DISABLE_AUTO_UPDATE=1`
+both apply too late — the exact conclusion of the measurements recorded in issue #49.
+
+Since 0.4.66 the plugin refreshes agy's fast-path timestamp
+(`<agy home>/last_check.timestamp`) right before every spawn. agy skips the
+check entirely when it is under 15 minutes old and spawns nothing, so the
+visible window chain never starts — for turns, boot probes, model-picker
+refreshes and login probes alike.
+
+- **Cost**: the agy home used by this plugin stops auto-checking for updates;
+  a manual `agy update` still works normally.
+- **Switch**: `suppressAgyAutoUpdate` (env `DSH_AGY_SUPPRESS_AUTOUPDATE`).
+  On by default on Windows, off elsewhere; set `false` to restore agy's own behaviour.
+- **Manual workaround on older versions**: make
+  `%USERPROFILE%\.gemini\antigravity-cli\updater\update.lock` read-only
+  (`attrib +R ...`). agy then fails to acquire the update lock and skips the
+  check — at the price of `agy update` reporting `update already in progress`
+  until you run `attrib -R`.
 
 ---
 

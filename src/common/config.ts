@@ -132,6 +132,7 @@ export function resolveConfig(
     disableTelemetry: asBool(get('disableTelemetry')) ?? base.disableTelemetry,
     quotaPollIntervalMs: asNum(get('quotaPollIntervalMs')) ?? base.quotaPollIntervalMs,
     proxyUrl: asString(get('proxyUrl')) ?? base.proxyUrl,
+    suppressAgyAutoUpdate: asBool(get('suppressAgyAutoUpdate')) ?? base.suppressAgyAutoUpdate,
   }
   // Env wins last (spec ADR-13).
   if (env.DSH_AGY_ENABLED !== undefined) cfg.enabled = asBool(env.DSH_AGY_ENABLED) ?? cfg.enabled
@@ -193,5 +194,9 @@ export function resolveConfig(
     if (q && q >= 60_000) cfg.quotaPollIntervalMs = q
   }
   if (env.DSH_AGY_PROXY_URL) cfg.proxyUrl = env.DSH_AGY_PROXY_URL
+  if (env.DSH_AGY_SUPPRESS_AUTOUPDATE !== undefined) {
+    const sa = asBool(env.DSH_AGY_SUPPRESS_AUTOUPDATE)
+    if (sa !== undefined) cfg.suppressAgyAutoUpdate = sa
+  }
   return cfg
 }

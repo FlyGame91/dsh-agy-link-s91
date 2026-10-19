@@ -101,6 +101,18 @@ export interface PluginConfig {
    * desktop installs need this (or per-account proxies) to reach Google.
    */
   proxyUrl: string
+  /**
+   * Pre-empt agy's built-in auto-updater before every spawn (issue #49).
+   *
+   * agy >= 1.4.2 ignores AGY_CLI_DISABLE_AUTO_UPDATE for the `--bg-updater`
+   * child it spawns itself, and that child's `agy --version` grandchild
+   * allocates a visible console window on Windows. Refreshing
+   * `<agy home>/last_check.timestamp` keeps agy on its 15-minute fast path, so
+   * the child chain never starts. Default: true on Windows, false elsewhere.
+   * Cost: the agy home used by this plugin stops doing automatic update checks
+   * (`agy update` still works); set false to restore agy's own behaviour.
+   */
+  suppressAgyAutoUpdate: boolean
 }
 
 // Full fallback line-up, mined from the agy 1.1.13 binary. Serves the
@@ -177,6 +189,9 @@ export function defaultConfig(): PluginConfig {
     disableTelemetry: true,
     quotaPollIntervalMs: 15 * 60_000,
     proxyUrl: '',
+    // Windows is where agy's `--bg-updater` grandchild flashes a console
+    // window; other platforms keep agy's own update behaviour by default.
+    suppressAgyAutoUpdate: process.platform === 'win32',
   }
 }
 

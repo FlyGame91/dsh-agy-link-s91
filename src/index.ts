@@ -175,14 +175,14 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         ? primaryAcc
         : pool.getAccounts().find((a) => a.enabled && !a.authRequired)
 
-      let out = await probeProcess(b, ['models'], 30_000, signal, getDiscoveryEnv(candidateAccount))
+      let out = await probeProcess(b, ['models'], 30_000, signal, getDiscoveryEnv(candidateAccount), getConfig().suppressAgyAutoUpdate)
 
       // If probe failed or prompted to sign in, and candidate had no dir (system HOME),
       // try secondary accounts with isolated dir if available before giving up.
       if ((out.code !== 0 || out.stdout.includes('Please sign in') || /sign in|auth|not logged in/i.test(out.stderrTail)) && (!candidateAccount || !candidateAccount.dir)) {
         const secondary = pool.getAccounts().find((a) => a.enabled && !a.authRequired && a.dir)
         if (secondary) {
-          const secondaryOut = await probeProcess(b, ['models'], 30_000, signal, getDiscoveryEnv(secondary))
+          const secondaryOut = await probeProcess(b, ['models'], 30_000, signal, getDiscoveryEnv(secondary), getConfig().suppressAgyAutoUpdate)
           if (secondaryOut.code === 0 && secondaryOut.stdout.trim() !== '') {
             out = secondaryOut
           }
@@ -198,7 +198,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     getConfig().modelsCacheTtlMs,
     notifyPicker,
   )
-  const auth = new AuthHelper(bin)
+  const auth = new AuthHelper(bin, () => getConfig().suppressAgyAutoUpdate)
   const poolAuth = new PoolAuthFlow(pool, quota, log)
   const runs = new RunRegistry()
 
@@ -416,7 +416,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         return
       }
       try {
-        const v = await probeProcess(currentBin, ['--version'], 10_000)
+        const v = await probeProcess(currentBin, ['--version'], 10_000, undefined, undefined, getConfig().suppressAgyAutoUpdate)
         versionCache = parseVersion(v.stdout)
         if (versionCache && compareVersions(versionCache, MIN_AGY_VERSION) < 0) {
           dormantReason = 'agy ' + versionCache + ' is older than ' + MIN_AGY_VERSION + ' — run: agy update'

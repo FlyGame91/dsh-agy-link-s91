@@ -6,6 +6,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { stateDir } from '../common/config.ts'
 import type { PluginConfig } from '../common/types.ts'
+import { describeAgyAutoUpdate } from './auto-updater.ts'
 import type { ModelCatalog } from './models.ts'
 import type { SessionStore } from './sessions.ts'
 
@@ -62,6 +63,11 @@ export function writeDoctorReport(deps: DoctorDeps): string {
   lines.push('- generated: ' + new Date().toISOString())
   lines.push('- agy binary: ' + (deps.bin() ?? 'NOT FOUND'))
   lines.push('- agy version: ' + (deps.version() ?? 'unknown'))
+  // Issue #49: whether spawns pre-empt agy's `--bg-updater` console flash.
+  lines.push(
+    '- agy auto-updater: ' +
+      (cfg.suppressAgyAutoUpdate ? describeAgyAutoUpdate() : 'not suppressed (suppressAgyAutoUpdate=false)'),
+  )
   // The full config is dumped for support: scrub values that can carry
   // credentials (proxyUrl) instead of emitting them into a 0644 file.
   const cfgDump: Record<string, unknown> = { ...cfg, extraArgs: cfg.extraArgs.length }

@@ -8,6 +8,7 @@ import { accessSync, constants, existsSync, mkdirSync, readdirSync, rmSync } fro
 import { delimiter, join } from 'node:path'
 import { homedir } from 'node:os'
 import type { PluginConfig } from '../common/types.ts'
+import { preemptAgyAutoUpdate } from './auto-updater.ts'
 
 const IS_WIN = process.platform === 'win32'
 
@@ -504,6 +505,14 @@ export interface RunOptions {
    * a browser login is legitimately silent on stdout for minutes.
    */
   stderrKeepalive?: boolean;
+  /**
+   * Pre-empt agy's own auto-updater before spawn (issue #49). Default true:
+   * agy >= 1.4.2 spawns `--bg-updater`, whose `agy --version` grandchild
+   * allocates a visible console window on Windows before any env switch can
+   * apply. Refreshing `last_check.timestamp` keeps agy on its 15-minute fast
+   * path so that chain never starts (see auto-updater.ts).
+   */
+  preemptAutoUpdate?: boolean;
 }
 
 export interface RunningProcess {
@@ -633,6 +642,10 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
   const viaCmd = IS_WIN && isCmdShim(opts.bin)
   const isNode = IS_WIN && /\.(mjs|js|cjs)$/i.test(opts.bin)
   const env = withAgyQuietEnv(opts.env ?? process.env)
+  // Issue #49: the quiet env cannot stop agy's internal `--bg-updater` child
+  // (that chain allocates its own console), so pre-empt the update *check*
+  // instead. Node-script spawns (the MCP bridge) never touch it.
+  if (opts.preemptAutoUpdate !== false && !isNode) preemptAgyAutoUpdate(env)
   const child = viaCmd
     ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', [opts.bin, ...opts.args].map(windowsQuote).join(' ')], {
         cwd: opts.cwd,
@@ -790,8 +803,9 @@ export async function probeProcess(
   timeoutMs = 30_000,
   signal?: AbortSignal,
   env?: NodeJS.ProcessEnv,
+  preemptAutoUpdate?: boolean,
 ): Promise<RunOutcome> {
-  const p = startAgyProcess({ bin, args, timeoutMs, signal, env });
+  const p = startAgyProcess({ bin, args, timeoutMs, signal, env, preemptAutoUpdate });
   return p.outcome;
 }
 

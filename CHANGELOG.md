@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.66 (2026-10-19)
+
+### English
+
+- **Fix: Residual Windows console flash from agy's own auto-updater (Fixes #49).**
+  - Root cause confirmed on agy 1.4.2: `--bg-updater` is spawned *inside* agy, and its `agy --version` grandchild allocates a fresh visible console. The parent's `windowsHide` and `AGY_CLI_DISABLE_AUTO_UPDATE=1` therefore apply too late — the window is already on screen (this invalidates the #23 assumption).
+  - New `src/host/auto-updater.ts` pre-empts the check instead of the child: agy's 15-minute fast path (`auto_updater.go:281 Last check was less than 15 minutes ago, skipping update (fast path)`) only stats `<agy home>/last_check.timestamp`, so the plugin refreshes that mtime immediately before every spawn. The `--bg-updater` chain is then never created.
+  - Covers every spawn path: turns, boot `--version`/`models` probes, model-picker `listModels` refresh, login probes and auxiliary oneshot calls. Verified end-to-end against agy 1.4.2: the run logs `skipping update (fast path)` and spawns no child.
+  - Isolated accounts are respected — the timestamp is resolved through the same `ANTIGRAVITY_APP_DATA_DIR` / `GEMINI_CLI_HOME` / `HOME` / `USERPROFILE` chain the plugin spawns with, so pooled homes are never mixed and the real profile is only touched for the system account.
+  - New config `suppressAgyAutoUpdate` (env `DSH_AGY_SUPPRESS_AUTOUPDATE`), default `true` on Windows and `false` elsewhere; `false` restores agy's own auto-update behaviour. Pre-emption is best-effort and never fails a run.
+  - `/agy doctor` now reports the auto-updater suppression state, and the FAQ documents both this fix and the read-only `update.lock` workaround for older versions.
+
+### 中文
+
+- **修复：agy 自身自动更新链导致的 Windows 残留闪窗（修复 #49）。**
+  - 在 agy 1.4.2 上实锤根因：`--bg-updater` 是 **agy 内部** spawn 的，它再拉起的 `agy --version` 孙进程会自行分配可见控制台，因此父进程的 `windowsHide` 与 `AGY_CLI_DISABLE_AUTO_UPDATE=1` 都来不及生效（#23 的假设在此版本不成立）。
+  - 新增 `src/host/auto-updater.ts`，改从「阻止检查」下手：agy 的 15 分钟 fast path（`auto_updater.go:281 Last check was less than 15 minutes ago, skipping update (fast path)`）只 stat `<agy home>/last_check.timestamp`，插件在每次 spawn 前刷新该文件 mtime，`--bg-updater` 链便完全不产生。
+  - 覆盖全部 spawn 路径：对话轮次、启动 `--version` / `models` 探测、模型选择器的 `listModels` 刷新、登录探测与 oneshot 辅助调用。已用真实 agy 1.4.2 端到端验证：日志为 `skipping update (fast path)`，无任何子进程。
+  - 隔离账号同样生效——时间戳按插件 spawn 时使用的 `ANTIGRAVITY_APP_DATA_DIR` / `GEMINI_CLI_HOME` / `HOME` / `USERPROFILE` 链路解析，号池目录互不串扰，只有系统主账号才会碰到真实 profile。
+  - 新增配置 `suppressAgyAutoUpdate`（环境变量 `DSH_AGY_SUPPRESS_AUTOUPDATE`），Windows 默认 `true`、其他平台默认 `false`；设为 `false` 即恢复 agy 原本的自动更新行为。拦截为 best-effort，失败绝不影响对话。
+  - `/agy doctor` 增加自动更新拦截状态行；FAQ 同时补充本修复说明与旧版本可用的只读 `update.lock` workaround。
+
 ## 0.4.65 (2026-10-19)
 
 ### English

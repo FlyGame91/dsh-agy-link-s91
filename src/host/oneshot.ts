@@ -139,6 +139,7 @@ export async function runAgyOnce(
     timeoutMs,
     signal: req.signal,
     stdinPayload,
+    preemptAutoUpdate: cfg.suppressAgyAutoUpdate,
     onLine: (line) => {
       for (const ev of parser.feed(line + '\n')) {
         if (ev.kind === 'init' && ev.conversationId) conversationId = ev.conversationId

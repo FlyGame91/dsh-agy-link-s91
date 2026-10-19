@@ -1654,6 +1654,7 @@ export class AgyAdapter extends LlmAdapter {
       signal: options.signal,
       env,
       stdinPayload,
+      preemptAutoUpdate: cfg.suppressAgyAutoUpdate,
       // stderr is liveness too: agy prints progress/diagnostics there while a
       // long step is running, and a run that only talks on stderr used to be
       // "idle" as far as the watchdog was concerned.
