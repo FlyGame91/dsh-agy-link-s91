@@ -1142,7 +1142,17 @@ export class AgyAdapter extends LlmAdapter {
         }
       }
     }
-    if (cfg.forwardSystemPrompt) {
+    // forwardSystemPrompt is opt-in for ordinary turns (agy already owns its
+    // own agent instructions, and stacking DSH's rendered system prompt on top
+    // invites conflicts). A review call is the exception: hosts that drive a
+    // tool-authorization reviewer put the whole output protocol in
+    // `options.system` (DSH's auto-review sends REVIEW_POLICY, which demands
+    // exactly one JSON object and nothing else). Dropping it leaves the model
+    // with only the data sections, so it answers in prose and the host's
+    // JSON.parse throws — the tool call is denied instead of reviewed. The
+    // isReview probe above already identifies these calls, so forward the
+    // policy whenever it fires rather than requiring the global opt-in.
+    if (cfg.forwardSystemPrompt || isReview) {
       const sysInstruction = options.system || (() => {
         const sm = messages.find((m) => m.role === 'system')
         return sm ? textOf(sm).trim() : ''

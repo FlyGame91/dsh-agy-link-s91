@@ -47,6 +47,14 @@ export interface PluginConfig {
   maxConcurrent: number
   contextWindowDefault: number
   maxTokensDefault: number
+  /**
+   * Prepend `options.system` to the agy prompt. Opt-in for ordinary turns,
+   * because agy owns its own agent instructions and stacking DSH's rendered
+   * prompt on top invites conflicts. Host authorization-review calls (those
+   * carrying REVIEW_POLICY) always forward their system prompt regardless of
+   * this flag: the output protocol lives there, and dropping it makes the
+   * reviewer answer in prose instead of the required JSON object.
+   */
   forwardSystemPrompt: boolean
   digestMaxChars: number
   /**
