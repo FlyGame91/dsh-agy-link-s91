@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### English
+
+- **Fix: Host authorization-review calls lost their output protocol (Fixes #50).**
+  - When DSH's `@deepseek-ai/dsh-experimental-auto-review` plugin reviews a tool call it sends the entire rubric in `options.system` (`REVIEW_POLICY`, which demands "Return exactly one JSON object and no other text"). The adapter only forwarded `options.system` when `forwardSystemPrompt` was on — and that flag defaults to `false` — so the model received the data sections alone.
+  - The model then answered the way a coding agent does ("Based on a…", preceded by a plan and a self-written test script), and the caller's `JSON.parse` threw `Unexpected token 'B', "Based on a"... is not valid JSON`. Every reviewed tool call was denied with "its body was not executed" instead of being reviewed.
+  - The adapter already detects these calls (`isReview`, used to exempt reviews from the auxiliary-call gate). System-prompt forwarding now also fires on that probe, so the policy always reaches the model regardless of the global opt-in. Ordinary turns are untouched: `forwardSystemPrompt` remains `false` by default and non-review calls still drop the system prompt.
+  - New tests pin both directions: a review call forwards the policy without the opt-in, and an ordinary turn still sends a bare prompt.
+
+### 中文
+
+- **修复：宿主授权复核调用丢失了输出协议（修复 #50）。**
+  - DSH 的 `@deepseek-ai/dsh-experimental-auto-review` 插件复核工具调用时，把整份规则放在 `options.system` 里（`REVIEW_POLICY`，要求「只返回一个 JSON 对象，不得有其他文本」）。该适配器仅在 `forwardSystemPrompt` 开启时才转发 `options.system`，而此配置默认 `false`，于是模型只拿到了数据段。
+  - 模型随后按编码代理的方式作答（「Based on a…」开头，前面还有计划和自写的测试脚本），调用方的 `JSON.parse` 抛出 `Unexpected token 'B', "Based on a"... is not valid JSON`。结果是每一次被复核的工具调用都以「its body was not executed」被拒绝，而不是被复核。
+  - 适配器本来就能识别这类调用（`isReview`，用于把复核豁免出辅助调用闸门）。现在该判定同时触发系统提示转发，策略无论全局开关如何都会送到模型。普通轮次不受影响：`forwardSystemPrompt` 默认仍为 `false`，非复核调用照旧丢弃系统提示。
+  - 新增测试固定两个方向：复核调用在未开启开关时也转发策略；普通轮次仍只发送裸提示。
+
 ## 0.4.66 (2026-10-19)
 
 ### English

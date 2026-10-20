@@ -1087,6 +1087,48 @@ test('forwardSystemPrompt falls back to role: system message when options.system
   assert.ok(prompt.includes('Please write a test.'))
 })
 
+// Hosts that ask a model to authorize a tool call put the entire output
+// protocol in `options.system` — DSH's auto-review sends REVIEW_POLICY, which
+// demands exactly one JSON object. Dropping it left the model with only the
+// data sections, so it answered in prose and the host's JSON.parse threw
+// ("Unexpected token 'B', \"Based on a\"... is not valid JSON"), denying the
+// tool call instead of reviewing it. The fix forwards the policy for review
+// calls even when the global opt-in is off. Regression for issue #50.
+test('review calls forward the REVIEW_POLICY system prompt without the global opt-in', async () => {
+  const { adapter } = makeAdapter({ forwardSystemPrompt: false })
+  process.env.FAKE_AGY_MODE = 'ok'
+  const argsFile = join(workDir, 'args-review-policy.json')
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+
+  const policy = 'REVIEW_POLICY\nYou are the final authorization reviewer for exactly one pending tool call.\nReturn exactly one JSON object and no other text.'
+  await runTurn(adapter, [
+    msg('user', 'ENVIRONMENT\n{"cwd":"/tmp/project"}\n\nPENDING_ACTION\n{"tool":"bash"}'),
+  ], { sessionId: 'sess-review' as never, system: policy } as never)
+
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const prompt = argv[argv.indexOf('-p') + 1] ?? ''
+  assert.ok(prompt.includes('System instructions:\n' + policy), 'review policy reaches the model')
+  assert.ok(prompt.includes('PENDING_ACTION'), 'the review data sections are still present')
+  assert.ok(prompt.startsWith('System instructions:'), 'the policy leads the prompt')
+})
+
+test('ordinary turns keep dropping the system prompt while the opt-in is off', async () => {
+  const { adapter } = makeAdapter({ forwardSystemPrompt: false })
+  process.env.FAKE_AGY_MODE = 'ok'
+  const argsFile = join(workDir, 'args-no-system.json')
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+
+  await runTurn(adapter, [msg('user', 'what is in this repo?')], {
+    sessionId: 'sess-no-sys' as never,
+    system: 'You are a helpful coding agent.',
+  } as never)
+
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const prompt = argv[argv.indexOf('-p') + 1] ?? ''
+  assert.ok(!prompt.includes('System instructions:'), 'non-review turns stay unchanged')
+  assert.equal(prompt, 'what is in this repo?')
+})
+
 test('unspawnable binary maps to PROCESS_EXIT without hanging', async () => {
   const { adapter } = makeAdapter()
   const argsFile = join(workDir, 'args-x.json')
