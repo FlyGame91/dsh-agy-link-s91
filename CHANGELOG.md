@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.67 (2026-10-20)
 
 ### English
 
