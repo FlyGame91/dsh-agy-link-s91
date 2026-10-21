@@ -14,7 +14,7 @@
 // derived cursor. Text/reasoning streaming and the result envelope behave
 // as before; thinking-only turns stay token-annotated because agy print
 // mode never streams the thoughts themselves.
-import type { StreamChunk, TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { LlmFailure, StreamChunk, TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import * as dshLlm from '@deepseek-ai/dsh-llm'
 import type { AgyEvent, RawUsage } from '../common/types.ts'
 import { mirrorCallId } from './recording.ts'
@@ -523,7 +523,17 @@ export class EventMapper {
    * context occupancy, so a failed turn used to reset the meter and could fire
    * a bogus compaction a step later.
    */
-  *emitFailure(kind: 'error' | 'aborted', code: string, message: string): Generator<StreamChunk> {
+  *emitFailure(
+    kind: 'error' | 'aborted',
+    code: string,
+    message: string,
+    /**
+     * Provider-requested retry delay (ms). Only transport failures state one:
+     * the generic 2s-doubling schedule cannot outlast an egress outage, and the
+     * retry plugin honours this value verbatim (up to the policy's maxDelayMs).
+     */
+    retryAfterMs?: number,
+  ): Generator<StreamChunk> {
     if (this.finished) return
     const close = this.closeOpen()
     if (close) yield close
@@ -534,12 +544,16 @@ export class EventMapper {
         ? usageFromRaw(tracked)
         : { inputTokens: 0, outputTokens: 0 },
     }
+    const failure: LlmFailure = {
+      message,
+      code,
+      ...(retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs > 0
+        ? { providerRetryAfterMs: Math.trunc(retryAfterMs) }
+        : {}),
+    }
     yield {
       type: 'finish',
-      reason:
-        kind === 'error'
-          ? { kind: 'error', failure: { message, code } }
-          : { kind: 'aborted', failure: { message, code } },
+      reason: kind === 'error' ? { kind: 'error', failure } : { kind: 'aborted', failure },
     };
     this.finished = true
   }

@@ -17,7 +17,7 @@ import { classifyToolError } from '../src/host/recording.ts'
 import { defineAgyMirrorTool, parseMirrorInvocation } from '../src/host/mirror-tool.ts'
 import { stripNulBytes } from '../src/host/runner.ts'
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import { defaultConfig, Err, type PluginConfig } from '../src/common/types.ts'
+import { NETWORK_RETRY_DELAYS_MS, defaultConfig, Err, type PluginConfig } from '../src/common/types.ts'
 
 const fakeBin = join(import.meta.dirname, 'fake-agy.mjs')
 const workDir = mkdtempSync(join(tmpdir(), 'agy-adapter-'))
@@ -1535,11 +1535,12 @@ test('soft rate limit signal (model overloaded) becomes a retryable OVERLOADED a
   }
 })
 
-test('transport-shaped auth failure is NETWORK (retryable, rotates) instead of AUTH', async () => {
+test('transport-shaped auth failure is NETWORK (retryable) instead of AUTH', async () => {
   const prevMode = process.env.FAKE_AGY_MODE
   process.env.FAKE_AGY_MODE = 'auth-network'
   const pool = new AccountPoolManager(join(workDir, 'pool-auth-network'))
   const second = pool.createAccountSlot('Second')
+  const initialActive = pool.getActiveAccountId('google')
   try {
     const { adapter } = makeAdapter({}, { pool })
     const chunks = await collect(adapter.stream(opts([msg('user', 'hi')], { sessionId: 'sess-auth-network' as never })))
@@ -1553,7 +1554,66 @@ test('transport-shaped auth failure is NETWORK (retryable, rotates) instead of A
     assert.ok(/transport failure/i.test(finish.reason.failure?.message ?? ''), finish.reason.failure?.message)
     const primary = pool.getAccounts()[0]!
     assert.equal(primary.authRequired, undefined, 'a transport blip must never flag the account for re-login')
-    assert.equal(pool.getPoolData().lastActiveAccountId, second.id, 'the retry must land on another account')
+    // No account owns a proxy here: every account leaves through the same
+    // egress, so rotating the sticky pointer only repoints the session and
+    // spends the rotation budget a real quota/eligibility hop needs.
+    assert.equal(pool.getActiveAccountId('google'), initialActive, 'a shared-egress blip must stay on the current account')
+    assert.notEqual(pool.getActiveAccountId('google'), second.id, 'the shared-egress blip must not hop accounts')
+  } finally {
+    process.env.FAKE_AGY_MODE = prevMode
+  }
+})
+
+test('a transport failure rotates when accounts leave through different proxies', async () => {
+  const prevMode = process.env.FAKE_AGY_MODE
+  process.env.FAKE_AGY_MODE = 'auth-network'
+  const pool = new AccountPoolManager(join(workDir, `pool-auth-network-split-${Date.now()}`))
+  const second = pool.createAccountSlot('Second')
+  // A per-account proxy makes the egress account-scoped: this account's route
+  // to Google can be broken while the next account's route is fine.
+  pool.setAccountProxy(second.id, 'socks5://127.0.0.1:7890')
+  try {
+    const { adapter } = makeAdapter({}, { pool })
+    const chunks = await collect(adapter.stream(opts([msg('user', 'hi')], { sessionId: 'sess-auth-network-split' as never })))
+    const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string } } }
+    assert.equal(finish.reason.failure?.code, Err.NETWORK)
+    assert.equal(pool.getPoolData().lastActiveAccountId, second.id, 'a distinct egress must hand the retry to the other account')
+  } finally {
+    process.env.FAKE_AGY_MODE = prevMode
+  }
+})
+
+test('transport failures ask DSH for a 5s/15s/30s backoff that resets after a success', async () => {
+  const prevMode = process.env.FAKE_AGY_MODE
+  const { adapter } = makeAdapter()
+  const sessionId = 'sess-network-backoff'
+  const failureDelay = async (): Promise<number | undefined> => {
+    const chunks = await collect(adapter.stream(opts([msg('user', 'hi')], { sessionId: sessionId as never })))
+    const finish = chunks[chunks.length - 1] as {
+      type: string
+      reason: { kind: string; failure?: { code: string; providerRetryAfterMs?: number } }
+    }
+    assert.equal(finish.reason.failure?.code, Err.NETWORK, JSON.stringify(finish.reason.failure))
+    return finish.reason.failure?.providerRetryAfterMs
+  }
+  try {
+    // A 14-minute egress outage outlives any short exponential backoff, so the
+    // adapter states the delay it wants instead of letting 2s/4s burn the
+    // whole retry budget inside four seconds (live 2026-10-21 16:43).
+    process.env.FAKE_AGY_MODE = 'auth-network'
+    assert.equal(await failureDelay(), 5_000)
+    assert.equal(await failureDelay(), 15_000, 'the second consecutive transport failure waits longer')
+    assert.equal(await failureDelay(), 30_000)
+    assert.equal(await failureDelay(), 30_000, 'the schedule caps instead of escalating forever')
+
+    process.env.FAKE_AGY_MODE = 'ok'
+    const ok = await collect(adapter.stream(opts([msg('user', 'hi')], { sessionId: sessionId as never })))
+    // An `ok` run may cut on a mirrored tool step; what matters is that the run
+    // SETTLED successfully, which is what clears the transport streak.
+    assert.notEqual((ok[ok.length - 1] as { reason: { kind: string } }).reason.kind, 'error', 'the healthy run must settle')
+
+    process.env.FAKE_AGY_MODE = 'auth-network'
+    assert.equal(await failureDelay(), 5_000, 'a success resets the transport streak')
   } finally {
     process.env.FAKE_AGY_MODE = prevMode
   }
@@ -1637,11 +1697,26 @@ test('quota exhaustion and timeouts are retried so the next account can serve th
   // sticky pointer advanced, but no retry was ever attempted.
   assert.ok(policy.retryableCodes.includes(Err.RATE_LIMIT), 'rate limit must retry onto the next account')
   assert.ok(policy.retryableCodes.includes(Err.TIMEOUT), 'silent timeouts must retry onto the next account')
-  assert.ok(policy.retryableCodes.includes(Err.NETWORK), 'transport failures must retry onto the next account')
+  assert.ok(policy.retryableCodes.includes(Err.NETWORK), 'transport failures must retry (same account when the egress is shared)')
   assert.ok(!(policy.retryableCodes as readonly string[]).includes(Err.AGY_ERROR), 'deterministic AGY_ERRORs stay single-shot')
-  // One account: a single retry, and a sign-out is not worth a second request.
-  assert.equal(policy.maxRetries, 1)
+  // The budget must outlast the 5s/15s/30s transport schedule: an egress
+  // outage that spans minutes used to die after two retries inside 4 seconds
+  // (live 2026-10-21 16:43), so a lone account gets the same three hops.
+  assert.equal(policy.maxRetries, NETWORK_RETRY_DELAYS_MS.length)
   assert.ok(!(policy.retryableCodes as readonly string[]).includes(Err.AUTH), 'a lone account cannot fail over a sign-out')
+})
+
+test('the retry policy can carry the whole transport backoff schedule', () => {
+  const { adapter } = makeAdapter()
+  const policy = adapter.providerRetryPolicy('agy')
+  // A provider delay ABOVE maxDelayMs makes the retry plugin refuse the retry
+  // outright (normal mode returns without scheduling), so the cap must sit at
+  // or past the longest transport delay.
+  assert.ok(policy.maxDelayMs >= 30_000, `maxDelayMs ${policy.maxDelayMs} would discard the 30s transport delay`)
+  assert.ok(policy.maxRetries >= NETWORK_RETRY_DELAYS_MS.length)
+  // Non-transport retries keep their short first delay: only NETWORK states a
+  // provider delay, everything else still backs off from 2s.
+  assert.equal(policy.initialDelayMs, 2_000)
 })
 
 test('the retry budget follows the pool so a 3-account pool fails over twice', () => {
@@ -1652,8 +1727,8 @@ test('the retry budget follows the pool so a 3-account pool fails over twice', (
   const policy = adapter.providerRetryPolicy('agy')
   // With one spare account a stale-token second account turned the single retry
   // into a dead end (live 2026-10-10: primary ELIGIBILITY → g98 "not signed in"
-  // → turn lost). The budget must cover the pool.
-  assert.equal(policy.maxRetries, 2)
+  // → turn lost). The budget must cover the pool…
+  assert.equal(policy.maxRetries, NETWORK_RETRY_DELAYS_MS.length)
   assert.ok(policy.retryableCodes.includes(Err.AUTH), 'with a spare account a sign-out can continue on the next one')
   assert.ok(policy.retryableCodes.includes(Err.ELIGIBILITY))
   assert.ok(policy.retryableCodes.includes(Err.OVERLOADED))

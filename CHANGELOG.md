@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### English
+
+- **Fix: Transport failures outlast a real egress outage, and no longer rotate a shared-egress pool.**
+  - Live case (2026-10-21 16:34–16:48): the machine's proxy answered `CONNECT 200` and then killed TLS for ~14 minutes. Every `agy` run on every account died in its startup probe with `Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF`, which agy wraps as `Eligibility check failed: …`. DSH retried twice inside ~4 seconds and gave up — while the Antigravity desktop's own language server simply kept retrying and recovered.
+  - Transport (`NETWORK`) failures now state their own backoff via `providerRetryAfterMs`: **5s → 15s → 30s** for consecutive failures in one session, reset on success or any non-transport failure, and treated as fresh after 10 minutes of quiet. `providerRetryPolicy` grew to 3 retries with `maxDelayMs: 45s` (the retry plugin *drops* a retry whose requested delay exceeds that cap, so it must sit above the longest transport delay).
+  - A transport failure is only account-scoped when accounts leave through **different** proxies. With a single shared egress (every account on the config/system proxy, including pool accounts seeded with a copy of the system proxy) the retry stays on the current account: the sticky pointer is not advanced, the conversation binding is kept, and the account-rotation budget stays available for real quota/eligibility hops. The in-step failover of a settled recording also skips the budget without changing accounts.
+  - Non-transport retries keep their 2s/4s starting schedule; nothing else about classification (AUTH vs NETWORK vs ELIGIBILITY) changed.
+
+### 中文
+
+- **修复：网络抖动时重试不再 4 秒内放弃，共用出口的号池不再被无意义轮换。**
+  - 实测案例（2026-10-21 16:34–16:48）：本机代理对 `CONNECT` 返回 200 后直接掐断 TLS 长达约 14 分钟。每个账号上每次 `agy` 运行都在启动探测阶段死于 `Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF`，被 agy 包成 `Eligibility check failed: …`。DSH 约 4 秒内重试两次即宣告失败，而 Antigravity 桌面端自己的 language server 只是一直重试，网络恢复后照常工作。
+  - 传输类（`NETWORK`）失败现在通过 `providerRetryAfterMs` 自带退避：同一会话连续失败按 **5s → 15s → 30s** 递增；成功或出现非传输类失败即归零，静默超过 10 分钟后重新从 5s 起算。`providerRetryPolicy` 提升为 3 次重试、`maxDelayMs: 45s`（重试插件对**超过上限**的请求延迟会直接放弃该次重试，因此上限必须高于最长退避）。
+  - 只有当各账号走**不同代理**时，传输失败才算账号级问题。共用同一出口时（所有账号都走配置/系统代理，含新建号池账号被写入系统代理副本的情况）重试留在当前账号：不推进粘性指针、保留会话绑定、也不消耗本该留给配额/资格跳转的轮换预算；已结算记录的步内失败切换同样不再计数、不再换号。
+  - 非传输类重试仍从 2s/4s 起步；AUTH / NETWORK / ELIGIBILITY 的判定逻辑未做任何改动。
+
 ## 0.4.67 (2026-10-20)
 
 ### English

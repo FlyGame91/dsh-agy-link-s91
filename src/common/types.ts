@@ -232,6 +232,72 @@ export function looksLikeNetworkError(message: string): boolean {
 }
 
 /**
+ * Backoff schedule for CONSECUTIVE transport (NETWORK) failures.
+ *
+ * DSH's generic backoff starts at 2s and doubles, which spends the whole retry
+ * budget inside a few seconds. A real egress outage does not look like that:
+ * on 2026-10-21 the machine's proxy answered CONNECT 200 and then killed TLS
+ * for ~14 minutes, so every agy run failed its startup eligibility probe with
+ * `Post "…/loadCodeAssist": EOF` and the turn died after two retries in 4s
+ * while agy itself kept working whenever a gap appeared.
+ *
+ * These delays are stated per failure as `providerRetryAfterMs`, which the
+ * retry plugin honours verbatim — but only up to the policy's maxDelayMs (a
+ * longer request makes it drop the retry entirely), so the cap must stay above
+ * the last entry. The schedule is capped, never unbounded: a dead egress still
+ * ends the turn, just after minutes instead of seconds.
+ */
+export const NETWORK_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 30_000]
+
+/** Delay to request after `consecutiveFailures` transport failures in a row. */
+export function networkRetryDelayMs(consecutiveFailures: number): number {
+  const index = Math.min(
+    Math.max(Math.trunc(consecutiveFailures) - 1, 0),
+    NETWORK_RETRY_DELAYS_MS.length - 1,
+  )
+  return NETWORK_RETRY_DELAYS_MS[index]!
+}
+
+/** The only account facts that decide whether a transport failure is account-scoped. */
+export interface EgressAccount {
+  /** Per-account proxy override; empty/undefined means the global/system proxy. */
+  proxyUrl?: string
+  enabled?: boolean
+}
+
+/**
+ * Whether every ENABLED account leaves through the same proxy.
+ *
+ * When it does, a transport failure is a property of the machine's egress, not
+ * of the account: rotating the pool repoints the session for nothing and burns
+ * the rotation budget that a real quota/eligibility hop needs. Accounts with
+ * their own `proxyUrl` (or one with an override next to the default) can fail
+ * independently, so rotation stays meaningful there.
+ *
+ * `globalProxy` is the proxy an account without an override uses (config
+ * `proxyUrl`, else the detected system proxy). It matters because a newly
+ * created pool account is seeded with a COPY of the system proxy while the
+ * primary/system account keeps an empty override — comparing raw overrides
+ * would call that "two different egresses" and rotate on every blip.
+ *
+ * Disabled accounts are ignored: they are never selected, so their proxy cannot
+ * make the reachable egress distinct.
+ */
+export function accountsShareSingleEgress(
+  accounts: readonly EgressAccount[],
+  globalProxy?: string,
+): boolean {
+  const fallback = (globalProxy ?? '').trim()
+  const urls = new Set<string>()
+  for (const account of accounts) {
+    if (account.enabled === false) continue
+    urls.add((account.proxyUrl ?? '').trim() || fallback)
+    if (urls.size > 1) return false
+  }
+  return true
+}
+
+/**
  * Evidence from agy's OWN per-run log that a stored credential was present but
  * could not be VALIDATED over the network — i.e. jitter wearing an auth costume.
  *

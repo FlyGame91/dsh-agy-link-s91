@@ -8,7 +8,7 @@
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
-import { Err, isAccountScopedFailure, isAuthoritativeAuthError, looksLikeAuthFailure, looksLikeAuthVerificationJitter, looksLikeContextWindowExceeded, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeNetworkError, looksLikeRateLimit, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
+import { Err, NETWORK_RETRY_DELAYS_MS, accountsShareSingleEgress, isAccountScopedFailure, isAuthoritativeAuthError, looksLikeAuthFailure, looksLikeAuthVerificationJitter, looksLikeContextWindowExceeded, looksLikeEligibilityFailure, looksLikeHardRateLimit, looksLikeNetworkError, looksLikeRateLimit, networkRetryDelayMs, shouldMarkAuthRequired, ELIGIBILITY_ERROR_HINT, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
 import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { conversationsDirFor, diffConversations, snapshotConversations } from './discovery.ts'
@@ -486,6 +486,16 @@ export class AgyAdapter extends LlmAdapter {
    */
   private readonly rateLimitFailover = new Map<string, { count: number; firstAt: number }>()
   private static readonly RATE_LIMIT_FAILOVER_WINDOW_MS = 600_000
+  /**
+   * sessionKey -> consecutive transport failures and when the streak started.
+   *
+   * The streak drives the 5s/15s/30s retry delay handed to DSH. A success (or
+   * any non-transport failure) clears it, and a gap longer than the window
+   * treats the next failure as a fresh streak: a user who retries a turn ten
+   * minutes after an outage must not start by waiting 30 seconds.
+   */
+  private readonly networkStreak = new Map<string, { count: number; at: number }>()
+  private static readonly NETWORK_STREAK_WINDOW_MS = 600_000
 
   constructor(private readonly deps: AgyAdapterDeps) {
     super()
@@ -495,6 +505,44 @@ export class AgyAdapter extends LlmAdapter {
     if (this.warnedKeys.has(key)) return
     this.warnedKeys.add(key)
     this.deps.log?.('WARNING: ' + msg)
+  }
+
+  /**
+   * Record one transport failure and return the streak position (1-based).
+   * Position drives the delay requested from DSH.
+   */
+  private noteNetworkFailure(sessionKey: string): number {
+    if (sessionKey === '') return 1
+    const now = Date.now()
+    const prev = this.networkStreak.get(sessionKey)
+    const fresh = prev === undefined || now - prev.at > AgyAdapter.NETWORK_STREAK_WINDOW_MS
+    const count = (fresh ? 0 : prev.count) + 1
+    this.networkStreak.set(sessionKey, { count, at: now })
+    return count
+  }
+
+  /** Drop the transport streak: the session reached Google (or failed another way). */
+  private clearNetworkStreak(sessionKey: string): void {
+    if (sessionKey === '') return
+    this.networkStreak.delete(sessionKey)
+  }
+
+  /**
+   * Whether every enabled account leaves through the same proxy.
+   *
+   * A shared egress makes a transport failure a property of the machine's
+   * network, not of the account: rotating the sticky pointer repoints the
+   * session for nothing and spends the rotation budget a real quota or
+   * eligibility hop needs (live 2026-10-21: one flapping proxy produced EOFs
+   * on every account and the turn still rotated the pool).
+   */
+  private sharesSingleEgress(): boolean {
+    // A pool account is seeded with a COPY of the system proxy while the
+    // primary account keeps an empty override, so the account comparison needs
+    // the same fallback the spawn path uses: config proxy, else detected system.
+    const cfg = this.deps.getConfig()
+    const fallback = (cfg.proxyUrl ?? '').trim() || (detectSystemProxy() ?? '')
+    return accountsShareSingleEgress(this.deps.pool?.getAccounts() ?? [], fallback)
   }
 
   /** Mark a session prompt as no longer in flight so retries are not debounced. */
@@ -513,6 +561,12 @@ export class AgyAdapter extends LlmAdapter {
    */
   private claimFailover(sessionKey: string, code: string | undefined): boolean {
     if (!isAccountScopedFailure(code)) return false
+    // A transport failure on a SHARED egress is account-scoped in name only:
+    // the step must still be re-run (the settled recording would otherwise be
+    // replayed verbatim), but nothing is wrong with the account, so no rotation
+    // budget is spent and the sticky pointer stays put. DSH's own retry budget
+    // (three hops for NETWORK) still bounds the re-runs.
+    if (code === Err.NETWORK && this.sharesSingleEgress()) return true
     const enabled = (this.deps.pool?.getAccounts() ?? []).filter((a) => a.enabled).length
     const max = Math.max(1, enabled - 1)
     const now = Date.now()
@@ -569,12 +623,23 @@ export class AgyAdapter extends LlmAdapter {
     // on the next account instead of interrupting it. With one account the
     // retry would just burn a second request against the same dead login.
     if (enabledAccounts >= 2) retryableCodes.push(Err.AUTH)
+    // Two budgets in one number:
+    //  - the pool needs one hop per spare account (a spent/expired account must
+    //    not dead-end the turn while a healthy one sits idle),
+    //  - transport failures need enough hops to survive the 5s/15s/30s schedule
+    //    stated as providerRetryAfterMs. A 14-minute egress outage (live
+    //    2026-10-21 16:43) exhausted the old 2-hop/4s budget instantly.
+    // Whichever is larger wins; every extra hop is bounded (pool depth for the
+    // account-scoped codes, the fixed schedule for NETWORK).
+    const poolHops = enabledAccounts >= 3 ? 2 : 1
     return {
       mode: 'normal' as const,
-      maxRetries: enabledAccounts >= 3 ? 2 : 1,
+      maxRetries: Math.max(poolHops, NETWORK_RETRY_DELAYS_MS.length),
       retryableCodes,
       initialDelayMs: 2_000,
-      maxDelayMs: 10_000,
+      // Must stay at or above the longest transport delay: the retry plugin
+      // DROPS a retry whose providerRetryAfterMs exceeds maxDelayMs.
+      maxDelayMs: 45_000,
       jitterRatio: 0.1,
     }
   }
@@ -794,7 +859,8 @@ export class AgyAdapter extends LlmAdapter {
         this.deps.runs.forget(continuation.runId)
         this.warnOnce(
           'dead-continuation:' + continuation.runId,
-          'agy run ' + continuation.runId + ' settled in ' + (deadFailure?.code ?? '') + ' — retrying this step on another account instead of replaying it',
+          'agy run ' + continuation.runId + ' settled in ' + (deadFailure?.code ?? '') + ' — retrying this step instead of replaying it'
+            + (deadFailure?.code === Err.NETWORK && this.sharesSingleEgress() ? ' on the same account (shared egress)' : ' on another account'),
         )
       } else {
         this.warnOnce(
@@ -1773,7 +1839,7 @@ export class AgyAdapter extends LlmAdapter {
       // black hole (unreachable Google / wedged credential), not a long tool:
       // the retry must try a different account rather than the same dead one.
       const silentTimeout = outcome.timedOut === true && outcome.stdout.trim() === ''
-      let failure: { kind: 'error' | 'aborted'; code: string; message: string } | null = null
+      let failure: { kind: 'error' | 'aborted'; code: string; message: string; retryAfterMs?: number } | null = null
       if (outcome.aborted) {
         failure = { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' }
       } else if (outcome.timedOut) {
@@ -1876,6 +1942,18 @@ export class AgyAdapter extends LlmAdapter {
           failure = { kind: 'error', code: Err.INVALID_OUTPUT, message: 'agy produced no result event (' + parser.stats.garbage + ' unparseable lines)' }
         }
       }
+      // Transport failures carry their own backoff. DSH's generic schedule
+      // (2s, doubling) cannot outlast an egress outage: on 2026-10-21 a proxy
+      // flapped for ~14 minutes and the whole retry budget was spent in four
+      // seconds, so every turn died mid-outage. The streak resets on success
+      // and on any non-transport failure, so only a sustained outage escalates.
+      if (failure !== null) {
+        if (failure.code === Err.NETWORK) {
+          failure.retryAfterMs = networkRetryDelayMs(this.noteNetworkFailure(sessionKey))
+        } else {
+          this.clearNetworkStreak(sessionKey)
+        }
+      }
       rec.settle(failure)
       // A newer run may already own this session (steer preemption whose
       // bounded settle wait expired). Its own handler writes the authoritative
@@ -1887,6 +1965,7 @@ export class AgyAdapter extends LlmAdapter {
         if (account) this.deps.pool?.recordSuccess(account.id, family)
         this.failoverBudget.delete(sessionKey)
         this.rateLimitFailover.delete(sessionKey)
+        this.clearNetworkStreak(sessionKey)
         if (!isAux && sessionAccountKey !== '' && !superseded) {
           const finalId = binding !== undefined ? binding.conversationId : conversationId
           if (finalId) {
@@ -1935,8 +2014,15 @@ export class AgyAdapter extends LlmAdapter {
         // Server capacity overload (OVERLOADED / 503 / 529): Google-side pressure.
         // We deliberately STAY on the current account with exponential backoff rather
         // than rotating, protecting healthy accounts in the pool from cascaded exhaustion.
+        //
+        // A transport failure only belongs on that list when the accounts have
+        // SEPARATE egress. With one shared proxy the failure says nothing about
+        // the account: rotating repoints the session, drops the conversation
+        // binding and spends the rotation budget a quota hop needs.
+        const sharedEgressNetwork = failure.code === Err.NETWORK && this.sharesSingleEgress()
         const rotateAway = !outcome.aborted && failure.code !== Err.RATE_LIMIT
           && failure.code !== Err.OVERLOADED
+          && !sharedEgressNetwork
           && (failure.code === Err.NETWORK
             || failure.code === Err.AUTH)
         if (rotateAway && account) this.deps.pool?.advanceAccount(account.id, family)
@@ -2199,7 +2285,7 @@ export class AgyAdapter extends LlmAdapter {
         if (!mapper.isFinished && !abortedLocally && !signal?.aborted) {
           const f = rec.failureInfo
           if (f !== null) {
-            for (const ch of mapper.emitFailure(f.kind, f.code, f.message)) queue.push(ch)
+            for (const ch of mapper.emitFailure(f.kind, f.code, f.message, f.retryAfterMs)) queue.push(ch)
           } else {
             for (const ch of mapper.emitFailure('error', Err.INVALID_OUTPUT, 'agy stream ended without a result event')) queue.push(ch)
           }

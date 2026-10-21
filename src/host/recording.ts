@@ -21,6 +21,12 @@ export interface RecordingFailure {
   kind: 'error' | 'aborted'
   code: string
   message: string
+  /**
+   * Delay the failure asks DSH to wait before retrying (ms). Only transport
+   * failures state one: the generic exponential schedule is far too short to
+   * outlast an egress outage (see NETWORK_RETRY_DELAYS_MS).
+   */
+  retryAfterMs?: number
 }
 
 /** Status guidance only: retain the original tool error for replay and logs. */
