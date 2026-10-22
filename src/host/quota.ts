@@ -78,11 +78,35 @@ export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
 
 export const OAUTH_USERINFO_URL = 'https://www.googleapis.com/oauth2/v1/userinfo'
 
+/**
+ * The backend classifies the caller by its `User-Agent` and only returns the
+ * separate `Gemini 4 Argon` quota group for the CLI product (`antigravity/cli/`)
+ * at or above this version. Older/other product strings get the legacy two
+ * groups, which is why Pro-plan users saw no Argon quota at all.
+ */
+export const AGY_UA_MIN_VERSION = '1.3.0'
+/** Used when the installed agy version is unknown or older than AGY_UA_MIN_VERSION. */
+const AGY_UA_FALLBACK_VERSION = '1.4.5'
+
+function semverAtLeast(candidate: string | null | undefined, floor: string): boolean {
+  if (!candidate) return false
+  const a = candidate.match(/^(\d+)\.(\d+)\.(\d+)$/)
+  const b = floor.match(/^(\d+)\.(\d+)\.(\d+)$/)
+  if (!a || !b) return false
+  for (let i = 1; i <= 3; i += 1) {
+    const x = Number(a[i])
+    const y = Number(b[i])
+    if (x !== y) return x > y
+  }
+  return true
+}
+
 /** Platform-faithful agy User-Agent (hardcoding darwin/arm64 on Windows is a bad fingerprint). */
-export function agyUserAgent(version = '2.24.0'): string {
+export function agyUserAgent(version?: string | null): string {
   const os = process.platform === 'win32' ? 'windows' : process.platform
   const arch = process.arch === 'x64' ? 'amd64' : process.arch
-  return `antigravity/${version} ${os}/${arch}`
+  const v = semverAtLeast(version, AGY_UA_MIN_VERSION) ? version! : AGY_UA_FALLBACK_VERSION
+  return `antigravity/cli/${v} (aidev_client; os_type=${os}; arch=${arch}; auth_method=consumer)`
 }
 
 /**
@@ -383,6 +407,11 @@ export class QuotaService {
   constructor(
     private readonly pool: AccountPoolManager,
     private readonly globalProxy: () => string = () => '',
+    /**
+     * Resolves the installed agy version for the quota/model User-Agent.
+     * Injected because the version probe lives in the plugin entry point.
+     */
+    private readonly agyVersion: () => string | null = () => null,
   ) {}
 
   /** Dedicated account proxy wins, then the global config proxy, then detected system proxy. */
@@ -627,7 +656,7 @@ export class QuotaService {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': agyUserAgent(),
+        'User-Agent': agyUserAgent(this.agyVersion()),
       },
       body: JSON.stringify({}),
     }, proxyUrl)
@@ -692,7 +721,7 @@ export class QuotaService {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': agyUserAgent(),
+        'User-Agent': agyUserAgent(this.agyVersion()),
       },
       body: JSON.stringify({}),
     }, proxyUrl)
@@ -733,7 +762,7 @@ export class QuotaService {
           headers: {
             Authorization: `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
-            'User-Agent': agyUserAgent(),
+            'User-Agent': agyUserAgent(this.agyVersion()),
           },
           body: JSON.stringify({}),
         }, proxyUrl)

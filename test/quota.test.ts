@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
-import { QuotaService, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
+import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
@@ -1043,3 +1043,31 @@ test('Argon model quota populates weeklyFraction when summary has no weekly argo
 
 
 
+
+test('agyUserAgent emits the CLI product string the backend needs for Argon', () => {
+  // Regression: the UA used to be `antigravity/<version> <os>/<arch>`, which the
+  // backend classifies as a non-CLI product, so `retrieveUserQuotaSummary`
+  // answered with only the Gemini/3P groups and the Pro-plan Argon group was
+  // never present — the UI silently showed no Argon quota at all.
+  const fallback = agyUserAgent()
+  assert.match(fallback, /^antigravity\/cli\/\d+\.\d+\.\d+ \(aidev_client; os_type=/)
+  assert.ok(fallback.includes('auth_method=consumer'), 'keeps the CLI identity markers')
+  assert.ok(!fallback.includes('antigravity/2.'), 'must not use the old non-CLI product form')
+
+  // A real, new-enough agy version is forwarded verbatim.
+  assert.ok(agyUserAgent('1.4.5').includes('antigravity/cli/1.4.5 '))
+  assert.ok(agyUserAgent('1.5.0').includes('antigravity/cli/1.5.0 '))
+
+  // Anything older than the floor (or unparseable) falls back, because those
+  // builds never received the Argon group in the first place.
+  assert.ok(!agyUserAgent('1.2.2').includes('cli/1.2.2'), 'below floor must not claim a new version')
+  assert.ok(!agyUserAgent('garbage').includes('garbage'))
+  assert.ok(!agyUserAgent(null).includes('null'))
+})
+
+test('QuotaService accepts an agy version provider without touching the network', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-ua-'))
+  const pool = new AccountPoolManager(dir)
+  const quota = new QuotaService(pool, () => '', () => '1.4.5')
+  assert.ok(quota instanceof QuotaService)
+})
