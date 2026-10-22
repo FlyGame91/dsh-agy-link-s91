@@ -1,6 +1,6 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFullToolArgs, readStepThoughts, extractStepThoughts, clearAgyDbCache, isSafeConversationId, findConversationDb, conversationsDirCandidates, __setAgyDbDirForTest } from '../src/host/agy-db.ts'
+import { readFullToolArgs, readStepThoughts, extractStepThoughts, clearAgyDbCache, isSafeConversationId, findConversationDb, conversationsDirCandidates, __setAgyDbDirForTest, __setNodeSqliteQueryForTest } from '../src/host/agy-db.ts'
 
 import { join } from 'node:path'
 import { mkdtemp, writeFile, rm } from 'node:fs/promises'
@@ -170,4 +170,163 @@ test('findConversationDb searches isolated pool account homes (thinking path)', 
   const cands = conversationsDirCandidates(accHome)
   assert.equal(cands[0], dbDir)
   assert.ok(cands.length >= 2)
+})
+
+test('issue #52: direct SQLite read handles active WAL and truncated WAL without copyFile busy loop', async (t) => {
+  let Database: new (path: string) => {
+    exec(sql: string): unknown
+    prepare(sql: string): { run(...p: unknown[]): unknown }
+    close(): void
+  }
+  try {
+    ({ DatabaseSync: Database } = await import('node:sqlite') as {
+      DatabaseSync: new (path: string) => {
+        exec(sql: string): unknown
+        prepare(sql: string): { run(...p: unknown[]): unknown }
+        close(): void
+      }
+    })
+  } catch {
+    return t.skip('node:sqlite unavailable')
+  }
+
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { statSync } = await import('node:fs')
+  const testRoot = await mkdtemp(join(tmpdir(), 'agy-db-wal-test-'))
+  t.after(async () => {
+    __setNodeSqliteQueryForTest(undefined)
+    await rm(testRoot, { recursive: true, force: true })
+  })
+
+  const convId = 'conv-wal-active'
+  const dbPath = join(testRoot, `${convId}.db`)
+
+  const toolPayload = buildStepPayload('write_to_file', {
+    CodeContent: 'console.log("wal test")',
+    TargetFile: '/tmp/test.ts',
+  })
+  const thoughtText = 'Inspecting WAL resilience under active truncation.'
+  const thoughtPayload = buildThoughtStepPayload(thoughtText)
+
+  // Initialize DB in WAL mode with active WAL entries
+  const db = new Database(dbPath)
+  db.exec('PRAGMA journal_mode = WAL;')
+  db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);')
+  db.prepare(`INSERT INTO steps (idx,step_type,status,step_payload) VALUES (1,132,3,X'${toolPayload.toString('hex')}');`).run()
+  db.prepare(`INSERT INTO steps (idx,step_type,status,step_payload) VALUES (2,14,3,X'${thoughtPayload.toString('hex')}');`).run()
+  // Keep connection open so WAL and SHM remain active
+  db.prepare(`INSERT INTO steps (idx,step_type,status,step_payload) VALUES (3,132,3,X'${toolPayload.toString('hex')}');`).run()
+
+  __setAgyDbDirForTest(testRoot)
+  clearAgyDbCache()
+
+  // 1. Read under active WAL mode via node:sqlite
+  const startActive = Date.now()
+  const activeTool = await readFullToolArgs(convId, 1)
+  const activeThought = await readStepThoughts(convId, 2)
+  const elapsedActive = Date.now() - startActive
+  assert.ok(elapsedActive < 2000, `active WAL read must not hang (took ${elapsedActive}ms)`)
+  assert.equal(activeTool?.name, 'write_to_file')
+  assert.equal(activeThought, thoughtText)
+
+  // 2. Truncate WAL via SQLite checkpoint (simulates SQLite checkpoint/truncate
+  // which previously triggered libuv copyFile busy loop if racing a copy)
+  clearAgyDbCache()
+  db.exec('PRAGMA wal_checkpoint(TRUNCATE);')
+  assert.equal(statSync(dbPath + '-wal').size, 0, 'WAL should be truncated to 0')
+
+  const startTruncated = Date.now()
+  const truncatedTool = await readFullToolArgs(convId, 1)
+  const elapsedTruncated = Date.now() - startTruncated
+  assert.ok(elapsedTruncated < 2000, `truncated WAL read must complete quickly without busy loop (took ${elapsedTruncated}ms)`)
+  assert.equal(truncatedTool?.name, 'write_to_file')
+
+  // 3. Write new steps into the truncated WAL and read again
+  clearAgyDbCache()
+  const thought2 = 'Second thought written into fresh WAL post-truncate.'
+  db.prepare(`INSERT INTO steps (idx,step_type,status,step_payload) VALUES (4,14,3,X'${buildThoughtStepPayload(thought2).toString('hex')}');`).run()
+  assert.ok(statSync(dbPath + '-wal').size > 0, 'WAL should have new frames')
+
+  const postTruncateThought = await readStepThoughts(convId, 4)
+  assert.equal(postTruncateThought, thought2)
+
+  db.close()
+})
+
+test('issue #52: fallback to sqlite3 CLI directly on dbPath without copyFile', async (t) => {
+  if (!sqliteOk) return t.skip('sqlite3 CLI unavailable')
+
+  let Database: new (path: string) => {
+    exec(sql: string): unknown
+    prepare(sql: string): { run(...p: unknown[]): unknown }
+    close(): void
+  }
+  try {
+    ({ DatabaseSync: Database } = await import('node:sqlite') as {
+      DatabaseSync: new (path: string) => {
+        exec(sql: string): unknown
+        prepare(sql: string): { run(...p: unknown[]): unknown }
+        close(): void
+      }
+    })
+  } catch {
+    return t.skip('node:sqlite unavailable')
+  }
+
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const testRoot = await mkdtemp(join(tmpdir(), 'agy-db-cli-test-'))
+  t.after(async () => {
+    __setNodeSqliteQueryForTest(undefined)
+    await rm(testRoot, { recursive: true, force: true })
+  })
+
+  const convId = 'conv-cli-direct'
+  const dbPath = join(testRoot, `${convId}.db`)
+
+  const toolPayload = buildStepPayload('read_file', {
+    Path: '/tmp/test.txt',
+  })
+  const thoughtText = 'Fallback CLI reading direct database file.'
+  const thoughtPayload = buildThoughtStepPayload(thoughtText)
+
+  const db = new Database(dbPath)
+  db.exec('PRAGMA journal_mode = WAL;')
+  db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);')
+  db.prepare(`INSERT INTO steps (idx,step_type,status,step_payload) VALUES (10,132,3,X'${toolPayload.toString('hex')}');`).run()
+  db.prepare(`INSERT INTO steps (idx,step_type,status,step_payload) VALUES (11,15,3,X'${thoughtPayload.toString('hex')}');`).run()
+  db.close()
+
+  __setAgyDbDirForTest(testRoot)
+  // Force node:sqlite unavailable to exercise the sqlite3 CLI fallback path
+  __setNodeSqliteQueryForTest(null)
+  clearAgyDbCache()
+
+  const start = Date.now()
+  const tool = await readFullToolArgs(convId, 10)
+  const thought = await readStepThoughts(convId, 11)
+  const elapsed = Date.now() - start
+
+  assert.ok(elapsed < 3000, `sqlite3 CLI fallback took ${elapsed}ms`)
+  assert.equal(tool?.name, 'read_file')
+  assert.equal((tool as { args: { Path?: string } })?.args?.Path, '/tmp/test.txt')
+  assert.equal(thought, thoughtText)
+
+  __setNodeSqliteQueryForTest(undefined)
+})
+
+test('zero-byte DB file returns null gracefully without error', async (t) => {
+  const { mkdtemp, rm, writeFile } = await import('node:fs/promises')
+  const testRoot = await mkdtemp(join(tmpdir(), 'agy-db-zero-test-'))
+  t.after(async () => {
+    await rm(testRoot, { recursive: true, force: true })
+  })
+
+  const convId = 'conv-zero'
+  await writeFile(join(testRoot, `${convId}.db`), Buffer.alloc(0))
+
+  __setAgyDbDirForTest(testRoot)
+  clearAgyDbCache()
+
+  assert.equal(await readFullToolArgs(convId, 1), null)
+  assert.equal(await readStepThoughts(convId, 1), null)
 })

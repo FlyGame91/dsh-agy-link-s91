@@ -4,6 +4,11 @@
 
 ### English
 
+- **Fix: DSH Host 100% CPU busy loop on macOS caused by copying active SQLite WAL files (Fixes #52).**
+  - Root cause: `loadAgyDbData()` previously copied `conversation.db`, `-wal`, and `-shm` to a temporary directory before querying tool step parameters and model thoughts. On macOS (and other BSD-derived libuv platforms), when an active SQLite WAL file is checkpointed or truncated to 0 during `copyFile`, libuv's `uv_fs_copyfile` enters an infinite busy loop in a worker thread, causing the Host process to permanently consume 100% of a CPU core.
+  - Solution: Replaced file copying with direct SQLite reads (`node:sqlite` DatabaseSync with `readOnly: true`, falling back to `sqlite3` CLI with `-cmd ".timeout 2000" -cmd "PRAGMA query_only = ON;"`). SQLite's native WAL architecture provides atomic, consistent MVCC read snapshots concurrently with active writers without blocking or file-copying races.
+  - Added regression test covering active WAL querying, WAL truncation/checkpointing during active use, sqlite3 CLI fallback, and zero-byte database handling.
+
 - **Fix: Transport failures outlast a real egress outage, and no longer rotate a shared-egress pool.**
   - Live case (2026-10-21 16:34–16:48): the machine's proxy answered `CONNECT 200` and then killed TLS for ~14 minutes. Every `agy` run on every account died in its startup probe with `Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF`, which agy wraps as `Eligibility check failed: …`. DSH retried twice inside ~4 seconds and gave up — while the Antigravity desktop's own language server simply kept retrying and recovered.
   - Transport (`NETWORK`) failures now state their own backoff via `providerRetryAfterMs`: **5s → 15s → 30s** for consecutive failures in one session, reset on success or any non-transport failure, and treated as fresh after 10 minutes of quiet. `providerRetryPolicy` grew to 3 retries with `maxDelayMs: 45s` (the retry plugin *drops* a retry whose requested delay exceeds that cap, so it must sit above the longest transport delay).
@@ -11,6 +16,11 @@
   - Non-transport retries keep their 2s/4s starting schedule; nothing else about classification (AUTH vs NETWORK vs ELIGIBILITY) changed.
 
 ### 中文
+
+- **修复：macOS 下复制活跃 SQLite WAL 时触发 libuv `copyFile` 忙循环导致 DSH Host 持续 100% CPU（修复 #52）。**
+  - 原因分析：`loadAgyDbData()` 此前在读取工具参数和思考内容时，顺序将 `conversation.db`、`-wal` 和 `-shm` 复制到临时目录。在 macOS（以及其他基于 BSD 的 libuv 平台）上，当活跃 WAL 文件在复制过程中被 SQLite checkpoint 截短为 0 字节时，libuv 的 `uv_fs_copyfile` 工作线程会陷入无限忙循环，导致 DSH Host 进程持续耗尽单核 100% CPU。
+  - 修复方案：完全移除临时目录与文件复制逻辑，改为直接通过 SQLite 引擎一致性读取（优先使用 `node:sqlite` 的 `DatabaseSync` 只读模式并开启 `PRAGMA query_only = ON;` 与 `busy_timeout`，后备使用 `sqlite3` CLI）。SQLite WAL 模式天然支持多读一写并发 MVCC 快照，既消除了文件截短忙循环与临时文件 I/O 争用，又保证了读取一致性。
+  - 补充回归测试：覆盖活跃 WAL 读取、WAL 截短/检查点处理、sqlite3 CLI 后备路径及 0 字节文件防御。
 
 - **修复：网络抖动时重试不再 4 秒内放弃，共用出口的号池不再被无意义轮换。**
   - 实测案例（2026-10-21 16:34–16:48）：本机代理对 `CONNECT` 返回 200 后直接掐断 TLS 长达约 14 分钟。每个账号上每次 `agy` 运行都在启动探测阶段死于 `Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF`，被 agy 包成 `Eligibility check failed: …`。DSH 约 4 秒内重试两次即宣告失败，而 Antigravity 桌面端自己的 language server 只是一直重试，网络恢复后照常工作。

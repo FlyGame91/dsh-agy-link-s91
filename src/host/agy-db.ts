@@ -11,17 +11,16 @@
 // stores the COMPLETE tool arguments as protobuf-encoded step_payload blobs.
 // Each tool step's payload contains a JSON string with the full parameter object.
 //
-// This module lazily reads the agy DB (via sqlite3 CLI, copying to temp to
-// avoid WAL locks), extracts full JSON parameters for every tool step, and
+// This module lazily reads the agy DB directly (via node:sqlite or sqlite3 CLI
+// in read-only / query-only mode), extracts full JSON parameters for every tool step, and
 // caches them keyed by (conversationId, stepIndex). The mapper then uses
 // these to construct accurate agy_tool arguments — enabling diff cards to
 // show the real oldText/newText content.
 import { execFile } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
-import { chmod, mkdtemp, readFile, unlink, copyFile, stat, mkdir, rm } from 'node:fs/promises'
+import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -289,7 +288,8 @@ async function queryViaNodeSqlite(dbPath: string, sql: string): Promise<string[]
 	if (nodeSqliteQuery === undefined) {
 		try {
 			const mod = (await import('node:sqlite')) as {
-				DatabaseSync?: new (path: string, options?: { open?: boolean }) => {
+				DatabaseSync?: new (path: string, options?: { open?: boolean; readOnly?: boolean }) => {
+					exec(sql: string): unknown
 					prepare(sql: string): { all(...params: unknown[]): unknown[] }
 					close(): void
 				}
@@ -297,10 +297,19 @@ async function queryViaNodeSqlite(dbPath: string, sql: string): Promise<string[]
 			if (typeof mod.DatabaseSync !== 'function') throw new Error('DatabaseSync missing')
 			const Database = mod.DatabaseSync
 			nodeSqliteQuery = async (p, q) => {
-				// Open read-write so the copied -wal can be replayed into the
-				// temp copy; the copy is ours and chmod'd 0600.
-				const db = new Database(p)
+				let db: {
+					exec(sql: string): unknown
+					prepare(sql: string): { all(...params: unknown[]): unknown[] }
+					close(): void
+				}
 				try {
+					db = new Database(p, { readOnly: true })
+				} catch {
+					db = new Database(p)
+				}
+				try {
+					try { db.exec('PRAGMA busy_timeout = 2000;') } catch { /* ignore */ }
+					try { db.exec('PRAGMA query_only = ON;') } catch { /* ignore */ }
 					const rows = db.prepare(q).all() as Array<{ idx?: unknown; step_type?: unknown; payload_hex?: unknown }>
 					return rows.map((r) => `${String(r.idx)}|${String(r.step_type)}|${typeof r.payload_hex === 'string' ? r.payload_hex : ''}`)
 				} finally {
@@ -316,9 +325,13 @@ async function queryViaNodeSqlite(dbPath: string, sql: string): Promise<string[]
 }
 
 /**
- * Copy the agy SQLite DB to a temp path (avoiding WAL lock issues), then
- * query tool and thought step payloads — node:sqlite first, sqlite3 CLI as
- * the fallback reader.
+ * Query tool and thought step payloads directly from the agy SQLite DB —
+ * node:sqlite first, sqlite3 CLI as the fallback reader.
+ *
+ * Direct read avoids the file-copy busy loop on macOS (issue #52) where
+ * libuv uv_fs_copyfile spins at 100% CPU if an active WAL file is truncated
+ * during copy. SQLite WAL mode provides concurrent read MVCC snapshots
+ * natively without copying to temp.
  */
 async function loadAgyDbData(conversationId: string, accountHome?: string): Promise<AgyDbData> {
   const steps = new Map<number, CachedStep>()
@@ -328,31 +341,29 @@ async function loadAgyDbData(conversationId: string, accountHome?: string): Prom
   const dbPath = findConversationDb(conversationId, accountHome)
   if (dbPath === null) return { steps, thoughts, seenSteps }
 
-  // Copy to temp to avoid WAL/shared-lock issues. Also copy -wal and -shm so
-  // recent writes in WAL mode are visible. A private mkdtemp directory (0700)
-  // replaces the old predictable /tmp filename, and the copy is chmod'd 0600:
-  // the DB carries the full conversation content and inherited the source
-  // file's permissions before.
-  let tmpDir: string | null = null
-  const tmpDb = join(tmpdir(), `agy-db-${conversationId.slice(0, 8)}-${Date.now()}.db`)
   try {
-    tmpDir = await mkdtemp(join(tmpdir(), 'agy-db-'))
-    const target = join(tmpDir, 'conversation.db')
-    await copyFile(dbPath, target)
-    await chmod(target, 0o600).catch(() => undefined)
-    try { await copyFile(dbPath + '-wal', target + '-wal') } catch { /* ignore */ }
-    try { await copyFile(dbPath + '-shm', target + '-shm') } catch { /* ignore */ }
+    const st = await stat(dbPath)
+    if (st.size === 0) return { steps, thoughts, seenSteps }
+  } catch {
+    return { steps, thoughts, seenSteps }
+  }
 
+  try {
     // Query tool-type steps AND text/thinking steps with payload > 20 bytes.
     // node:sqlite first (no external binary — desktop hosts, issue #43);
     // the sqlite3 CLI stays as the fallback for runtimes without node:sqlite.
     const sql = `SELECT idx, step_type, hex(step_payload) AS payload_hex FROM steps WHERE (step_type IN (5,7,8,9,14,15,17,21,33,101,132,138,139)) AND length(step_payload) > 20`
     let lines: string[] | null = null
     try {
-      lines = await queryViaNodeSqlite(target, sql)
+      lines = await queryViaNodeSqlite(dbPath, sql)
     } catch {
       try {
-        const { stdout } = await execFileAsync('sqlite3', [target, sql], {
+        const { stdout } = await execFileAsync('sqlite3', [
+          '-cmd', '.timeout 2000',
+          '-cmd', 'PRAGMA query_only = ON;',
+          dbPath,
+          sql,
+        ], {
           timeout: 5_000,
           encoding: 'utf-8',
           maxBuffer: 25 * 1024 * 1024,
@@ -416,14 +427,6 @@ async function loadAgyDbData(conversationId: string, accountHome?: string): Prom
       } catch {
         // ignore
       }
-    }
-  } finally {
-    if (tmpDir !== null) {
-      try { await rm(tmpDir, { recursive: true, force: true }) } catch { /* ignore cleanup errors */ }
-    } else {
-      try { await unlink(tmpDb) } catch { /* ignore cleanup errors */ }
-      try { await unlink(tmpDb + '-wal') } catch { /* ignore */ }
-      try { await unlink(tmpDb + '-shm') } catch { /* ignore */ }
     }
   }
 
@@ -639,6 +642,7 @@ export function clearAgyDbCache(): void {
   cache = null
   lastFailureAt = 0
   failureWindowMs = 0
+  warnedUnavailable = false
 }
 
 /**
@@ -652,4 +656,16 @@ export function __setAgyDbDirForTest(dir: string): void {
   cacheTime = 0
   lastFailureAt = 0
   failureWindowMs = 0
+  warnedUnavailable = false
+}
+
+/**
+ * TEST-ONLY injection: override the node:sqlite reader function.
+ * Pass null to simulate node:sqlite missing (forcing sqlite3 CLI fallback),
+ * or undefined to reset back to automatic probing.
+ */
+export function __setNodeSqliteQueryForTest(
+  fn: ((dbPath: string, sql: string) => Promise<string[]>) | null | undefined,
+): void {
+  nodeSqliteQuery = fn
 }
