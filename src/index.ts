@@ -164,16 +164,19 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   }
 
   const catalog = new ModelCatalog(
-    async (signal) => {
+    async (signal, accountId) => {
       const b = bin()
       if (!b) throw new Error('agy binary not found')
       // agy models has no --output-format flag (verified against 1.1.13);
       // it prints a two-column text table. parseModelsOutput handles both.
       const poolData = pool.getPoolData()
-      const primaryAcc = poolData.primaryAccountId ? pool.getAccount(poolData.primaryAccountId) : undefined
-      const candidateAccount = (primaryAcc && primaryAcc.enabled && !primaryAcc.authRequired)
-        ? primaryAcc
-        : pool.getAccounts().find((a) => a.enabled && !a.authRequired)
+      const targetAcc = accountId ? pool.getAccount(accountId) : undefined
+      const activeId = pool.getActiveAccountId('google') ?? poolData.lastActiveAccountId ?? poolData.primaryAccountId
+      const candidateAccount = (targetAcc && targetAcc.enabled && !targetAcc.authRequired)
+        ? targetAcc
+        : (activeId ? pool.getAccount(activeId) : undefined)
+        ?? (poolData.primaryAccountId ? pool.getAccount(poolData.primaryAccountId) : undefined)
+        ?? pool.getAccounts().find((a) => a.enabled && !a.authRequired)
 
       let out = await probeProcess(b, ['models'], 30_000, signal, getDiscoveryEnv(candidateAccount), getConfig().suppressAgyAutoUpdate)
 
@@ -878,6 +881,9 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         const body = await readBody(req)
         const id = typeof body.id === 'string' ? body.id : ''
         const ok = id !== '' && pool.setActiveAccount(id)
+        if (ok) {
+          void catalog.forceRefresh(id).then(() => notifyPicker()).catch(() => notifyPicker())
+        }
         sendJson(res as RawRes, ok ? 200 : 400, { ok, pool: pool.getPoolData() })
       })()
     }})
@@ -990,7 +996,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   ctx.effect(() => {
     if (!getConfig().enabled) return () => undefined
     const refresh = (): void => {
-      void quota.refreshAllQuotas().catch(() => undefined)
+      void quota.refreshAllQuotas().then(() => notifyPicker()).catch(() => undefined)
     }
     const boot = setTimeout(refresh, 5_000)
     boot.unref?.()

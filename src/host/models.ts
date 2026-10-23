@@ -5,6 +5,8 @@
 // (agy rejects --effort for Claude/GPT-OSS). Discovery failure falls back to
 // a bundled catalog so the /model picker is never empty.
 import type { FallbackModelDef, PluginConfig } from '../common/types.ts'
+import type { ManagedAccount } from '../common/pool-types.ts'
+import type { AccountPoolManager } from './pool.ts'
 
 export interface RawModel { slug: string; label: string }
 
@@ -21,6 +23,39 @@ export interface Catalog {
   discoveredAt: number
   /** Last discovery error, surfaced by /agy models and doctor. */
   lastError?: string
+}
+
+/** Check if a model identifier belongs to the Gemini 4 Argon family. */
+export function isArgonModel(id: string): boolean {
+  return id.trim().toLowerCase().includes('argon')
+}
+
+/**
+ * Determine whether a managed account has confirmed access to the Gemini 4 Argon family.
+ * Argon is exclusive to paid Pro/Ultra plans and returns a separate quota bucket
+ * and/or dedicated model list from agy cli. Free/standard accounts do not have Argon.
+ */
+export function accountHasArgon(
+  acc?: ManagedAccount | null,
+  pool?: AccountPoolManager | null,
+  catalog?: Catalog,
+): boolean {
+  if (!acc) return false
+  // 1. Authoritative quota bucket
+  if (acc.quotas?.argon !== undefined) return true
+  // 2. Pool recorded dedicated Argon quota group (PR #54)
+  if (pool && typeof pool.hasDedicatedGroup === 'function' && pool.hasDedicatedGroup(acc.id, 'argon')) return true
+  // 3. Per-model quotas reported an argon model
+  if (acc.quotas?.google?.models?.some((m) => isArgonModel(m.modelId))) return true
+  // 4. If this account's discovered catalog contains argon
+  if (catalog && catalog.source === 'discovered') {
+    return catalog.models.some((m) => isArgonModel(m.id))
+  }
+  // 5. If quota was polled and has Google family but no Argon, it definitely lacks Argon
+  if (acc.quotas?.google !== undefined && acc.quotas.argon === undefined) {
+    return false
+  }
+  return false
 }
 
 /** Parse `agy models` stdout: JSON shapes first, then two-column text. */
@@ -194,10 +229,11 @@ export function sanitizeCatalogEntries(models: readonly CatalogEntry[]): {
 // ---------------------------------------------------------------------------
 // Catalog cache with TTL + stale-while-revalidate (pi-bridge pattern).
 
-export type DiscoverFn = (signal?: AbortSignal) => Promise<{ stdout: string; stderr: string }>
+export type DiscoverFn = (signal?: AbortSignal, accountId?: string) => Promise<{ stdout: string; stderr: string }>
 
 export class ModelCatalog {
   private current: Catalog;
+  private readonly accountCatalogs = new Map<string, Catalog>();
   private refreshing: Promise<void> | null = null;
   /**
    * While the catalog is still on the fallback source, re-probe at most once
@@ -221,44 +257,53 @@ export class ModelCatalog {
     };
   }
 
-  get(): Catalog {
+  get(accountId?: string): Catalog {
+    if (accountId && this.accountCatalogs.has(accountId)) {
+      return this.accountCatalogs.get(accountId)!;
+    }
     return this.current;
   }
 
   /** Refresh if stale; never throws — failures keep the previous catalog. */
-  async refreshIfNeeded(): Promise<void> {
+  async refreshIfNeeded(accountId?: string): Promise<void> {
     if (this.refreshing) return this.refreshing;
     const now = Date.now();
-    const age = now - this.current.discoveredAt;
-    if (this.current.source === 'discovered' && age < this.ttlMs) return;
-    if (this.current.source === 'fallback' && now - this.lastAttemptAt < ModelCatalog.FALLBACK_RETRY_MS) return;
+    const targetCat = this.get(accountId);
+    const age = now - targetCat.discoveredAt;
+    if (targetCat.source === 'discovered' && age < this.ttlMs) return;
+    if (targetCat.source === 'fallback' && now - this.lastAttemptAt < ModelCatalog.FALLBACK_RETRY_MS) return;
     this.lastAttemptAt = now;
-    this.refreshing = this.refresh().finally(() => {
+    this.refreshing = this.refresh(accountId).finally(() => {
       this.refreshing = null;
     });
     return this.refreshing;
   }
 
-  async forceRefresh(): Promise<Catalog> {
-    await this.refresh();
+  async forceRefresh(accountId?: string): Promise<Catalog> {
+    await this.refresh(accountId);
     this.onUpdate?.();
-    return this.current;
+    return this.get(accountId);
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(accountId?: string): Promise<void> {
     try {
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), 30_000);
       try {
-        const { stdout } = await this.discover(ac.signal);
+        const { stdout } = await this.discover(ac.signal, accountId);
         const raw = parseModelsOutput(stdout);
         if (raw.length > 0) {
           const newModels = foldEfforts(raw);
+          const newCatalog: Catalog = { source: 'discovered', models: newModels, discoveredAt: Date.now() };
+          const prev = this.get(accountId);
           const changed =
-            this.current.source !== 'discovered' ||
-            this.current.models.length !== newModels.length ||
-            this.current.models.some((m, i) => m.id !== newModels[i]?.id);
-          this.current = { source: 'discovered', models: newModels, discoveredAt: Date.now() };
+            prev.source !== 'discovered' ||
+            prev.models.length !== newModels.length ||
+            prev.models.some((m, i) => m.id !== newModels[i]?.id);
+          if (accountId) {
+            this.accountCatalogs.set(accountId, newCatalog);
+          }
+          this.current = newCatalog;
           if (changed) {
             this.onUpdate?.();
           }

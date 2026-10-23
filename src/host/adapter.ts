@@ -14,7 +14,7 @@ import type { AccountPoolManager } from './pool.ts'
 import { conversationsDirFor, diffConversations, snapshotConversations } from './discovery.ts'
 import { EventMapper, toToolCallId } from './mapper.ts'
 import { parseMirrorCallId, type RunRecording, type RunRegistry } from './recording.ts'
-import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug, sanitizeCatalogEntries } from './models.ts'
+import { accountHasArgon, defaultEffortFor, findEntry, isArgonModel, ModelCatalog, resolveModelSlug, sanitizeCatalogEntries } from './models.ts'
 import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
 import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin, stripNulBytes } from './runner.ts'
@@ -648,15 +648,29 @@ export class AgyAdapter extends LlmAdapter {
     return { id: PROVIDER_ID, name: 'Antigravity (agy CLI)' }
   }
 
+  private getActiveAccount(): ManagedAccount | undefined {
+    if (!this.deps.pool) return undefined
+    const pool = this.deps.pool
+    const activeId = pool.getActiveAccountId('google') ?? pool.getPoolData().lastActiveAccountId ?? pool.getPoolData().primaryAccountId
+    return activeId ? pool.getAccount(activeId) : undefined
+  }
+
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    void this.deps.catalog.refreshIfNeeded()
+    const activeAcc = this.getActiveAccount()
+    void this.deps.catalog.refreshIfNeeded(activeAcc?.id)
     const cfg = this.deps.getConfig()
-    const cat = this.deps.catalog.get()
+    const cat = this.deps.catalog.get(activeAcc?.id)
+    let models = cat.models
+    // If the active account has no Argon access, filter out Argon models so the
+    // composer model picker only shows models available to the current active account.
+    if (activeAcc && !accountHasArgon(activeAcc, this.deps.pool, cat)) {
+      models = models.filter((m) => !isArgonModel(m.id))
+    }
     // DSH's llm.listModels rejects a provider catalog containing any
     // duplicate model id or invalid id (INVALID_CATALOG) and the model picker then drops
     // the whole Antigravity group — dedupe and sanitize as a final guard over every
     // catalog source (discovered, fallback, user-configured fallbackModels).
-    const { entries, dropped } = sanitizeCatalogEntries(cat.models)
+    const { entries, dropped } = sanitizeCatalogEntries(models)
     if (dropped.length > 0) {
       // Observable on purpose: without this the guard silently masks the
       // catalog duplication that would otherwise remove every Antigravity
@@ -681,8 +695,9 @@ export class AgyAdapter extends LlmAdapter {
   }
 
   override async resolveModel(_provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    const activeAcc = this.getActiveAccount()
     const cfg = this.deps.getConfig()
-    const cat = this.deps.catalog.get()
+    const cat = this.deps.catalog.get(activeAcc?.id)
     const rawModel = typeof model === 'string' ? model.trim() : ''
     const cleanId = rawModel !== '' ? rawModel : cfg.defaultModel
     const entry = findEntry(cat, cleanId)

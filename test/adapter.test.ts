@@ -1273,6 +1273,50 @@ test('listModels and resolveModel defensively handle empty IDs, empty names, and
   assert.equal(resolvedNoEffort.reasoning, undefined)
 })
 
+test('listModels dynamically isolates Argon models based on active account eligibility', async () => {
+  let activeId = 'acc_free'
+  const accounts: Record<string, any> = {
+    acc_free: {
+      id: 'acc_free',
+      alias: 'Free Account',
+      dir: '/tmp/acc_free',
+      enabled: true,
+      quotas: { google: { remainingFraction: 1 } },
+    },
+    acc_pro: {
+      id: 'acc_pro',
+      alias: 'Pro Account',
+      dir: '/tmp/acc_pro',
+      enabled: true,
+      quotas: { argon: { remainingFraction: 1 }, google: { remainingFraction: 1 } },
+    },
+  }
+  const fakePool = {
+    getActiveAccountId: () => activeId,
+    getPoolData: () => ({ primaryAccountId: 'acc_free', accounts: Object.values(accounts) }),
+    getAccount: (id: string) => accounts[id],
+    hasDedicatedGroup: (id: string, fam: string) => id === 'acc_pro' && fam === 'argon',
+  }
+  const { adapter } = makeAdapter({
+    fallbackModels: [
+      { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+      { id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
+    ],
+  }, { pool: fakePool as any })
+
+  // 1. With free account active: gemini-4-argon is hidden from picker
+  activeId = 'acc_free'
+  const freeModels = await adapter.listModels('antigravity')
+  assert.ok(freeModels.some((m) => m.id === 'gemini-3.8-flash'))
+  assert.ok(!freeModels.some((m) => m.id === 'gemini-4-argon'), 'free account must not show gemini-4-argon')
+
+  // 2. With pro account active: gemini-4-argon is present in picker
+  activeId = 'acc_pro'
+  const proModels = await adapter.listModels('antigravity')
+  assert.ok(proModels.some((m) => m.id === 'gemini-3.8-flash'))
+  assert.ok(proModels.some((m) => m.id === 'gemini-4-argon'), 'pro account must show gemini-4-argon')
+})
+
 test('compaction detection clears stale binding and re-seeds with digest (ADR-013)', async () => {
   const { adapter, store } = makeAdapter()
   process.env.FAKE_AGY_MODE = 'ok'

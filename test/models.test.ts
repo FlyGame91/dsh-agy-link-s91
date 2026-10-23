@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildFallbackCatalog, defaultEffortFor, findEntry, foldEfforts, parseModelsOutput } from '../src/host/models.ts'
+import { accountHasArgon, buildFallbackCatalog, defaultEffortFor, findEntry, foldEfforts, isArgonModel, ModelCatalog, parseModelsOutput } from '../src/host/models.ts'
 import { DEFAULT_FALLBACK_MODELS, defaultConfig, type PluginConfig } from '../src/common/types.ts'
 
 test('parseModelsOutput reads the JSON array shape', () => {
@@ -177,4 +177,127 @@ test('findEntry resolves aliases via resolveModelSlug', () => {
   assert.equal(findEntry(cat, 'claude-opus')?.id, 'claude-opus-4-6-thinking')
   assert.equal(findEntry(cat, 'gpt-oss-120b')?.id, 'gpt-oss-120b-medium')
 })
+
+test('isArgonModel identifies Argon variants case-insensitively', () => {
+  assert.equal(isArgonModel('gemini-4-argon'), true)
+  assert.equal(isArgonModel('gemini-4-argon-high'), true)
+  assert.equal(isArgonModel('GEMINI-4-ARGON'), true)
+  assert.equal(isArgonModel('gemini-3.8-flash'), false)
+  assert.equal(isArgonModel('claude-sonnet-4-6'), false)
+})
+
+test('accountHasArgon detects Argon access across quota, pool, and discovered catalog', () => {
+  // 1. Account with live argon quota
+  const accWithArgonQuota = {
+    id: 'acc_pro',
+    alias: 'Pro',
+    dir: '/tmp/pro',
+    enabled: true,
+    createdAt: Date.now(),
+    cooldowns: {},
+    quotas: {
+      argon: { remainingFraction: 1 },
+      google: { remainingFraction: 0.8 },
+    },
+  }
+  assert.equal(accountHasArgon(accWithArgonQuota), true)
+
+  // 2. Account with dedicated group noted in pool (PR #54)
+  const fakePool = {
+    hasDedicatedGroup: (id: string, fam: string) => id === 'acc_pro_pool' && fam === 'argon',
+  }
+  const accWithPoolNote = {
+    id: 'acc_pro_pool',
+    alias: 'Pro Pool',
+    dir: '/tmp/pro2',
+    enabled: true,
+    createdAt: Date.now(),
+    cooldowns: {},
+    quotas: {},
+  }
+  assert.equal(accountHasArgon(accWithPoolNote, fakePool as never), true)
+
+  // 3. Account with per-model quota mentioning argon
+  const accWithModelQuota = {
+    id: 'acc_model',
+    alias: 'Model',
+    dir: '/tmp/model',
+    enabled: true,
+    createdAt: Date.now(),
+    cooldowns: {},
+    quotas: {
+      google: {
+        remainingFraction: 1,
+        models: [{ modelId: 'gemini-4-argon-high', remainingFraction: 1 }],
+      },
+    },
+  }
+  assert.equal(accountHasArgon(accWithModelQuota), true)
+
+  // 4. Free account: Google quota present, but NO Argon bucket
+  const freeAcc = {
+    id: 'acc_free',
+    alias: 'Free',
+    dir: '/tmp/free',
+    enabled: true,
+    createdAt: Date.now(),
+    cooldowns: {},
+    quotas: {
+      google: { remainingFraction: 1 },
+    },
+  }
+  assert.equal(accountHasArgon(freeAcc), false)
+
+  // 5. Blank/un-polled account: defaults to false
+  const blankAcc = {
+    id: 'acc_blank',
+    alias: 'Blank',
+    dir: '/tmp/blank',
+    enabled: true,
+    createdAt: Date.now(),
+    cooldowns: {},
+    quotas: {},
+  }
+  assert.equal(accountHasArgon(blankAcc), false)
+})
+
+test('ModelCatalog caches per-account catalogs when accountId is provided', async () => {
+  const accountOutputs: Record<string, string> = {
+    acc_free: 'gemini-3.8-flash\tGemini 3.8 Flash\nclaude-sonnet-4-6\tClaude Sonnet 4.6',
+    acc_pro: 'gemini-3.8-flash\tGemini 3.8 Flash\ngemini-4-argon\tGemini 4 Argon\nclaude-sonnet-4-6\tClaude Sonnet 4.6',
+  }
+
+  const catalog = new ModelCatalog(
+    async (_signal, accountId) => {
+      const out = accountId ? accountOutputs[accountId] : undefined
+      if (out) return { stdout: out, stderr: '' }
+      return { stdout: accountOutputs.acc_free!, stderr: '' }
+    },
+    DEFAULT_FALLBACK_MODELS,
+    300_000,
+  )
+
+  // Initial state is fallback
+  assert.equal(catalog.get('acc_free').source, 'fallback')
+
+  // Force refresh for free account
+  await catalog.forceRefresh('acc_free')
+  const freeCat = catalog.get('acc_free')
+  assert.equal(freeCat.source, 'discovered')
+  const freeIds = freeCat.models.map((m) => m.id)
+  assert.ok(freeIds.includes('gemini-3.8-flash'))
+  assert.ok(!freeIds.includes('gemini-4-argon'), 'free account has no argon')
+
+  // Force refresh for pro account
+  await catalog.forceRefresh('acc_pro')
+  const proCat = catalog.get('acc_pro')
+  assert.equal(proCat.source, 'discovered')
+  const proIds = proCat.models.map((m) => m.id)
+  assert.ok(proIds.includes('gemini-3.8-flash'))
+  assert.ok(proIds.includes('gemini-4-argon'), 'pro account has argon')
+
+  // Verifying isolation: freeCat still does not have argon
+  assert.ok(!catalog.get('acc_free').models.some((m) => m.id === 'gemini-4-argon'))
+})
+
 
