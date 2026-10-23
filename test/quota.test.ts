@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
-import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken, pickFamilyQuota, summaryHasArgonGroup } from '../src/host/quota.ts'
+import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken, pickFamilyQuota, shouldReleaseOrphanedCooldown, summaryHasArgonGroup } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
@@ -1124,4 +1124,40 @@ test('summaryHasArgonGroup detects the dedicated Argon bucket across group shape
   }]), true)
 
   assert.equal(summaryHasArgonGroup([]), false)
+})
+
+test('shouldReleaseOrphanedCooldown never fires for an account that never had an Argon bucket', () => {
+  // Reviewer-reported regression: the first draft cleared the argon cooldown on
+  // every authoritative poll that lacked the group — true for free-tier and every
+  // non-Pro account, whose argon cooldowns come from real 429s. Clearing those
+  // every 60s silently disabled the cooldown mechanism for that family.
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: true,
+    groupPresent: false,
+    groupSeenBefore: false,   // never reported a dedicated bucket
+    hasCooldown: true,
+  }), false)
+
+  // The genuine Pro -> Ultra transition: the account used to report the bucket.
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: true,
+    groupPresent: false,
+    groupSeenBefore: true,
+    hasCooldown: true,
+  }), true)
+
+  // Still reported -> nothing to release.
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: true, groupPresent: true, groupSeenBefore: true, hasCooldown: true,
+  }), false)
+
+  // No cooldown to release -> no pointless persist().
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: true, groupPresent: false, groupSeenBefore: true, hasCooldown: false,
+  }), false)
+
+  // Failed/empty summary carries no authority over a family that is missing.
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: false, groupPresent: false, groupSeenBefore: true, hasCooldown: true,
+  }), false)
 })

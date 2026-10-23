@@ -43,20 +43,6 @@ export function mergeFallbackFamilyQuota(
   return fallback
 }
 
-/**
- * Pick the family fraction when this poll's summary carried no group for it.
- *
- * An *authoritative* summary (at least one group returned) means the absence is
- * real: the family lost its own bucket — a Pro → Ultra upgrade folds the
- * separate Argon pool into the larger Gemini bucket, and the backend then stops
- * reporting a `Gemini 4 Argon` group entirely while `fetchAvailableModels`
- * keeps listing the argon models with fresh per-model fractions. Keeping the
- * last-known-good row there would freeze a dead window on screen (0%, a reset
- * time from the previous tier).
- *
- * A failed or empty summary is the case `mergeFallbackFamilyQuota` protects:
- * nothing authoritative arrived, so the previous complete value stays.
- */
 /** Minimal shape of the quota groups `retrieveUserQuotaSummary` returns. */
 export interface QuotaGroupShape {
   displayName?: string
@@ -80,6 +66,47 @@ export function summaryHasArgonGroup(groups: readonly QuotaGroupShape[]): boolea
   })
 }
 
+/**
+ * Decide whether a family's cooldown belongs to a quota bucket that no longer exists.
+ *
+ * A cooldown is recorded against the pool that produced the 429. A plan change can
+ * retire that pool — a Pro → Ultra upgrade folds Argon into the larger Gemini bucket
+ * and the backend stops emitting the `Gemini 4 Argon` group — leaving a cooldown that
+ * blocks the family until a reset that no longer applies:
+ *
+ *   All Antigravity accounts are unavailable: no account can serve argon right now
+ *   (1 in cooldown) (earliest reset in 345338s)
+ *
+ * `groupSeenBefore` is what keeps this from firing on accounts that never had the
+ * group at all (free tier, or any plan without an Argon bucket): their argon
+ * cooldowns come from genuine 429s and must survive.
+ */
+export function shouldReleaseOrphanedCooldown(state: {
+  summaryAuthoritative: boolean
+  groupPresent: boolean
+  groupSeenBefore: boolean
+  hasCooldown: boolean
+}): boolean {
+  return state.summaryAuthoritative
+    && !state.groupPresent
+    && state.groupSeenBefore
+    && state.hasCooldown
+}
+
+/**
+ * Pick the family fraction when this poll's summary carried no group for it.
+ *
+ * An *authoritative* summary (at least one group returned) means the absence is
+ * real: the family lost its own bucket — a Pro → Ultra upgrade folds the
+ * separate Argon pool into the larger Gemini bucket, and the backend then stops
+ * reporting a `Gemini 4 Argon` group entirely while `fetchAvailableModels`
+ * keeps listing the argon models with fresh per-model fractions. Keeping the
+ * last-known-good row there would freeze a dead window on screen (0%, a reset
+ * time from the previous tier).
+ *
+ * A failed or empty summary is the case `mergeFallbackFamilyQuota` protects:
+ * nothing authoritative arrived, so the previous complete value stays.
+ */
 export function pickFamilyQuota(
   prev: FamilyQuotaInfo | undefined,
   fresh: FamilyQuotaInfo,
@@ -87,7 +114,6 @@ export function pickFamilyQuota(
 ): FamilyQuotaInfo {
   return summaryAuthoritative ? fresh : mergeFallbackFamilyQuota(prev, fresh)
 }
-
 
 export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
   const logDir = join(homeDir, '.gemini', 'antigravity-cli', 'log')
@@ -1135,12 +1161,20 @@ export class QuotaService {
       }
     }
 
-    // A family that lost its dedicated group is governed by the shared bucket, so a
-    // cooldown taken against the retired pool would block it until a reset that no
-    // longer applies (observed: 4 days of "no account can serve argon" right after a
-    // Pro -> Ultra upgrade, while the merged bucket sat at 100%).
-    if (summaryGroups.length > 0 && !summaryHasArgonGroup(summaryGroups) && account.cooldowns?.argon) {
-      this.pool.clearCooldown(account.id, 'argon')
+    // Track whether this account reports a dedicated Argon bucket, so a retired one
+    // can be told apart from one that never existed (see shouldReleaseOrphanedCooldown).
+    if (summaryGroups.length > 0) {
+      if (summaryHasArgonGroup(summaryGroups)) {
+        this.pool.noteDedicatedGroup(account.id, 'argon')
+      } else if (shouldReleaseOrphanedCooldown({
+        summaryAuthoritative: true,
+        groupPresent: false,
+        groupSeenBefore: this.pool.hasDedicatedGroup(account.id, 'argon'),
+        hasCooldown: account.cooldowns?.argon !== undefined,
+      })) {
+        this.pool.forgetDedicatedGroup(account.id, 'argon')
+        this.pool.clearCooldown(account.id, 'argon')
+      }
     }
 
     this.pool.updateAccountQuotas(account.id, familyQuotas, email)
