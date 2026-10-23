@@ -1,14 +1,24 @@
 # Changelog
 
-## 0.4.68 (2026-10-22)
+## 0.4.68 (2026-10-23)
 
 ### English
 
+- **Feat: Dynamic model picker reflects active account eligibility (Gemini 4 Argon isolation).**
+  - Accounts in the pool now discover and cache models independently (`ModelCatalog` keyed by `accountId`).
+  - When switching the active account in the UI or pool, the DSH composer model picker automatically refreshes (`llm/adapters-updated`).
+  - If the active account lacks Argon access (free/standard tier), `gemini-4-argon` is dynamically excluded from the picker to prevent generation errors. When an account with Pro/Ultra subscription is active, Argon models are immediately restored.
+- **Fix: Eliminate page scrolling and violent screen flickering in Antigravity client.**
+  - Root cause: In `src/client/decisions.ts`, decision chip toolbar was repeatedly injected into TanStack-Virtual dynamic measurement containers because container-level marker `data-agy-decisions-scanned` was checked but never set, and re-rendering reconstructed heading nodes. The item height expansion triggered scroll position adjustments, which caused a re-render and re-injection flywheel.
+  - In addition, settings nav row `MutationObserver` watched the entire subtree including `characterData` and re-triggered on its own marker writes without an attribute filter, and account button busy states repainted the entire account list instead of scoping to the target account.
+  - Resolved with container-level idempotence guards (`data-agy-decisions-scanned` written before mutation), pre-checking existing toolbar containers, filtering nav mutation observer strictly to marker attribute changes, and scoping button busy states and shimmer animations to target accounts.
+- **Fix: Send agy CLI User-Agent in quota requests so Argon quota group is returned (PR #54, Fixes #53).**
+  - Google's Cloud Code backend requires a genuine `agy` CLI User-Agent header (format `Antigravity/<version> (darwin; arm64)`) to return the `Gemini 4 Argon` quota bucket in `retrieveUserQuotaSummary`. Without this header, only generic Gemini and 3P groups were returned.
+  - Quota service now detects the installed `agy` CLI version and passes the proper User-Agent header in HTTP requests. When an account transitions or drops dedicated groups, obsolete cooldowns and stale last-known-good entries are cleanly evicted.
 - **Fix: DSH Host 100% CPU busy loop on macOS caused by copying active SQLite WAL files (Fixes #52).**
   - Root cause: `loadAgyDbData()` previously copied `conversation.db`, `-wal`, and `-shm` to a temporary directory before querying tool step parameters and model thoughts. On macOS (and other BSD-derived libuv platforms), when an active SQLite WAL file is checkpointed or truncated to 0 during `copyFile`, libuv's `uv_fs_copyfile` enters an infinite busy loop in a worker thread, causing the Host process to permanently consume 100% of a CPU core.
   - Solution: Replaced file copying with direct SQLite reads (`node:sqlite` DatabaseSync with `readOnly: true`, falling back to `sqlite3` CLI with `-cmd ".timeout 2000" -cmd "PRAGMA query_only = ON;"`). SQLite's native WAL architecture provides atomic, consistent MVCC read snapshots concurrently with active writers without blocking or file-copying races.
   - Added regression test covering active WAL querying, WAL truncation/checkpointing during active use, sqlite3 CLI fallback, and zero-byte database handling.
-
 - **Fix: Transport failures outlast a real egress outage, and no longer rotate a shared-egress pool.**
   - Live case (2026-10-21 16:34–16:48): the machine's proxy answered `CONNECT 200` and then killed TLS for ~14 minutes. Every `agy` run on every account died in its startup probe with `Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF`, which agy wraps as `Eligibility check failed: …`. DSH retried twice inside ~4 seconds and gave up — while the Antigravity desktop's own language server simply kept retrying and recovered.
   - Transport (`NETWORK`) failures now state their own backoff via `providerRetryAfterMs`: **5s → 15s → 30s** for consecutive failures in one session, reset on success or any non-transport failure, and treated as fresh after 10 minutes of quiet. `providerRetryPolicy` grew to 3 retries with `maxDelayMs: 45s` (the retry plugin *drops* a retry whose requested delay exceeds that cap, so it must sit above the longest transport delay).
@@ -17,11 +27,21 @@
 
 ### 中文
 
+- **新功能：模型选择框按当前活动账号资格动态隔离（Gemini 4 Argon 自动感知）。**
+  - 号池内账号支持按账号独立发现并缓存模型目录（`ModelCatalog` 按 `accountId` 隔离）。
+  - 在前端或号池切换当前活动账号后，DSH 输入框模型选择列表即时联动刷新（`llm/adapters-updated`）。
+  - 若当前活动账号无 Argon 权限（标准/免费层），输入框模型列表中自动剔除 `gemini-4-argon`，防止误选调用报错；当切回 Pro/Ultra 订阅账号时，Argon 模型自动呈现。
+- **修复：解决 Antigravity 插件设置及历史页面来回滚动疯狂闪屏问题。**
+  - 根因定位：在 `src/client/decisions.ts` 中，决策按钮增强器容器级标记 `data-agy-decisions-scanned` 此前只读未写，且在 TanStack-Virtual 动态虚拟列表中，重新挂载渲染会重建 heading 节点。工具条反复注入导致项高度变化，进而触发虚拟列表重算 scrollTop 并再次触发重渲染注入飞轮。
+  - 此外，设置导航图标的 `MutationObserver` 监听范围过广且在修改属性时自身被反复触发，且操作账号按钮的全局 busy 状态导致 40+ 个元素属性全量刷新并引发重排重绘。
+  - 修复方案：在变更 DOM 前对容器写入 `data-agy-decisions-scanned` 并严格预检容器已有工具条；导航 Observer 限制仅监听对应属性变更（`attributeFilter`）并剥离 `characterData`；按钮 loading 状态与额度进度条 shimmer 动画改为账号级别作用域隔离。
+- **修复：配额请求中上报 agy CLI 原生 User-Agent 以获取 Argon 额度分组（合并 PR #54，修复 #53）。**
+  - Google Cloud Code 后端要求在 `retrieveUserQuotaSummary` 请求中携带真实的 `agy` CLI User-Agent（格式如 `Antigravity/<version> (darwin; arm64)`）才会返回 `Gemini 4 Argon` 独立额度桶。缺少该头时后端仅下发普通 Gemini 与 3P 组。
+  - 配额探测服务现在自动探测本地 `agy` 版本并携带该头发送请求；当账号升级或移出专用桶时，旧版冷却记录与失效缓存自动淘汰。
 - **修复：macOS 下复制活跃 SQLite WAL 时触发 libuv `copyFile` 忙循环导致 DSH Host 持续 100% CPU（修复 #52）。**
   - 原因分析：`loadAgyDbData()` 此前在读取工具参数和思考内容时，顺序将 `conversation.db`、`-wal` 和 `-shm` 复制到临时目录。在 macOS（以及其他基于 BSD 的 libuv 平台）上，当活跃 WAL 文件在复制过程中被 SQLite checkpoint 截短为 0 字节时，libuv 的 `uv_fs_copyfile` 工作线程会陷入无限忙循环，导致 DSH Host 进程持续耗尽单核 100% CPU。
   - 修复方案：完全移除临时目录与文件复制逻辑，改为直接通过 SQLite 引擎一致性读取（优先使用 `node:sqlite` 的 `DatabaseSync` 只读模式并开启 `PRAGMA query_only = ON;` 与 `busy_timeout`，后备使用 `sqlite3` CLI）。SQLite WAL 模式天然支持多读一写并发 MVCC 快照，既消除了文件截短忙循环与临时文件 I/O 争用，又保证了读取一致性。
   - 补充回归测试：覆盖活跃 WAL 读取、WAL 截短/检查点处理、sqlite3 CLI 后备路径及 0 字节文件防御。
-
 - **修复：网络抖动时重试不再 4 秒内放弃，共用出口的号池不再被无意义轮换。**
   - 实测案例（2026-10-21 16:34–16:48）：本机代理对 `CONNECT` 返回 200 后直接掐断 TLS 长达约 14 分钟。每个账号上每次 `agy` 运行都在启动探测阶段死于 `Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF`，被 agy 包成 `Eligibility check failed: …`。DSH 约 4 秒内重试两次即宣告失败，而 Antigravity 桌面端自己的 language server 只是一直重试，网络恢复后照常工作。
   - 传输类（`NETWORK`）失败现在通过 `providerRetryAfterMs` 自带退避：同一会话连续失败按 **5s → 15s → 30s** 递增；成功或出现非传输类失败即归零，静默超过 10 分钟后重新从 5s 起算。`providerRetryPolicy` 提升为 3 次重试、`maxDelayMs: 45s`（重试插件对**超过上限**的请求延迟会直接放弃该次重试，因此上限必须高于最长退避）。
