@@ -29,10 +29,28 @@ export function makeToggle(setValue: (next: boolean | ((prev: boolean) => boolea
 	return () => setValue((prev: boolean) => !prev);
 }
 
-export function useToggle(initial: boolean = false): [boolean, () => void] {
+/** Cache user-expanded tool cards across TanStack Virtualizer remount cycles */
+const expandedToolBlockKeys = new Set<string>();
+
+export function clearExpandedToolBlockKeysForTest(): void {
+	expandedToolBlockKeys.clear();
+}
+
+export function useToggle(initial: boolean = false, key?: string): [boolean, () => void] {
 	const R2 = react();
-	const [value, setValue] = R2.useState(initial) as [boolean, (next: boolean | ((prev: boolean) => boolean)) => void];
-	return [value, makeToggle(setValue)];
+	const init = key ? expandedToolBlockKeys.has(key) : initial;
+	const [value, setValue] = R2.useState<boolean>(init) as [boolean, (next: boolean | ((prev: boolean) => boolean)) => void];
+	const toggle = () => {
+		setValue((prev: boolean) => {
+			const next = !prev;
+			if (key) {
+				if (next) expandedToolBlockKeys.add(key);
+				else expandedToolBlockKeys.delete(key);
+			}
+			return next;
+		});
+	};
+	return [value, toggle];
 }
 
 function hx(type: unknown, props?: Record<string, unknown> | null, ...children: unknown[]): unknown {
@@ -968,12 +986,13 @@ function CardBody({ model, openFile, cwd, home, inspect, t }: {
 // ---- Main ToolView Component ----------------------------------------------
 
 export function AgyMirrorToolView(props: AgyToolViewProps): unknown {
-	const [open, setOpen] = useToggle(false);
 	const h = hx;
-	const { block, cwd, home, openFile, inspect, t } = props;
+	const { block, cwd, home, openFile, inspect, t, callId } = props;
 	const settle = isSettled(block);
 	const err = isError(block);
 	const model = mirrorCardModel(block, cwd, home);
+	const cardKey = callId ? `call:${callId}` : `${model.kind}:${model.tool ?? ''}:${model.title}:${model.path ?? model.command ?? ''}`;
+	const [open, setOpen] = useToggle(false, cardKey);
 	const state: 'ok' | 'err' | 'run' = !settle ? 'run' : err ? 'err' : 'ok';
 	const title = displayTitle(model, t);
 	const summary = displaySummary(model, cwd, home);
@@ -1091,10 +1110,11 @@ export function runCodeModel(block?: ToolBlock): { code: string; title: string }
  * friends) so an ordinary Code Mode call reads exactly like a native tool row.
  */
 export function AgyCodeToolView(props?: AgyToolViewProps): unknown {
-	const [open, setOpen] = useToggle(false);
 	const h = hx;
-	const { block, inspect, t } = props ?? ({} as AgyToolViewProps);
+	const { block, inspect, t, callId } = props ?? ({} as AgyToolViewProps);
 	const model = runCodeModel(block);
+	const cardKey = callId ? `call:${callId}` : `code:${model.title}`;
+	const [open, setOpen] = useToggle(false, cardKey);
 	const settle = block !== undefined && isSettled(block);
 	const err = block !== undefined && isError(block);
 	const state: 'ok' | 'err' | 'run' = !settle ? 'run' : err ? 'err' : 'ok';

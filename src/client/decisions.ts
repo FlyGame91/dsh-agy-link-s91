@@ -1,3 +1,5 @@
+import { isScrollActive, onScrollSettle } from './scroll-guard.ts';
+
 // Interactive User Decision & Choice Quick-Actions for dsh-agy-link.
 //
 // Detects decision sections and choice prompts in model responses (e.g.
@@ -184,6 +186,7 @@ function extractOptionsFromList(container: HTMLElement): ExtractedOption[] {
  */
 export function scanAndEnhanceDecisions(): void {
   if (typeof document === 'undefined') return;
+  if (isScrollActive()) return;
 
   const markdownContainers = document.querySelectorAll<HTMLElement>('div[class*="_markdown_"], [data-markdown-variant]');
   for (let i = 0; i < markdownContainers.length; i++) {
@@ -278,6 +281,18 @@ export function scanAndEnhanceDecisions(): void {
 }
 
 let decisionChipsDispose: (() => void) | null = null;
+let decisionScanTimer: ReturnType<typeof setTimeout> | null = null;
+let unbindDecisionSettle: (() => void) | null = null;
+
+function scheduleDecisionScan(): void {
+  if (isScrollActive()) return;
+  if (decisionScanTimer !== null) return;
+  decisionScanTimer = setTimeout(() => {
+    decisionScanTimer = null;
+    if (isScrollActive()) return;
+    scanAndEnhanceDecisions();
+  }, 100);
+}
 
 export function installDecisionChips(): () => void {
   if (typeof window === 'undefined' || typeof document === 'undefined') return () => {};
@@ -287,7 +302,11 @@ export function installDecisionChips(): () => void {
   injectStyles();
 
   const observer = new MutationObserver(() => {
-    scanAndEnhanceDecisions();
+    scheduleDecisionScan();
+  });
+
+  unbindDecisionSettle = onScrollSettle(() => {
+    scheduleDecisionScan();
   });
 
   const setup = () => {
@@ -305,6 +324,14 @@ export function installDecisionChips(): () => void {
 
   const dispose = (): void => {
     observer.disconnect();
+    if (unbindDecisionSettle !== null) {
+      unbindDecisionSettle();
+      unbindDecisionSettle = null;
+    }
+    if (decisionScanTimer !== null) {
+      clearTimeout(decisionScanTimer);
+      decisionScanTimer = null;
+    }
     window.removeEventListener('DOMContentLoaded', setup);
     if (decisionChipsDispose === dispose) decisionChipsDispose = null;
   };

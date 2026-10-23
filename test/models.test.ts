@@ -248,6 +248,22 @@ test('accountHasArgon detects Argon access across quota, pool, and discovered ca
   }
   assert.equal(accountHasArgon(freeAcc), false)
 
+  // 4b. REGRESSION: Free account with Google quota but NO Argon bucket
+  // must return false EVEN IF passed a discovered catalog that contains Argon!
+  const discoveredCatalogWithArgon = {
+    source: 'discovered' as const,
+    models: [
+      { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', efforts: null },
+      { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: null },
+    ],
+    discoveredAt: Date.now(),
+  }
+  assert.equal(
+    accountHasArgon(freeAcc, null, discoveredCatalogWithArgon),
+    false,
+    'free account must NEVER claim argon even if a discovered catalog contains argon',
+  )
+
   // 5. Blank/un-polled account: defaults to false
   const blankAcc = {
     id: 'acc_blank',
@@ -298,6 +314,30 @@ test('ModelCatalog caches per-account catalogs when accountId is provided', asyn
 
   // Verifying isolation: freeCat still does not have argon
   assert.ok(!catalog.get('acc_free').models.some((m) => m.id === 'gemini-4-argon'))
+})
+
+test('REGRESSION: refreshIfNeeded(accountId) does not skip an un-cached account because global current is fresh', async () => {
+  let probedAccount: string | undefined
+  const catalog = new ModelCatalog(
+    async (_signal, accountId) => {
+      probedAccount = accountId
+      return { stdout: 'gemini-3.8-flash\tGemini 3.8 Flash', stderr: '' }
+    },
+    DEFAULT_FALLBACK_MODELS,
+    300_000,
+  )
+
+  // 1. Initial boot refresh without accountId establishes this.current as discovered
+  await catalog.forceRefresh()
+  assert.equal(catalog.get().source, 'discovered')
+
+  // 2. An account 'acc_free' has never been probed.
+  // In the old buggy code, refreshIfNeeded('acc_free') saw that this.get('acc_free')
+  // returned this.current whose age < ttlMs, so it returned early without probing!
+  probedAccount = undefined
+  await catalog.refreshIfNeeded('acc_free')
+  assert.equal(probedAccount, 'acc_free', 'refreshIfNeeded must probe the un-cached account')
+  assert.equal(catalog.hasAccountCatalog('acc_free'), true)
 })
 
 

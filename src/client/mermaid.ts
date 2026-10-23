@@ -1,3 +1,5 @@
+import { isScrollActive, onScrollSettle } from './scroll-guard.ts';
+
 // Client-side mermaid rendering (dsh-agy-link).
 //
 // DSH's markdown pipeline (marked + shiki) has no mermaid grammar: a
@@ -444,15 +446,18 @@ async function renderInto(block: HTMLElement, source: string, lang = ''): Promis
 // walks every code block, so coalesce mutation bursts into one pass.
 let scanTimer: ReturnType<typeof setTimeout> | null = null
 function scheduleScan(): void {
+	if (isScrollActive()) return
 	if (scanTimer !== null) return
 	scanTimer = setTimeout(() => {
 		scanTimer = null
+		if (isScrollActive()) return
 		scan()
 	}, 150)
 }
 
 function scan(): void {
 	if (typeof document === 'undefined') return
+	if (isScrollActive()) return
 	cleanupTempElements()
 	const blocks = document.querySelectorAll<HTMLElement>('.md-code-block')
 	for (let i = 0; i < blocks.length; i++) {
@@ -473,6 +478,7 @@ function scan(): void {
 
 let activeObserver: MutationObserver | null = null
 let domContentLoadedHandler: (() => void) | null = null
+let unbindMermaidSettle: (() => void) | null = null
 
 /**
  * Install the mermaid overlay. Returns a disposer that disconnects the
@@ -489,6 +495,9 @@ export function installMermaidRendering(): () => void {
 		scheduleScan()
 	})
 	activeObserver = observer
+	unbindMermaidSettle = onScrollSettle(() => {
+		scheduleScan()
+	})
 	const setup = (): void => {
 		if (document.body) {
 			cleanupTempElements()
@@ -510,6 +519,10 @@ export function disposeMermaidRendering(): void {
 	if (activeObserver !== null) {
 		activeObserver.disconnect()
 		activeObserver = null
+	}
+	if (unbindMermaidSettle !== null) {
+		unbindMermaidSettle()
+		unbindMermaidSettle = null
 	}
 	if (domContentLoadedHandler !== null) {
 		window.removeEventListener('DOMContentLoaded', domContentLoadedHandler)

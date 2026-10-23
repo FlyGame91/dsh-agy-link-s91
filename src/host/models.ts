@@ -41,20 +41,28 @@ export function accountHasArgon(
   catalog?: Catalog,
 ): boolean {
   if (!acc) return false
-  // 1. Authoritative quota bucket
+
+  // 1. Authoritative quota bucket explicitly exists
   if (acc.quotas?.argon !== undefined) return true
+
   // 2. Pool recorded dedicated Argon quota group (PR #54)
   if (pool && typeof pool.hasDedicatedGroup === 'function' && pool.hasDedicatedGroup(acc.id, 'argon')) return true
+
   // 3. Per-model quotas reported an argon model
   if (acc.quotas?.google?.models?.some((m) => isArgonModel(m.modelId))) return true
-  // 4. If this account's discovered catalog contains argon
+
+  // 4. Authoritative negative quota rule: if the account has polled Google quota
+  // and none of the Argon indicators above matched, it is definitively a standard/free
+  // account without Argon access. We must NOT fall back to catalog discovery in this case.
+  if (acc.quotas?.google !== undefined) {
+    return false
+  }
+
+  // 5. Account's discovered catalog contains argon (only when quota has not been polled yet)
   if (catalog && catalog.source === 'discovered') {
     return catalog.models.some((m) => isArgonModel(m.id))
   }
-  // 5. If quota was polled and has Google family but no Argon, it definitely lacks Argon
-  if (acc.quotas?.google !== undefined && acc.quotas.argon === undefined) {
-    return false
-  }
+
   return false
 }
 
@@ -264,14 +272,21 @@ export class ModelCatalog {
     return this.current;
   }
 
+  hasAccountCatalog(accountId: string): boolean {
+    return this.accountCatalogs.has(accountId);
+  }
+
   /** Refresh if stale; never throws — failures keep the previous catalog. */
   async refreshIfNeeded(accountId?: string): Promise<void> {
     if (this.refreshing) return this.refreshing;
     const now = Date.now();
-    const targetCat = this.get(accountId);
-    const age = now - targetCat.discoveredAt;
-    if (targetCat.source === 'discovered' && age < this.ttlMs) return;
-    if (targetCat.source === 'fallback' && now - this.lastAttemptAt < ModelCatalog.FALLBACK_RETRY_MS) return;
+    const accountCat = accountId ? this.accountCatalogs.get(accountId) : undefined;
+    if (!accountId || accountCat) {
+      const targetCat = accountCat ?? this.current;
+      const age = now - targetCat.discoveredAt;
+      if (targetCat.source === 'discovered' && age < this.ttlMs) return;
+      if (targetCat.source === 'fallback' && now - this.lastAttemptAt < ModelCatalog.FALLBACK_RETRY_MS) return;
+    }
     this.lastAttemptAt = now;
     this.refreshing = this.refresh(accountId).finally(() => {
       this.refreshing = null;
@@ -302,19 +317,31 @@ export class ModelCatalog {
             prev.models.some((m, i) => m.id !== newModels[i]?.id);
           if (accountId) {
             this.accountCatalogs.set(accountId, newCatalog);
+          } else {
+            this.current = newCatalog;
           }
-          this.current = newCatalog;
           if (changed) {
             this.onUpdate?.();
           }
           return;
         }
-        this.current = { ...this.current, lastError: 'agy models returned no entries' };
+        if (accountId) {
+          const cat = this.accountCatalogs.get(accountId);
+          if (cat) cat.lastError = 'agy models returned no entries';
+        } else {
+          this.current = { ...this.current, lastError: 'agy models returned no entries' };
+        }
       } finally {
         clearTimeout(timer);
       }
     } catch (err) {
-      this.current = { ...this.current, lastError: err instanceof Error ? err.message : String(err) };
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (accountId) {
+        const cat = this.accountCatalogs.get(accountId);
+        if (cat) cat.lastError = errMsg;
+      } else {
+        this.current = { ...this.current, lastError: errMsg };
+      }
     }
   }
 }

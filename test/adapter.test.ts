@@ -411,7 +411,7 @@ test('a Stop mid-flight marks the binding interrupted and the next prompt carrie
   const prevMode = process.env.FAKE_AGY_MODE
   const prevDelay = process.env.FAKE_AGY_DELAY_MS
   process.env.FAKE_AGY_MODE = 'slow-init'
-  process.env.FAKE_AGY_DELAY_MS = '5000'
+  process.env.FAKE_AGY_DELAY_MS = '300'
   const { adapter, store } = makeAdapter()
   const ctrl = new AbortController()
   const iter = adapter.stream(opts([msg('user', 'FIRST-QUESTION')], { sessionId: 'sess-abort' as never, signal: ctrl.signal }))[Symbol.asyncIterator]()
@@ -1460,7 +1460,7 @@ test('identical prompt while a live run owns the session is rejected with BUSY (
   try {
     // Keep the first agy child alive long enough for the second submission
     // to observe a live run (a long tool is silent for minutes — issue #33).
-    process.env.FAKE_AGY_DELAY_MS = '4000'
+    process.env.FAKE_AGY_DELAY_MS = '400'
     const iter1 = adapter.stream(sessionOptions)[Symbol.asyncIterator]()
     const firstChunkPromise = iter1.next()
     // Let stream() spawn and register the live run; do NOT wait for output.
@@ -1523,7 +1523,7 @@ test('a NEW (steered) prompt preempts a live run instead of debouncing', async (
   const firstMsg = msg('user', 'Please perform task X')
   const steeredMsg = msg('user', 'Actually please perform task Y instead')
   try {
-    process.env.FAKE_AGY_DELAY_MS = '8000'
+    process.env.FAKE_AGY_DELAY_MS = '400'
     const iter1 = adapter.stream(opts([firstMsg], { sessionId: 'sess-steer-same' as never }))[Symbol.asyncIterator]()
     const firstChunkPromise = iter1.next()
     await new Promise((r) => setTimeout(r, 80))
@@ -1979,7 +1979,7 @@ test('steered prompt carries interrupted notice so agy switches tasks immediatel
   const { adapter, argsFile } = makeAdapter()
   process.env.FAKE_AGY_MODE = 'ok'
   process.env.FAKE_AGY_ARGS_FILE = argsFile
-  process.env.FAKE_AGY_DELAY_MS = '6000'
+  process.env.FAKE_AGY_DELAY_MS = '400'
 
   const firstMsg = msg('user', 'Initial long calculation')
   const steeredMsg = msg('user', 'Cancel that and tell me a joke')

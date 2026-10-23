@@ -187,7 +187,7 @@ if (mode === 'auth-jitter') {
 if (mode === 'slow-init') {
   emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
   emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 0, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'working' } })
-  await sleep(Number(process.env.FAKE_AGY_DELAY_MS ?? 2000))
+  await sleep(Number(process.env.FAKE_AGY_DELAY_MS ?? 200))
   emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: 'late answer', duration_seconds: 2, num_turns: 1, usage: { input_tokens: 10, output_tokens: 2 } } })
   process.exit(0)
 }

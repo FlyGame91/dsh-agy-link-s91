@@ -9,6 +9,7 @@ import { en, es, NS, ptBR, zh, type AgyLocaleKey } from './locales.ts';
 import { installAutoExpandReasoning } from './reasoning.ts';
 import { installImageEnhancer } from './images.ts';
 import { installDecisionChips } from './decisions.ts';
+import { ensureScrollListener, disposeScrollListener } from './scroll-guard.ts';
 
 
 type ReactApi = {
@@ -2416,6 +2417,12 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 			},
 		);
 		return dispose;
+	});
+
+	// Global scroll activity coordinator: suppresses layout-shifting DOM mutations during scrolling
+	ctx.effect(() => {
+		ensureScrollListener();
+		return disposeScrollListener;
 	});
 
 	// Native tool-card rendering for the agy_tool mirror (DSH >= 0.1.5):

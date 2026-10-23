@@ -1,3 +1,5 @@
+import { isScrollActive, onScrollSettle } from './scroll-guard.ts';
+
 // Client-side local image display & lightbox enhancer for dsh-agy-link.
 //
 // Solves local image display issues in DSH Web and Desktop:
@@ -418,6 +420,7 @@ function getReactProps(el: HTMLElement): Record<string, unknown> | null {
  */
 export function scanAndEnhanceImages(): void {
   if (typeof document === 'undefined') return;
+  if (isScrollActive()) return;
   const origin = getOrigin();
 
   // 1. Rewrite any existing <img> src pointing to 127.0.0.1 to current origin if remote
@@ -537,6 +540,18 @@ export function scanAndEnhanceImages(): void {
 }
 
 let imageEnhancerDispose: (() => void) | null = null;
+let imageScanTimer: ReturnType<typeof setTimeout> | null = null;
+let unbindImageSettle: (() => void) | null = null;
+
+function scheduleImageScan(): void {
+  if (isScrollActive()) return;
+  if (imageScanTimer !== null) return;
+  imageScanTimer = setTimeout(() => {
+    imageScanTimer = null;
+    if (isScrollActive()) return;
+    scanAndEnhanceImages();
+  }, 100);
+}
 
 export function installImageEnhancer(): () => void {
   if (typeof window === 'undefined' || typeof document === 'undefined') return () => {};
@@ -546,7 +561,11 @@ export function installImageEnhancer(): () => void {
   injectStyles();
 
   const observer = new MutationObserver(() => {
-    scanAndEnhanceImages();
+    scheduleImageScan();
+  });
+
+  unbindImageSettle = onScrollSettle(() => {
+    scheduleImageScan();
   });
 
   const setup = () => {
@@ -564,6 +583,14 @@ export function installImageEnhancer(): () => void {
 
   const dispose = (): void => {
     observer.disconnect();
+    if (unbindImageSettle !== null) {
+      unbindImageSettle();
+      unbindImageSettle = null;
+    }
+    if (imageScanTimer !== null) {
+      clearTimeout(imageScanTimer);
+      imageScanTimer = null;
+    }
     window.removeEventListener('DOMContentLoaded', setup);
     if (imageEnhancerDispose === dispose) imageEnhancerDispose = null;
   };

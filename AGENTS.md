@@ -17,6 +17,19 @@
 
 ---
 
+## ⚡ 两级双环测试原则（对齐 academic-agent）
+
+> ⚠️ **严禁在日常编码与 TDD 循环中直接运行全量测试套件**！系统累计 491 项用例，全量运行耗时较长会严重打断开发心流。日常开发必须遵循两级双环测试：
+
+1. **内环（TDD 极速环，0.3 ~ 2 秒，日常开发必用）**：
+   - 自动基于 Git 变更精准执行关联测试：`pnpm run test:fast`
+   - 指定模块关键字秒级直跑：`pnpm run test:fast <name>`（例如 `pnpm run test:fast models` 仅需 0.5s，`pnpm run test:fast reasoning` 仅需 0.4s）
+   - 单文件直跑：`node --experimental-transform-types --test test/xxx.test.ts`
+2. **外环（全量回归门禁，仅提 PR 或发版打 Tag 前）**：
+   - 全量回归测试：`pnpm test`（确保 491 项用例 100% 全部通过）
+
+---
+
 ## 🛠️ Project Architecture & Constraints
 
 - **Engine & Bridge**: `dsh-agy-link` bridges Google Antigravity (`agy` CLI) into DeepSeek Harness (DSH).

@@ -100,8 +100,13 @@ export interface PluginConfig {
   logRetentionDays: number
   /** Opt-out and suppress Google Cloud Code / Antigravity telemetry tracking. */
   disableTelemetry: boolean
-  /** Background quota polling interval in ms (default 15 min; clamped >= 60s). Lower = more risk-control exposure. */
+  /** Background quota polling interval in ms (default 60 min; clamped >= 60s). Lower = more risk-control exposure. */
   quotaPollIntervalMs: number
+  /**
+   * Fetch quota statistics via official `agy -p /usage` CLI execution instead
+   * of direct Node.js REST calls to Google internal endpoints (default: true).
+   */
+  quotaViaCli: boolean
   /**
    * Global proxy URL (http:// or socks5://) applied to every agy spawn and
    * Google API call. An account's dedicated proxyUrl wins over this; empty
@@ -195,7 +200,8 @@ export function defaultConfig(): PluginConfig {
     autoFallbackModel: false,
     logRetentionDays: 7,
     disableTelemetry: true,
-    quotaPollIntervalMs: 15 * 60_000,
+    quotaPollIntervalMs: 60 * 60_000,
+    quotaViaCli: true,
     proxyUrl: '',
     // Windows is where agy's `--bg-updater` grandchild flashes a console
     // window; other platforms keep agy's own update behaviour by default.

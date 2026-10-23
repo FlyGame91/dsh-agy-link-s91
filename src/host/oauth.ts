@@ -65,8 +65,6 @@ export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_CALLBACK_PORT}${OAUT
 export const AGY_ENDPOINTS: readonly string[] = [
   'https://daily-cloudcode-pa.googleapis.com',
   'https://cloudcode-pa.googleapis.com',
-  'https://daily-cloudcode-pa.sandbox.googleapis.com',
-  'https://autopush-cloudcode-pa.sandbox.googleapis.com',
 ]
 
 export interface PkcePair {

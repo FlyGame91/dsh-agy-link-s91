@@ -26,6 +26,8 @@ import { AGY_ENDPOINTS, refreshTokens } from './oauth.ts'
 import { agyFetch } from './net.ts'
 import { detectSystemProxy } from './wincred.ts'
 import { parseCredentialDoc, credentialFingerprint, readPrimaryCredential, writePrimaryCredential } from './credential-slot.ts'
+import { readAgyUsage, usageGroupsToFamilies } from './agy-usage.ts'
+import { isolatedHomeEnv, proxyEnvFor } from './runner.ts'
 
 /**
  * When the quota-summary endpoint transiently fails, per-model fallback
@@ -483,7 +485,41 @@ export class QuotaService {
      * Injected because the version probe lives in the plugin entry point.
      */
     private readonly agyVersion: () => string | null = () => null,
+    /**
+     * Optional CLI quota source (`agy -p /usage`). Primary quota source:
+     * 100% official binary, real TLS fingerprint, native token refresh by agy Go runtime.
+     * REST endpoints serve as secondary fallback when CLI is unavailable.
+     */
+    private readonly cliDeps: {
+      bin?: () => string | null
+      preemptAutoUpdate?: () => boolean
+      viaCli?: () => boolean
+    } = {},
   ) {}
+
+  /**
+   * One `agy -p /usage` spawn under this account's own home/proxy, mapped onto
+   * pool families. Returns null when the CLI is missing, fails or reports
+   * nothing — the caller then falls back to REST-derived quotas.
+   */
+  private async readCliUsageFamilies(
+    account: ManagedAccount,
+  ): Promise<Partial<Record<ModelFamily, FamilyQuotaInfo>> | null> {
+    const bin = this.cliDeps.bin?.()
+    if (!bin) return null
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(account.dir ? isolatedHomeEnv(account.dir) : {}),
+      ...proxyEnvFor(this.proxyFor(account)),
+    }
+    const groups = await readAgyUsage({
+      bin,
+      env,
+      timeoutMs: 20_000,
+      preemptAutoUpdate: this.cliDeps.preemptAutoUpdate?.(),
+    })
+    return groups === null ? null : usageGroupsToFamilies(groups)
+  }
 
   /** Dedicated account proxy wins, then the global config proxy, then detected system proxy. */
   private proxyFor(account: ManagedAccount): string | undefined {
@@ -920,6 +956,24 @@ export class QuotaService {
       }
     }
 
+    // 1. CLI-FIRST PATH (Anti-Risk Control):
+    // When CLI is available and enabled (default), run official `agy -p /usage`.
+    // 100% official Google binary, real Go TLS fingerprint, native token refresh by agy Go runtime.
+    // Zero Node.js REST calls to Google's internal APIs.
+    if (this.cliDeps.viaCli?.() !== false) {
+      const cliFamilies = await this.readCliUsageFamilies(account)
+      if (cliFamilies !== null && Object.keys(cliFamilies).length > 0) {
+        if (account.authRequired) {
+          this.pool.clearAuthRequired(account.id)
+        }
+        if (cliFamilies.argon) {
+          this.pool.noteDedicatedGroup(account.id, 'argon')
+        }
+        this.pool.updateAccountQuotas(account.id, cliFamilies, email)
+        return cliFamilies
+      }
+    }
+
     const accessToken = await this.getValidAccessToken(account)
     if (!accessToken) {
       return null
@@ -1228,6 +1282,16 @@ export class QuotaService {
       // common transient false positive) or re-stamps it. This is what makes
       // "needs re-login" self-heal without a manual quota refresh.
       accounts = accounts.filter((acc) => shouldPollAccount(acc) || needsAuthReverify(acc))
+      // Stagger background polling: run accounts sequentially with a 2-second sleep
+      // to avoid spawning multiple CLI instances concurrently or hammering the system.
+      for (let i = 0; i < accounts.length; i++) {
+        const acc = accounts[i]!
+        await this.refreshAccountQuota(acc, false).catch(() => null)
+        if (i < accounts.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+        }
+      }
+      return
     }
     await Promise.allSettled(accounts.map((acc) => this.refreshAccountQuota(acc, force)))
   }

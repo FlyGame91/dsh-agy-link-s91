@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.69 (2026-10-23)
+
+### English
+
+- **Feat: Google risk-control hardening and CLI-first quota architecture.**
+  - Implemented CLI-first quota detection via official `agy -p /usage`: 100% genuine Go TLS fingerprint and client handshake, eliminating Node.js-level direct REST calls (`v1internal:retrieveUserQuotaSummary`) that trigger JA3/JA4 fingerprint mismatch warnings.
+  - Purged internal test endpoints (`daily-cloudcode-pa.sandbox.googleapis.com` and `autopush-cloudcode-pa.sandbox.googleapis.com`) from `AGY_ENDPOINTS` to prevent sandbox probe alarms on consumer accounts.
+  - Token refresh is fully delegated to the native `agy` CLI Go runtime; Node.js host process no longer issues direct refresh requests to `oauth2.googleapis.com/token`.
+  - Background quota polling interval widened from 15m to 60m (`quotaPollIntervalMs: 60m`), and account polling incorporates a 2-second stagger sleep to avoid simultaneous process bursts.
+- **Feat: Full concurrency on Windows credential slot via global primary account alignment (Scheme A).**
+  - Resolved Windows single-slot mutex serialization: concurrent sessions align to the current primary healthy candidate, hitting the `parallelSameAccount: true` fast path for 100% lock-free concurrency across sessions.
+  - Single-direction migration to the next candidate only occurs when the active account encounters a 429 quota exhaustion.
+- **Feat: Two-tier dual-loop test framework aligned with academic-agent & test suite speedup.**
+  - Introduced `pnpm run test:fast` (powered by `scripts/fast-test.mjs`) for inner TDD vibe loops (0.5s~5s), running only Git-affected test files or specified module keywords (`pnpm run test:fast <keyword>`).
+  - Tuned simulated asynchronous delay timers in `test/adapter.test.ts` and `fake-agy.mjs` from 5000ms/8000ms down to 300ms/400ms, speeding up adapter unit test execution by ~4x.
+- **Feat: Scroll guard & tool view expansion state persistence.**
+  - Added `scroll-guard.ts` to suspend DOM mutations and heavy scans (decisions, images, reasoning, mermaid) during active scrolling and smooth momentum settling.
+  - Preserved user expanded/collapsed tool card states across TanStack Virtualizer dynamic remount cycles.
+
+### 中文
+
+- **新功能：针对 Google 敏感风控强化防护与 CLI 优先配额体系。**
+  - 配额查询全面转向官方 `agy -p /usage` 解析：100% 走官方原生 Go 二进制握手与正规 TLS 指纹，消除 Node.js 层使用 `undici` 直接裸调 Google 内部 `v1internal` 接口带来的 JA3/JA4 客户端指纹断层风险。
+  - 从 `AGY_ENDPOINTS` 中彻底移除 `daily-cloudcode-pa.sandbox.googleapis.com` 与 `autopush-cloudcode-pa.sandbox.googleapis.com` 内部测试端点，杜绝异常沙箱端点探测对正式 Google 账号的风控隐患。
+  - OAuth 令牌刷新完全交由 `agy` 官方 Go 运行时在日常使用中原生完成，Node.js 宿主停止主动向 `oauth2.googleapis.com/token` 发送换票请求。
+  - 默认后台巡检周期放宽至 60 分钟（`quotaPollIntervalMs: 60m`），多账号后台轮询增加 2 秒错峰休眠，避免瞬时并发拉起 CLI 进程造成的系统负载颠簸。
+- **新功能：Windows 凭证槽位并发性能全面解锁（方案 A：全局主导账号收敛）。**
+  - 解决 Windows 系统下因全局唯一定制凭证槽位 `gemini:antigravity` 导致的跨 Session 串行卡顿问题：所有会话默认对齐到号池主导活跃健康账号，命中 `parallelSameAccount: true` 快速通道，实现跨会话 100% 无锁全并发执行。仅当主导账号 429 配额耗尽时，全局指针单向整体迁移至下一账号。
+- **新功能：对齐 academic-agent 的两级双环极速测试架构与用例调优。**
+  - 新增 `pnpm run test:fast` 极速内环测试工具（`scripts/fast-test.mjs`），实现基于 Git 变动的秒级精准回归（0.5s~5s）以及按模块关键字直跑（`pnpm run test:fast <keyword>`）。
+  - 优化 `adapter.test.ts` 与 `fake-agy.mjs` 中的异步等待延迟（由 5000ms/8000ms 降至 300ms/400ms），单测执行速度提升近 4 倍，保障日常开发极速反馈心流。
+- **新功能：页面平滑滚动守卫与工具卡片展开状态持久化。**
+  - 增加 `scroll-guard.ts` 滚动守卫机制，在用户主动滚屏及平滑滑动期间挂起 DOM 探测（decisions/images/reasoning/mermaid），彻底杜绝滚屏时内容突变抖动与闪烁。
+  - 工具卡片折叠/展开状态跨 TanStack-Virtual 虚拟列表重新挂载自动持久化保留（`expandedToolBlockKeys`）。
+
 ## 0.4.68 (2026-10-23)
 
 ### English

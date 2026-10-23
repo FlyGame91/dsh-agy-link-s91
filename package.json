@@ -1,6 +1,6 @@
 {
   "name": "dsh-agy-link",
-  "version": "0.4.68",
+  "version": "0.4.69",
   "description": "Google Antigravity (agy CLI) models for DeepSeek Harness — stream Gemini/Claude/GPT-OSS subscriptions into DSH with thinking, tool activity, token usage and in-GUI Google OAuth login.",
   "type": "module",
   "license": "MIT",
@@ -97,6 +97,7 @@
     "build": "tsdown",
     "check": "tsc --noEmit",
     "test": "node --experimental-transform-types --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "test:fast": "node scripts/fast-test.mjs",
     "prepare": "npm run build",
     "prepack": "npm run build"
   },

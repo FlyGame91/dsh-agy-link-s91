@@ -131,6 +131,7 @@ export function resolveConfig(
     logRetentionDays: asNum(get('logRetentionDays')) ?? base.logRetentionDays,
     disableTelemetry: asBool(get('disableTelemetry')) ?? base.disableTelemetry,
     quotaPollIntervalMs: asNum(get('quotaPollIntervalMs')) ?? base.quotaPollIntervalMs,
+    quotaViaCli: asBool(get('quotaViaCli')) ?? base.quotaViaCli,
     proxyUrl: asString(get('proxyUrl')) ?? base.proxyUrl,
     suppressAgyAutoUpdate: asBool(get('suppressAgyAutoUpdate')) ?? base.suppressAgyAutoUpdate,
   }
@@ -192,6 +193,10 @@ export function resolveConfig(
   if (env.DSH_AGY_QUOTA_POLL_INTERVAL_MS) {
     const q = asNum(env.DSH_AGY_QUOTA_POLL_INTERVAL_MS)
     if (q && q >= 60_000) cfg.quotaPollIntervalMs = q
+  }
+  if (env.DSH_AGY_QUOTA_VIA_CLI !== undefined) {
+    const qvc = asBool(env.DSH_AGY_QUOTA_VIA_CLI)
+    if (qvc !== undefined) cfg.quotaViaCli = qvc
   }
   if (env.DSH_AGY_PROXY_URL) cfg.proxyUrl = env.DSH_AGY_PROXY_URL
   if (env.DSH_AGY_SUPPRESS_AUTOUPDATE !== undefined) {

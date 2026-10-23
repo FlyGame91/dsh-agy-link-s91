@@ -663,7 +663,7 @@ export class AgyAdapter extends LlmAdapter {
     let models = cat.models
     // If the active account has no Argon access, filter out Argon models so the
     // composer model picker only shows models available to the current active account.
-    if (activeAcc && !accountHasArgon(activeAcc, this.deps.pool, cat)) {
+    if (!activeAcc || !accountHasArgon(activeAcc, this.deps.pool, cat)) {
       models = models.filter((m) => !isArgonModel(m.id))
     }
     // DSH's llm.listModels rejects a provider catalog containing any
@@ -973,25 +973,39 @@ export class AgyAdapter extends LlmAdapter {
     // which wastes huge amounts of token quota.
     let account: ManagedAccount | undefined
     if (this.deps.pool && !isAux && sessionKey !== '') {
-      const prefix = `${sessionKey}:`
-      let mostRecentAccount: ManagedAccount | undefined
-      let latestUpdated = -1
-
-      for (const [k, b] of Object.entries(this.deps.store.all())) {
-        if (k.startsWith(prefix) && b.updatedAt > latestUpdated) {
-          const boundId = k.slice(prefix.length)
-          const boundAcc = this.deps.pool.getAccount(boundId)
-          if (boundAcc) {
-            mostRecentAccount = boundAcc
-            latestUpdated = b.updatedAt
-          } else {
-            this.deps.store.delete(k)
-          }
+      // Scheme A: On Windows (shared global Credential Manager slot), cross-account
+      // session affinity forces different sessions to ping-pong on the single
+      // slot and completely serializes them. Align all concurrent sessions to the
+      // pool's current active healthy candidate so they share the slot under
+      // `parallelSameAccount: true` and run with 100% lock-free concurrency.
+      if (process.platform === 'win32' && cfg.parallelSameAccount) {
+        const poolActive = this.deps.pool.selectAccount(family)
+        if (poolActive) {
+          account = poolActive
         }
       }
 
-      if (mostRecentAccount && this.deps.pool.isAccountEligible(mostRecentAccount, family)) {
-        account = mostRecentAccount
+      if (!account) {
+        const prefix = `${sessionKey}:`
+        let mostRecentAccount: ManagedAccount | undefined
+        let latestUpdated = -1
+
+        for (const [k, b] of Object.entries(this.deps.store.all())) {
+          if (k.startsWith(prefix) && b.updatedAt > latestUpdated) {
+            const boundId = k.slice(prefix.length)
+            const boundAcc = this.deps.pool.getAccount(boundId)
+            if (boundAcc) {
+              mostRecentAccount = boundAcc
+              latestUpdated = b.updatedAt
+            } else {
+              this.deps.store.delete(k)
+            }
+          }
+        }
+
+        if (mostRecentAccount && this.deps.pool.isAccountEligible(mostRecentAccount, family)) {
+          account = mostRecentAccount
+        }
       }
     }
 
