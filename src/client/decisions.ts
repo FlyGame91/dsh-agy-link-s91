@@ -166,7 +166,21 @@ function extractOptionsFromList(container: HTMLElement): ExtractedOption[] {
 }
 
 /**
- * Scan DOM for decision prompts and mount interactive choice chips
+ * Scan DOM for decision prompts and mount interactive choice chips.
+ *
+ * IDEMPOTENCE (incident 2026-10-23 — "scroll back and forth = insane flashing"):
+ * DSH renders these containers inside a TanStack-Virtual list with dynamic
+ * measurement (`measureElement` + `anchorTo:"start"`). Injecting a toolbar
+ * changes the measured item height, which makes the virtualizer rewrite
+ * scrollTop; the resulting re-render rebuilds the markdown/heading nodes
+ * (dropping the per-HEADING guard) and this scanner injected the toolbar
+ * again — growth on every scroll pass, i.e. a flashing flywheel.
+ *
+ * Two independent guards now make injection strictly once-per-container:
+ *   1. `data-agy-decisions-scanned` on the container, written on EVERY pass
+ *      (it used to be read here but never assigned anywhere in the codebase),
+ *   2. "a toolbar already exists in this container" — survives React
+ *      rebuilding the heading nodes during a virtualizer remount.
  */
 export function scanAndEnhanceDecisions(): void {
   if (typeof document === 'undefined') return;
@@ -175,6 +189,17 @@ export function scanAndEnhanceDecisions(): void {
   for (let i = 0; i < markdownContainers.length; i++) {
     const container = markdownContainers[i];
     if (!container || container.dataset.agyDecisionsScanned === 'true') continue;
+
+    // A previous pass (or the host's own snapshot) already injected a toolbar
+    // into this container. Mark and skip: never inject a duplicate.
+    if (container.querySelector('.agy-decision-container')) {
+      container.dataset.agyDecisionsScanned = 'true';
+      continue;
+    }
+
+    // Mark BEFORE mutating so a self-triggered re-scan (this function inserts
+    // nodes, which fires the observer that called it) short-circuits above.
+    container.dataset.agyDecisionsScanned = 'true';
 
     // Check headings (h2, h3, h4, or strong paragraphs)
     const headings = container.querySelectorAll<HTMLElement>('h2, h3, h4, p > strong');

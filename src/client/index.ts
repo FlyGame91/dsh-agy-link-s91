@@ -526,12 +526,16 @@ function installSettingsNavIcon(ctx: ClientContext, resolveLabel: () => string):
 		scheduled = false;
 		if (disposed) return;
 		const wanted = resolveLabel();
+		// Only touch the DOM when the marker is not already correct. Unconditional
+		// writes made every sync pass enqueue another sync pass (the observer
+		// watches this very attribute), which turned a single host re-render into
+		// a self-sustaining loop during streaming/scroll reflows (2026-10-23).
 		for (const row of Array.from(document.querySelectorAll(NAV_ROW_SELECTOR))) {
-			if (isOwnNavRow(row.textContent, wanted)) {
-				row.setAttribute(NAV_ICON_MARKER, '');
-			} else {
-				row.removeAttribute(NAV_ICON_MARKER);
-			}
+			const shouldMark = isOwnNavRow(row.textContent, wanted);
+			const marked = row.hasAttribute(NAV_ICON_MARKER);
+			if (shouldMark === marked) continue;
+			if (shouldMark) row.setAttribute(NAV_ICON_MARKER, '');
+			else row.removeAttribute(NAV_ICON_MARKER);
 		}
 	};
 	const schedule = () => {
@@ -541,10 +545,16 @@ function installSettingsNavIcon(ctx: ClientContext, resolveLabel: () => string):
 	};
 	sync();
 	const observer = new MutationObserver(schedule);
+	// attributeFilter is load-bearing: sync() writes NAV_ICON_MARKER, and an
+	// unfiltered subtree observer re-fires on its own writes (measured 5
+	// self-induced passes per host mutation). characterData is deliberately
+	// NOT observed — label text changes arrive as childList of the row, and
+	// watching every text node made the host's streaming output drive full
+	// nav sweeps.
 	observer.observe(document.body, {
 		childList: true,
 		subtree: true,
-		characterData: true,
+		attributeFilter: [NAV_ICON_MARKER],
 	});
 	return () => {
 		disposed = true;
@@ -1564,7 +1574,18 @@ export function apply(ctx: ClientContext): void {
 		const hiddenModelSet = new Set(status?.hiddenModels ?? []);
 		const accounts = pool?.accounts ?? [];
 		const isAuthed = authPhase === 'ok' || accounts.length > 0;
+		// Per-action busy scoping (2026-10-23): `isBusy` used to be
+		// `loadingAction !== null` and was applied to EVERY account button, so
+		// one refresh flipped 40 `disabled` attributes at once (measured: 40
+		// attribute mutations for 2 added nodes) and repainted the whole panel.
+		// Each control now derives its own busy state from the action that
+		// concerns it, so an unrelated action leaves its DOM untouched.
 		const isBusy = loadingAction !== null;
+		/** Busy for a per-account action; also blocks while a global action runs. */
+		const accountActionBusy = (acc: ManagedAccount, action: string): boolean =>
+			loadingAction === `${action}:${acc.id}`;
+		/** Global actions (add/sync-all/save) genuinely conflict with everything. */
+		const globalBusy = isBusy && !loadingAction?.includes(':');
 
 		const renderSpinner = () => h('span', { className: 'agy-spinner' });
 
@@ -1591,9 +1612,18 @@ export function apply(ctx: ClientContext): void {
 			);
 		};
 
-		const isRefreshingQuota = loadingAction === 'refresh-quota';
+		// Scoped shimmer (2026-10-23): the global 'refresh-quota' flag used to be
+		// passed to EVERY account's quota bars, so refreshing one account started
+		// the infinite shimmer animation on all of them — extra compositing and
+		// repaints across the whole panel while the user scrolls.
 		const renderQuotaBar = (label: string, familyKey: 'google' | 'argon' | 'anthropic' | 'openai', acc: ManagedAccount): unknown =>
-			renderFamilyQuotaBar(t, label, familyKey, acc, isRefreshingQuota);
+			renderFamilyQuotaBar(
+				t,
+				label,
+				familyKey,
+				acc,
+				loadingAction === 'refresh-quota' || loadingAction === `refresh:${acc.id}`,
+			);
 
 		// Authoritative active account: trust pool.activeAccountId computed by
 		// the scheduler, falling back to lastActiveAccountId, activeAccountIds.google, or primaryAccountId.
@@ -1794,7 +1824,7 @@ export function apply(ctx: ClientContext): void {
 								? { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' }
 								: { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							title: acc.enabled ? t('account.disableTitle') : t('account.enableTitle'),
-							disabled: isBusy,
+							disabled: accountActionBusy(acc, 'enable'),
 							onClick: () => void toggleAccountEnabled(acc),
 						}, loadingAction === `enable:${acc.id}`
 							? [renderSpinner(), acc.enabled ? t('account.disable') : t('account.enable')]
@@ -1804,7 +1834,7 @@ export function apply(ctx: ClientContext): void {
 							className: 'agy-btn',
 							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							title: t('account.syncTitle'),
-							disabled: isBusy,
+							disabled: accountActionBusy(acc, 'refresh'),
 							onClick: () => void refreshQuota(acc.id),
 						}, loadingAction === `refresh:${acc.id}` ? [renderSpinner(), t('account.syncing')] : [uiIcon('refresh', 10), ` ${t('account.sync')}`]),
 						acc.enabled && !isInUse ? h('button', {
@@ -1812,7 +1842,7 @@ export function apply(ctx: ClientContext): void {
 							className: 'agy-btn',
 							style: { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
 							title: t('account.setActive'),
-							disabled: isBusy,
+							disabled: accountActionBusy(acc, 'active'),
 							onClick: () => void setActiveAccount(acc.id),
 						}, loadingAction === `active:${acc.id}` ? [renderSpinner(), t('account.settingActive')] : [uiIcon('zap', 10), ` ${t('account.setActive')}`]) : null,
 
@@ -1820,7 +1850,7 @@ export function apply(ctx: ClientContext): void {
 							type: 'button',
 							className: 'agy-btn',
 							style: isEditingProxy ? { ...S.btnSmPrimary, gap: '3px', fontSize: '11px', padding: '2px 6px' } : { ...S.btnSm, gap: '3px', fontSize: '11px', padding: '2px 6px' },
-							disabled: isBusy,
+							disabled: accountActionBusy(acc, 'proxy'),
 							onClick: () => setEditingProxyId(isEditingProxy ? null : acc.id),
 						}, [uiIcon('globe', 10), ` ${t('proxy.button')}`]),
 						accounts.length > 1 ? h('button', {
@@ -1829,7 +1859,7 @@ export function apply(ctx: ClientContext): void {
 							style: { ...S.btnDanger, padding: '2px 6px', fontSize: '11px' },
 							title: t('account.removeTitle'),
 							'aria-label': t('account.removeTitle'),
-							disabled: isBusy,
+							disabled: accountActionBusy(acc, 'remove'),
 							onClick: () => void removeAccount(acc.id, displayAlias),
 						}, loadingAction === `remove:${acc.id}` ? renderSpinner() : uiIcon('trash', 11, 'var(--agy-danger-text)')) : null,
 					),
@@ -1917,7 +1947,7 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 						type: 'button',
 						className: 'agy-btn',
 						style: { ...S.btnSm, color: 'var(--agy-warn-btn-text)', borderColor: 'var(--agy-warn-btn-border)', background: 'var(--agy-warn-btn-bg)', gap: '4px' },
-						disabled: isBusy,
+						disabled: accountActionBusy(acc, 'clearCooldown'),
 						onClick: () => void clearCooldown(acc.id),
 					}, loadingAction === `clearCooldown:${acc.id}` ? [renderSpinner(), ''] : [uiIcon('zap', 11, 'var(--agy-warn-btn-text)'), ` ${t('account.clearCooldown')}`]),
 				) : null,
@@ -1943,7 +1973,7 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 							type: 'button',
 							className: 'agy-btn',
 							style: S.btnPrimary,
-							disabled: isBusy,
+							disabled: accountActionBusy(acc, 'proxy'),
 							onClick: () => void saveProxy(acc.id),
 						}, loadingAction === `proxy:${acc.id}` ? [renderSpinner(), t('proxy.save')] : t('proxy.save')),
 						h('button', {
