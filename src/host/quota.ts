@@ -43,6 +43,77 @@ export function mergeFallbackFamilyQuota(
   return fallback
 }
 
+/** Minimal shape of the quota groups `retrieveUserQuotaSummary` returns. */
+export interface QuotaGroupShape {
+  displayName?: string
+  description?: string
+  buckets?: readonly { bucketId?: string; displayName?: string }[]
+}
+
+/**
+ * True when any returned group is the dedicated Argon bucket.
+ *
+ * The backend stops emitting that group once the plan folds Argon into the
+ * larger Gemini bucket (Ultra). From then on the family is governed by the
+ * shared bucket, so a cooldown recorded against the retired pool — e.g. a 429
+ * taken minutes before an upgrade — must not keep blocking the family for days.
+ */
+export function summaryHasArgonGroup(groups: readonly QuotaGroupShape[]): boolean {
+  return groups.some((group) => {
+    const fields: (string | undefined)[] = [group.displayName, group.description]
+    for (const bucket of group.buckets ?? []) fields.push(bucket.bucketId, bucket.displayName)
+    return fields.some((value) => typeof value === 'string' && value.toLowerCase().includes('argon'))
+  })
+}
+
+/**
+ * Decide whether a family's cooldown belongs to a quota bucket that no longer exists.
+ *
+ * A cooldown is recorded against the pool that produced the 429. A plan change can
+ * retire that pool — a Pro → Ultra upgrade folds Argon into the larger Gemini bucket
+ * and the backend stops emitting the `Gemini 4 Argon` group — leaving a cooldown that
+ * blocks the family until a reset that no longer applies:
+ *
+ *   All Antigravity accounts are unavailable: no account can serve argon right now
+ *   (1 in cooldown) (earliest reset in 345338s)
+ *
+ * `groupSeenBefore` is what keeps this from firing on accounts that never had the
+ * group at all (free tier, or any plan without an Argon bucket): their argon
+ * cooldowns come from genuine 429s and must survive.
+ */
+export function shouldReleaseOrphanedCooldown(state: {
+  summaryAuthoritative: boolean
+  groupPresent: boolean
+  groupSeenBefore: boolean
+  hasCooldown: boolean
+}): boolean {
+  return state.summaryAuthoritative
+    && !state.groupPresent
+    && state.groupSeenBefore
+    && state.hasCooldown
+}
+
+/**
+ * Pick the family fraction when this poll's summary carried no group for it.
+ *
+ * An *authoritative* summary (at least one group returned) means the absence is
+ * real: the family lost its own bucket — a Pro → Ultra upgrade folds the
+ * separate Argon pool into the larger Gemini bucket, and the backend then stops
+ * reporting a `Gemini 4 Argon` group entirely while `fetchAvailableModels`
+ * keeps listing the argon models with fresh per-model fractions. Keeping the
+ * last-known-good row there would freeze a dead window on screen (0%, a reset
+ * time from the previous tier).
+ *
+ * A failed or empty summary is the case `mergeFallbackFamilyQuota` protects:
+ * nothing authoritative arrived, so the previous complete value stays.
+ */
+export function pickFamilyQuota(
+  prev: FamilyQuotaInfo | undefined,
+  fresh: FamilyQuotaInfo,
+  summaryAuthoritative: boolean,
+): FamilyQuotaInfo {
+  return summaryAuthoritative ? fresh : mergeFallbackFamilyQuota(prev, fresh)
+}
 
 export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
   const logDir = join(homeDir, '.gemini', 'antigravity-cli', 'log')
@@ -78,11 +149,35 @@ export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
 
 export const OAUTH_USERINFO_URL = 'https://www.googleapis.com/oauth2/v1/userinfo'
 
+/**
+ * The backend classifies the caller by its `User-Agent` and only returns the
+ * separate `Gemini 4 Argon` quota group for the CLI product (`antigravity/cli/`)
+ * at or above this version. Older/other product strings get the legacy two
+ * groups, which is why Pro-plan users saw no Argon quota at all.
+ */
+export const AGY_UA_MIN_VERSION = '1.3.0'
+/** Used when the installed agy version is unknown or older than AGY_UA_MIN_VERSION. */
+const AGY_UA_FALLBACK_VERSION = '1.4.5'
+
+function semverAtLeast(candidate: string | null | undefined, floor: string): boolean {
+  if (!candidate) return false
+  const a = candidate.match(/^(\d+)\.(\d+)\.(\d+)$/)
+  const b = floor.match(/^(\d+)\.(\d+)\.(\d+)$/)
+  if (!a || !b) return false
+  for (let i = 1; i <= 3; i += 1) {
+    const x = Number(a[i])
+    const y = Number(b[i])
+    if (x !== y) return x > y
+  }
+  return true
+}
+
 /** Platform-faithful agy User-Agent (hardcoding darwin/arm64 on Windows is a bad fingerprint). */
-export function agyUserAgent(version = '2.24.0'): string {
+export function agyUserAgent(version?: string | null): string {
   const os = process.platform === 'win32' ? 'windows' : process.platform
   const arch = process.arch === 'x64' ? 'amd64' : process.arch
-  return `antigravity/${version} ${os}/${arch}`
+  const v = semverAtLeast(version, AGY_UA_MIN_VERSION) ? version! : AGY_UA_FALLBACK_VERSION
+  return `antigravity/cli/${v} (aidev_client; os_type=${os}; arch=${arch}; auth_method=consumer)`
 }
 
 /**
@@ -383,6 +478,11 @@ export class QuotaService {
   constructor(
     private readonly pool: AccountPoolManager,
     private readonly globalProxy: () => string = () => '',
+    /**
+     * Resolves the installed agy version for the quota/model User-Agent.
+     * Injected because the version probe lives in the plugin entry point.
+     */
+    private readonly agyVersion: () => string | null = () => null,
   ) {}
 
   /** Dedicated account proxy wins, then the global config proxy, then detected system proxy. */
@@ -627,7 +727,7 @@ export class QuotaService {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': agyUserAgent(),
+        'User-Agent': agyUserAgent(this.agyVersion()),
       },
       body: JSON.stringify({}),
     }, proxyUrl)
@@ -692,7 +792,7 @@ export class QuotaService {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': agyUserAgent(),
+        'User-Agent': agyUserAgent(this.agyVersion()),
       },
       body: JSON.stringify({}),
     }, proxyUrl)
@@ -733,7 +833,7 @@ export class QuotaService {
           headers: {
             Authorization: `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
-            'User-Agent': agyUserAgent(),
+            'User-Agent': agyUserAgent(this.agyVersion()),
           },
           body: JSON.stringify({}),
         }, proxyUrl)
@@ -1025,11 +1125,11 @@ export class QuotaService {
         const isStale = stale5hFamilies.has(fam)
         // Fallback for family fraction if summary was unavailable.
         if (!familyQuotas[fam]) {
-          familyQuotas[fam] = mergeFallbackFamilyQuota(account.quotas[fam], {
-            remainingFraction: remaining,
-            resetTime,
-            updatedAt: now,
-          })
+          familyQuotas[fam] = pickFamilyQuota(
+            account.quotas[fam],
+            { remainingFraction: remaining, resetTime, updatedAt: now },
+            summaryGroups.length > 0,
+          )
           if (fam === 'argon' && familyQuotas[fam]!.weeklyFraction === undefined) {
             familyQuotas[fam]!.weeklyFraction = remaining
             familyQuotas[fam]!.weeklyResetTime = resetTime
@@ -1058,6 +1158,22 @@ export class QuotaService {
       const fam = famKey as ModelFamily
       if (familyQuotas[fam]) {
         familyQuotas[fam]!.models = list
+      }
+    }
+
+    // Track whether this account reports a dedicated Argon bucket, so a retired one
+    // can be told apart from one that never existed (see shouldReleaseOrphanedCooldown).
+    if (summaryGroups.length > 0) {
+      if (summaryHasArgonGroup(summaryGroups)) {
+        this.pool.noteDedicatedGroup(account.id, 'argon')
+      } else if (shouldReleaseOrphanedCooldown({
+        summaryAuthoritative: true,
+        groupPresent: false,
+        groupSeenBefore: this.pool.hasDedicatedGroup(account.id, 'argon'),
+        hasCooldown: account.cooldowns?.argon !== undefined,
+      })) {
+        this.pool.forgetDedicatedGroup(account.id, 'argon')
+        this.pool.clearCooldown(account.id, 'argon')
       }
     }
 

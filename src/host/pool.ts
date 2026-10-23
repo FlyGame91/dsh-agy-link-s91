@@ -877,6 +877,31 @@ export class AccountPoolManager {
     this.persist()
   }
 
+  /** True when this account has reported a dedicated quota group for `family`. */
+  hasDedicatedGroup(id: string, family: ModelFamily): boolean {
+    return this.getAccount(id)?.dedicatedGroups?.includes(family) === true
+  }
+
+  /**
+   * Remember that `family` has its own quota group on this account.
+   * Persists only on an actual change so a steady-state poll stays write-free.
+   */
+  noteDedicatedGroup(id: string, family: ModelFamily): void {
+    const acc = this.getAccount(id)
+    if (!acc) return
+    if (acc.dedicatedGroups?.includes(family)) return
+    acc.dedicatedGroups = [...(acc.dedicatedGroups ?? []), family]
+    this.persist()
+  }
+
+  /** Forget a family's dedicated group after it stopped being reported. */
+  forgetDedicatedGroup(id: string, family: ModelFamily): void {
+    const acc = this.getAccount(id)
+    if (!acc?.dedicatedGroups?.includes(family)) return
+    acc.dedicatedGroups = acc.dedicatedGroups.filter((f) => f !== family)
+    this.persist()
+  }
+
   clearCooldown(id?: string, family?: ModelFamily): void {
     if (id) {
       const acc = this.getAccount(id)

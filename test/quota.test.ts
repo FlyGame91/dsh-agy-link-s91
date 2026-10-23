@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
-import { QuotaService, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
+import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken, pickFamilyQuota, shouldReleaseOrphanedCooldown, summaryHasArgonGroup } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
@@ -1043,3 +1043,121 @@ test('Argon model quota populates weeklyFraction when summary has no weekly argo
 
 
 
+
+test('agyUserAgent emits the CLI product string the backend needs for Argon', () => {
+  // Regression: the UA used to be `antigravity/<version> <os>/<arch>`, which the
+  // backend classifies as a non-CLI product, so `retrieveUserQuotaSummary`
+  // answered with only the Gemini/3P groups and the Pro-plan Argon group was
+  // never present — the UI silently showed no Argon quota at all.
+  const fallback = agyUserAgent()
+  assert.match(fallback, /^antigravity\/cli\/\d+\.\d+\.\d+ \(aidev_client; os_type=/)
+  assert.ok(fallback.includes('auth_method=consumer'), 'keeps the CLI identity markers')
+  assert.ok(!fallback.includes('antigravity/2.'), 'must not use the old non-CLI product form')
+
+  // A real, new-enough agy version is forwarded verbatim.
+  assert.ok(agyUserAgent('1.4.5').includes('antigravity/cli/1.4.5 '))
+  assert.ok(agyUserAgent('1.5.0').includes('antigravity/cli/1.5.0 '))
+
+  // Anything older than the floor (or unparseable) falls back, because those
+  // builds never received the Argon group in the first place.
+  assert.ok(!agyUserAgent('1.2.2').includes('cli/1.2.2'), 'below floor must not claim a new version')
+  assert.ok(!agyUserAgent('garbage').includes('garbage'))
+  assert.ok(!agyUserAgent(null).includes('null'))
+})
+
+test('QuotaService accepts an agy version provider without touching the network', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-ua-'))
+  const pool = new AccountPoolManager(dir)
+  const quota = new QuotaService(pool, () => '', () => '1.4.5')
+  assert.ok(quota instanceof QuotaService)
+})
+
+test('pickFamilyQuota drops a dead last-known-good row when the summary is authoritative', () => {
+  // Real incident: an account upgraded Pro → Ultra. The backend then stopped
+  // returning the separate `Gemini 4 Argon` group (its quota is folded into the
+  // Gemini bucket) while `fetchAvailableModels` kept listing the argon models
+  // with a fresh 100%. Keeping last-known-good froze the previous tier's window
+  // on screen: 0%, and a reset time two days in the past relative to the new one.
+  const staleArgon: import('../src/common/pool-types.ts').FamilyQuotaInfo = {
+    remainingFraction: 0,
+    resetTime: '2026-10-27T03:28:36Z',
+    weeklyFraction: 0,
+    weeklyResetTime: '2026-10-27T03:28:36Z',
+    updatedAt: 1_000,
+  }
+  const freshArgon = {
+    remainingFraction: 1,
+    resetTime: '2026-10-30T03:19:31Z',
+    updatedAt: 2_000,
+  }
+
+  // Authoritative summary: the family is genuinely gone → adopt the live value.
+  assert.equal(pickFamilyQuota(staleArgon, freshArgon, true), freshArgon)
+
+  // Failed/empty summary: nothing authoritative arrived → keep last-known-good,
+  // which is exactly what mergeFallbackFamilyQuota already guarantees.
+  assert.equal(pickFamilyQuota(staleArgon, freshArgon, false), staleArgon)
+
+  // First-ever refresh has no previous value either way.
+  assert.equal(pickFamilyQuota(undefined, freshArgon, true), freshArgon)
+  assert.equal(pickFamilyQuota(undefined, freshArgon, false), freshArgon)
+})
+
+test('summaryHasArgonGroup detects the dedicated Argon bucket across group shapes', () => {
+  // Pro: the backend emits a dedicated group whose name carries "Argon".
+  assert.equal(summaryHasArgonGroup([
+    { displayName: 'Gemini Models', description: 'Gemini Flash, Gemini Pro' },
+    { displayName: 'Gemini 4 Argon', description: 'For paid Pro plans, Argon quota is separate.' },
+  ]), true)
+
+  // Freshly upgraded Ultra account: only the two shared groups come back, so the
+  // family is now governed by the Gemini bucket (the #54 scenario).
+  assert.equal(summaryHasArgonGroup([
+    { displayName: 'Gemini Models', description: 'Gemini Flash, Gemini Pro' },
+    { displayName: 'Claude and GPT models', description: 'Claude Opus, Claude Sonnet, GPT-OSS' },
+  ]), false)
+
+  // A neutrally named group that only announces Argon through its bucketId still counts.
+  assert.equal(summaryHasArgonGroup([{
+    displayName: 'Quota',
+    buckets: [{ bucketId: 'gemini-argon-wtu-weekly', displayName: 'Weekly Limit Remaining' }],
+  }]), true)
+
+  assert.equal(summaryHasArgonGroup([]), false)
+})
+
+test('shouldReleaseOrphanedCooldown never fires for an account that never had an Argon bucket', () => {
+  // Reviewer-reported regression: the first draft cleared the argon cooldown on
+  // every authoritative poll that lacked the group — true for free-tier and every
+  // non-Pro account, whose argon cooldowns come from real 429s. Clearing those
+  // every 60s silently disabled the cooldown mechanism for that family.
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: true,
+    groupPresent: false,
+    groupSeenBefore: false,   // never reported a dedicated bucket
+    hasCooldown: true,
+  }), false)
+
+  // The genuine Pro -> Ultra transition: the account used to report the bucket.
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: true,
+    groupPresent: false,
+    groupSeenBefore: true,
+    hasCooldown: true,
+  }), true)
+
+  // Still reported -> nothing to release.
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: true, groupPresent: true, groupSeenBefore: true, hasCooldown: true,
+  }), false)
+
+  // No cooldown to release -> no pointless persist().
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: true, groupPresent: false, groupSeenBefore: true, hasCooldown: false,
+  }), false)
+
+  // Failed/empty summary carries no authority over a family that is missing.
+  assert.equal(shouldReleaseOrphanedCooldown({
+    summaryAuthoritative: false, groupPresent: false, groupSeenBefore: true, hasCooldown: true,
+  }), false)
+})

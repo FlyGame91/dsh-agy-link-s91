@@ -87,6 +87,15 @@ export interface ManagedAccount {
   cooldowns: Partial<Record<ModelFamily, FamilyCooldownState>>
   /** Cached real-time quota statistics per model family. */
   quotas: Partial<Record<ModelFamily, FamilyQuotaInfo>>
+  /**
+   * Families this account has itself reported a dedicated quota group for.
+   *
+   * Only used to tell "the bucket went away" (Pro -> Ultra folds Argon into the
+   * Gemini bucket) apart from "this account never had one" (free tier, or a
+   * plan that never exposes Argon) — the latter must never have its cooldown
+   * cleared, because its argon cooldowns come from real 429s.
+   */
+  dedicatedGroups?: ModelFamily[]
 }
 
 export type AccountHealthStatus = 'healthy' | 'cooldown' | 'auth_required' | 'disabled'

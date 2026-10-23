@@ -143,7 +143,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const version = () => versionCache
   const store = new SessionStore(join(stateDir(), 'sessions.json'))
   const pool = new AccountPoolManager()
-  const quota = new QuotaService(pool, () => getConfig().proxyUrl || detectSystemProxy() || '')
+  const quota = new QuotaService(pool, () => getConfig().proxyUrl || detectSystemProxy() || '', version)
   const semaphore = new Semaphore(() => getConfig().maxConcurrent)
 
   const getDiscoveryEnv = (account?: ManagedAccount): NodeJS.ProcessEnv => {
