@@ -43,6 +43,28 @@ export function mergeFallbackFamilyQuota(
   return fallback
 }
 
+/**
+ * Pick the family fraction when this poll's summary carried no group for it.
+ *
+ * An *authoritative* summary (at least one group returned) means the absence is
+ * real: the family lost its own bucket — a Pro → Ultra upgrade folds the
+ * separate Argon pool into the larger Gemini bucket, and the backend then stops
+ * reporting a `Gemini 4 Argon` group entirely while `fetchAvailableModels`
+ * keeps listing the argon models with fresh per-model fractions. Keeping the
+ * last-known-good row there would freeze a dead window on screen (0%, a reset
+ * time from the previous tier).
+ *
+ * A failed or empty summary is the case `mergeFallbackFamilyQuota` protects:
+ * nothing authoritative arrived, so the previous complete value stays.
+ */
+export function pickFamilyQuota(
+  prev: FamilyQuotaInfo | undefined,
+  fresh: FamilyQuotaInfo,
+  summaryAuthoritative: boolean,
+): FamilyQuotaInfo {
+  return summaryAuthoritative ? fresh : mergeFallbackFamilyQuota(prev, fresh)
+}
+
 
 export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
   const logDir = join(homeDir, '.gemini', 'antigravity-cli', 'log')
@@ -1054,11 +1076,11 @@ export class QuotaService {
         const isStale = stale5hFamilies.has(fam)
         // Fallback for family fraction if summary was unavailable.
         if (!familyQuotas[fam]) {
-          familyQuotas[fam] = mergeFallbackFamilyQuota(account.quotas[fam], {
-            remainingFraction: remaining,
-            resetTime,
-            updatedAt: now,
-          })
+          familyQuotas[fam] = pickFamilyQuota(
+            account.quotas[fam],
+            { remainingFraction: remaining, resetTime, updatedAt: now },
+            summaryGroups.length > 0,
+          )
           if (fam === 'argon' && familyQuotas[fam]!.weeklyFraction === undefined) {
             familyQuotas[fam]!.weeklyFraction = remaining
             familyQuotas[fam]!.weeklyResetTime = resetTime

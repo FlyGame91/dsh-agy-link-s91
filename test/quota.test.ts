@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
-import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
+import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken, pickFamilyQuota } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
@@ -1070,4 +1070,35 @@ test('QuotaService accepts an agy version provider without touching the network'
   const pool = new AccountPoolManager(dir)
   const quota = new QuotaService(pool, () => '', () => '1.4.5')
   assert.ok(quota instanceof QuotaService)
+})
+
+test('pickFamilyQuota drops a dead last-known-good row when the summary is authoritative', () => {
+  // Real incident: an account upgraded Pro → Ultra. The backend then stopped
+  // returning the separate `Gemini 4 Argon` group (its quota is folded into the
+  // Gemini bucket) while `fetchAvailableModels` kept listing the argon models
+  // with a fresh 100%. Keeping last-known-good froze the previous tier's window
+  // on screen: 0%, and a reset time two days in the past relative to the new one.
+  const staleArgon: import('../src/common/pool-types.ts').FamilyQuotaInfo = {
+    remainingFraction: 0,
+    resetTime: '2026-10-27T03:28:36Z',
+    weeklyFraction: 0,
+    weeklyResetTime: '2026-10-27T03:28:36Z',
+    updatedAt: 1_000,
+  }
+  const freshArgon = {
+    remainingFraction: 1,
+    resetTime: '2026-10-30T03:19:31Z',
+    updatedAt: 2_000,
+  }
+
+  // Authoritative summary: the family is genuinely gone → adopt the live value.
+  assert.equal(pickFamilyQuota(staleArgon, freshArgon, true), freshArgon)
+
+  // Failed/empty summary: nothing authoritative arrived → keep last-known-good,
+  // which is exactly what mergeFallbackFamilyQuota already guarantees.
+  assert.equal(pickFamilyQuota(staleArgon, freshArgon, false), staleArgon)
+
+  // First-ever refresh has no previous value either way.
+  assert.equal(pickFamilyQuota(undefined, freshArgon, true), freshArgon)
+  assert.equal(pickFamilyQuota(undefined, freshArgon, false), freshArgon)
 })
