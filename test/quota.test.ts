@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
-import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken, pickFamilyQuota } from '../src/host/quota.ts'
+import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken, pickFamilyQuota, summaryHasArgonGroup } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
@@ -1101,4 +1101,27 @@ test('pickFamilyQuota drops a dead last-known-good row when the summary is autho
   // First-ever refresh has no previous value either way.
   assert.equal(pickFamilyQuota(undefined, freshArgon, true), freshArgon)
   assert.equal(pickFamilyQuota(undefined, freshArgon, false), freshArgon)
+})
+
+test('summaryHasArgonGroup detects the dedicated Argon bucket across group shapes', () => {
+  // Pro: the backend emits a dedicated group whose name carries "Argon".
+  assert.equal(summaryHasArgonGroup([
+    { displayName: 'Gemini Models', description: 'Gemini Flash, Gemini Pro' },
+    { displayName: 'Gemini 4 Argon', description: 'For paid Pro plans, Argon quota is separate.' },
+  ]), true)
+
+  // Freshly upgraded Ultra account: only the two shared groups come back, so the
+  // family is now governed by the Gemini bucket (the #54 scenario).
+  assert.equal(summaryHasArgonGroup([
+    { displayName: 'Gemini Models', description: 'Gemini Flash, Gemini Pro' },
+    { displayName: 'Claude and GPT models', description: 'Claude Opus, Claude Sonnet, GPT-OSS' },
+  ]), false)
+
+  // A neutrally named group that only announces Argon through its bucketId still counts.
+  assert.equal(summaryHasArgonGroup([{
+    displayName: 'Quota',
+    buckets: [{ bucketId: 'gemini-argon-wtu-weekly', displayName: 'Weekly Limit Remaining' }],
+  }]), true)
+
+  assert.equal(summaryHasArgonGroup([]), false)
 })

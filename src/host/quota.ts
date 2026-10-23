@@ -57,6 +57,29 @@ export function mergeFallbackFamilyQuota(
  * A failed or empty summary is the case `mergeFallbackFamilyQuota` protects:
  * nothing authoritative arrived, so the previous complete value stays.
  */
+/** Minimal shape of the quota groups `retrieveUserQuotaSummary` returns. */
+export interface QuotaGroupShape {
+  displayName?: string
+  description?: string
+  buckets?: readonly { bucketId?: string; displayName?: string }[]
+}
+
+/**
+ * True when any returned group is the dedicated Argon bucket.
+ *
+ * The backend stops emitting that group once the plan folds Argon into the
+ * larger Gemini bucket (Ultra). From then on the family is governed by the
+ * shared bucket, so a cooldown recorded against the retired pool — e.g. a 429
+ * taken minutes before an upgrade — must not keep blocking the family for days.
+ */
+export function summaryHasArgonGroup(groups: readonly QuotaGroupShape[]): boolean {
+  return groups.some((group) => {
+    const fields: (string | undefined)[] = [group.displayName, group.description]
+    for (const bucket of group.buckets ?? []) fields.push(bucket.bucketId, bucket.displayName)
+    return fields.some((value) => typeof value === 'string' && value.toLowerCase().includes('argon'))
+  })
+}
+
 export function pickFamilyQuota(
   prev: FamilyQuotaInfo | undefined,
   fresh: FamilyQuotaInfo,
@@ -1110,6 +1133,14 @@ export class QuotaService {
       if (familyQuotas[fam]) {
         familyQuotas[fam]!.models = list
       }
+    }
+
+    // A family that lost its dedicated group is governed by the shared bucket, so a
+    // cooldown taken against the retired pool would block it until a reset that no
+    // longer applies (observed: 4 days of "no account can serve argon" right after a
+    // Pro -> Ultra upgrade, while the merged bucket sat at 100%).
+    if (summaryGroups.length > 0 && !summaryHasArgonGroup(summaryGroups) && account.cooldowns?.argon) {
+      this.pool.clearCooldown(account.id, 'argon')
     }
 
     this.pool.updateAccountQuotas(account.id, familyQuotas, email)
