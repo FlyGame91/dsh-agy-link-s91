@@ -303,6 +303,26 @@ export function isStale5hBucket(remainingFraction?: number, resetTime?: string, 
   return resetMs > 4.5 * 3600_000 && resetMs < 5.2 * 3600_000
 }
 
+/** How close two ISO reset stamps must be to name the SAME quota window. */
+export const QUOTA_WINDOW_MATCH_TOLERANCE_MS = 5 * 60_000
+
+/**
+ * True when two reset stamps point at the same quota window.
+ *
+ * `fetchAvailableModels` returns a per-model `quotaInfo` with NO window label:
+ * for some accounts it carries the 5-hour bucket, for others the WEEKLY bucket
+ * (live: daoxzeex@gmail.com reports the weekly fraction + weekly reset on every
+ * Gemini model). The only reliable discriminator is the reset instant — it
+ * matches exactly one of the `retrieveUserQuotaSummary` buckets.
+ */
+export function sameQuotaWindow(a?: string, b?: string, toleranceMs = QUOTA_WINDOW_MATCH_TOLERANCE_MS): boolean {
+  if (!a || !b) return false
+  const ta = Date.parse(a)
+  const tb = Date.parse(b)
+  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return false
+  return Math.abs(ta - tb) <= toleranceMs
+}
+
 /**
  * Parse a go-keyring payload (optionally "go-keyring-base64:" prefixed) into
  * a normalized StoredToken. Shared by the macOS and Linux keyring readers.
@@ -1189,20 +1209,40 @@ export class QuotaService {
             familyQuotas[fam]!.weeklyResetTime = resetTime
           }
         } else {
+          // Window-aware merge. `quotaInfo` carries no window label, so the
+          // reset instant decides where the number belongs:
+          //   • reset == summary 5h reset  → a 5h reading: tighten the 5h row.
+          //   • reset == summary WEEKLY reset → a weekly reading: tighten the
+          //     weekly row ONLY. Filing it under the 5h row painted "5h 19% ·
+          //     weekly 19%" with the weekly reset on both lines (2026-10-22).
+          //   • neither / no summary resets → unmatchable: keep the old
+          //     conservative "lowest binding constraint" tighten on the 5h row.
+          const familyQuota = familyQuotas[fam]!
+          const modelIsWeekly =
+            sameQuotaWindow(resetTime, familyQuota.weeklyResetTime) &&
+            !sameQuotaWindow(resetTime, familyQuota.resetTime)
+          if (modelIsWeekly) {
+            const curWeekly = familyQuota.weeklyFraction ?? 1
+            if (remaining < curWeekly) {
+              familyQuota.weeklyFraction = remaining
+              familyQuota.weeklyResetTime = resetTime
+            }
+            continue
+          }
           // The binding constraint is the LOWEST reported remaining across all
-          // sources, full stop. A lower remaining is by definition more consumed —
+          // sources. A lower remaining is by definition more consumed —
           // tighten to it and adopt its reset. If the coarse summary returned an
           // unmetered 5h placeholder (stale 100% with now+5h), the live model
           // window overrides it so the UI displays authentic numbers.
-          const curRemaining = familyQuotas[fam]!.remainingFraction ?? 1
+          const curRemaining = familyQuota.remainingFraction ?? 1
           if (remaining < curRemaining || isStale) {
-            familyQuotas[fam]!.remainingFraction = remaining
-            familyQuotas[fam]!.resetTime = resetTime
+            familyQuota.remainingFraction = remaining
+            familyQuota.resetTime = resetTime
             stale5hFamilies.delete(fam)
           }
-          if (fam === 'argon' && familyQuotas[fam]!.weeklyFraction === undefined) {
-            familyQuotas[fam]!.weeklyFraction = remaining
-            familyQuotas[fam]!.weeklyResetTime = resetTime
+          if (fam === 'argon' && familyQuota.weeklyFraction === undefined) {
+            familyQuota.weeklyFraction = remaining
+            familyQuota.weeklyResetTime = resetTime
           }
         }
       }

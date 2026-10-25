@@ -1,10 +1,10 @@
-import { test } from 'node:test'
+﻿import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
-import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken, pickFamilyQuota, shouldReleaseOrphanedCooldown, summaryHasArgonGroup } from '../src/host/quota.ts'
+import { QuotaService, agyUserAgent, detectEmailFromAgyLogs, isStale5hBucket, mergeFallbackFamilyQuota, normalizeStoredToken, pickFamilyQuota, sameQuotaWindow, shouldReleaseOrphanedCooldown, summaryHasArgonGroup } from '../src/host/quota.ts'
 import { shouldPollAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 import { parseCredentialDoc, writePrimaryCredential } from '../src/host/credential-slot.ts'
@@ -44,7 +44,7 @@ test('QuotaService parses stored tokens and saves token refresh updates', async 
   const dir = mkdtempSync(join(tmpdir(), 'agy-quota-test-'))
   const pool = new AccountPoolManager(dir)
   // Primary rides the system HOME (Keychain); token files only exist for
-  // isolated secondary accounts — exercise those.
+  // isolated secondary accounts 鈥?exercise those.
   const acc = pool.createAccountSlot('quota-test')
 
   const tokenDir = join(acc.dir, '.gemini', 'antigravity-cli')
@@ -207,7 +207,7 @@ test('Quota aggregation extracts bottleneck model fraction and earliest reset', 
 test('manual force refresh re-anchors slot identity from the token, not the label (primary showed another account\'s quota)', async () => {
   // Real incident: the system token belonged to elegantmanco@gmail.com but
   // the slot still said q986465568@gmail.com (log scraping returned the
-  // stale label), so 刷新/同步 fetched elegantmanco's quota and displayed
+  // stale label), so 鍒锋柊/鍚屾 fetched elegantmanco's quota and displayed
   // it as the primary's values. Manual refresh must trust the TOKEN (via
   // userinfo) over both the stored label and log detection.
   const dir = mkdtempSync(join(tmpdir(), 'agy-quota-force-'))
@@ -262,7 +262,7 @@ test('manual force refresh re-anchors slot identity from the token, not the labe
 
 test('background refresh keeps the zero-network identity path (no userinfo when email known)', async () => {
   // 0.4.15 risk posture: background polls never call userinfo just to detect
-  // account switching — only manual force refreshes pay that network cost.
+  // account switching 鈥?only manual force refreshes pay that network cost.
   const dir = mkdtempSync(join(tmpdir(), 'agy-quota-bg-'))
   const pool = new AccountPoolManager(dir)
   const acc = pool.createAccountSlot('bg-poll')
@@ -428,12 +428,12 @@ test('mergeFallbackFamilyQuota keeps last-known-good data over partial fallback'
     resetTime: '2026-09-01T09:53:06Z',
     updatedAt: 2_000,
   }
-  // Complete previous data wins — never clobbered by the partial shape.
+  // Complete previous data wins 鈥?never clobbered by the partial shape.
   assert.equal(mergeFallbackFamilyQuota(good, partial), good)
   assert.equal(mergeFallbackFamilyQuota(good, partial).weeklyFraction, 0.47)
-  // No previous data (first-ever refresh) → fallback fills in.
+  // No previous data (first-ever refresh) 鈫?fallback fills in.
   assert.equal(mergeFallbackFamilyQuota(undefined, partial), partial)
-  // Degenerate previous entry without a fraction → fallback fills in.
+  // Degenerate previous entry without a fraction 鈫?fallback fills in.
   assert.equal(mergeFallbackFamilyQuota({ weeklyFraction: 0.5 }, partial), partial)
 })
 
@@ -648,7 +648,7 @@ test('accounts without Argon access carry no argon quota entry (UI hides the row
   const svc = new FreeService(pool)
   const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
   assert.ok(quotas, 'quota refresh succeeded')
-  assert.equal(quotas.argon, undefined, 'no argon permission → no argon quota family')
+  assert.equal(quotas.argon, undefined, 'no argon permission 鈫?no argon quota family')
   assert.equal(pool.getAccount(acc.id)!.quotas.argon, undefined, 'argon row must stay hidden for this account')
 })
 
@@ -711,13 +711,92 @@ test('active 5h consumption in model discovery tightens coarse summary 5h quota'
   assert.equal(quotas.google?.weeklyResetTime, weeklyReset)
 })
 
-test('exhausted 5h bucket: per-model weekly-boundary remaining tightens the coarse placeholder', async () => {
+test('weekly-bound model discovery must not overwrite the 5h row (2026-10-22 report)', async () => {
+  // Live evidence (daoxzeex@gmail.com, 2026-10-22 23:23):
+  //   summary: gemini-5h 0.822 / reset +4h18m, gemini-weekly 0.174 / reset +2d2h
+  //   fetchAvailableModels: every gemini model 0.1736 / reset == THE WEEKLY RESET
+  // The models endpoint reports whichever window Google deems binding for that
+  // account, WITHOUT labelling it. The old merge folded that number into the
+  // family's 5h slot, so the GUI painted "5h 19% 路 weekly 19%" with the weekly
+  // reset on BOTH rows 鈥?exactly the screenshot the user filed.
+  const dir = mkdtempSync(join(tmpdir(), 'agy-quota-weeklymodels-'))
+  const pool = new AccountPoolManager(dir)
+  const acc = pool.createAccountSlot('weekly-models-user')
+
+  const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+  mkdirSync(tokenDir, { recursive: true })
+  writeFileSync(
+    join(tokenDir, 'antigravity-oauth-token'),
+    JSON.stringify({ access_token: 'ya29.weeklymodels', expiry: Date.now() + 3600_000 }),
+    'utf8',
+  )
+
+  const now = Date.now()
+  const SUMMARY_5H_RESET = new Date(now + (4 * 60 + 18) * 60_000).toISOString()
+  const SUMMARY_WEEKLY_RESET = new Date(now + (2 * 24 + 2) * 3600_000).toISOString()
+  const SUMMARY_5H = 0.82211393
+  const WEEKLY = 0.17376757
+  const MODEL_WEEKLY = 0.17361549
+
+  class WeeklyModelsService extends QuotaService {
+    override async fetchUserInfo() {
+      return { email: 'weeklymodels@gmail.com' }
+    }
+    override async fetchQuotaSummary() {
+      return {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            description: 'Models within this group: Gemini Flash, Gemini Pro',
+            buckets: [
+              { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: WEEKLY, resetTime: SUMMARY_WEEKLY_RESET },
+              { bucketId: 'gemini-5h', window: '5h', remainingFraction: SUMMARY_5H, resetTime: SUMMARY_5H_RESET },
+            ],
+          },
+        ],
+      } as never
+    }
+    override async fetchAvailableModels() {
+      return {
+        models: {
+          'gemini-3.8-flash-high': {
+            displayName: 'Gemini 3.8 Flash (High)',
+            quotaInfo: { remainingFraction: MODEL_WEEKLY, resetTime: SUMMARY_WEEKLY_RESET },
+          },
+          'gemini-3-flash': {
+            displayName: 'Gemini 3 Flash',
+            quotaInfo: { remainingFraction: MODEL_WEEKLY, resetTime: SUMMARY_WEEKLY_RESET },
+          },
+        },
+      } as never
+    }
+  }
+
+  const svc = new WeeklyModelsService(pool)
+  const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+  assert.ok(quotas)
+  // 5h row: untouched by the weekly-shaped model data.
+  assert.equal(quotas.google?.remainingFraction, SUMMARY_5H, '5h row keeps the 5h bucket')
+  assert.equal(quotas.google?.resetTime, SUMMARY_5H_RESET, '5h row keeps the 5h reset (鈮?h out, not 2d)')
+  // Weekly row: tightened to the fresher model-side weekly figure.
+  assert.equal(quotas.google?.weeklyFraction, MODEL_WEEKLY, 'weekly row takes the model-side weekly value')
+  assert.equal(quotas.google?.weeklyResetTime, SUMMARY_WEEKLY_RESET)
+  // The two rows must never be identical in value AND reset 鈥?that is the bug.
+  assert.notEqual(quotas.google?.remainingFraction, quotas.google?.weeklyFraction)
+  assert.notEqual(quotas.google?.resetTime, quotas.google?.weeklyResetTime)
+})
+
+test('exhausted 5h bucket: per-model weekly-boundary remaining lands on the WEEKLY row, not 5h', async () => {
   // 2026-10-17 00:37 incident: the coarse summary reported the meaningless
   // placeholder "100%, resets in now+5h" while the account was actually down
-  // to 4.06% — every model row carried the real remaining with the NEXT reset
-  // at the weekly boundary, 14.5 hours out. The previous is5hWindow gate
-  // (reset must land within 6h) skipped that merge, so the UI kept showing
-  // 100% for an account that was effectively dry.
+  // to 4.06% 鈥?every model row carried that remaining with the NEXT reset at
+  // the weekly boundary, 14.5 hours out.
+  //
+  // 2026-10-22 correction: that per-model number IS the weekly bucket (its
+  // reset is the weekly reset), so it belongs on the weekly row. Folding it
+  // into the 5h row made both rows print the same percentage and the same
+  // reset (the filed screenshot). The account still reads as dry, because the
+  // weekly row is what drives eligibility (LOW_QUOTA_WEEKLY = 5%).
   const dir = mkdtempSync(join(tmpdir(), 'agy-quota-weeklytighten-'))
   const pool = new AccountPoolManager(dir)
   const acc = pool.createAccountSlot('weekly-tighten-user')
@@ -732,7 +811,7 @@ test('exhausted 5h bucket: per-model weekly-boundary remaining tightens the coar
 
   const now = Date.now()
   const summary5hReset = new Date(now + 5 * 3600_000).toISOString() // the "now+5h" placeholder
-  const weeklyBoundaryReset = new Date(now + 14.5 * 3600_000).toISOString() // 14.5h out — beyond the old 6h gate
+  const weeklyBoundaryReset = new Date(now + 14.5 * 3600_000).toISOString() // 14.5h out 鈥?beyond the old 6h gate
   const REAL_REMAINING = 0.040659066
 
   class WeeklyTightenService extends QuotaService {
@@ -772,13 +851,17 @@ test('exhausted 5h bucket: per-model weekly-boundary remaining tightens the coar
   const svc = new WeeklyTightenService(pool)
   const quotas = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
   assert.ok(quotas)
-  // The coarse "100%" placeholder must be tightened to the real remaining
-  // even though the reset sits beyond 6 hours.
-  assert.equal(quotas.google?.remainingFraction, REAL_REMAINING)
-  assert.equal(quotas.google?.resetTime, weeklyBoundaryReset)
-  // Weekly row is preserved alongside.
+  // The weekly row carries the real remaining and its weekly-boundary reset,
+  // even though that reset sits beyond the old 6-hour gate.
   assert.equal(quotas.google?.weeklyFraction, REAL_REMAINING)
   assert.equal(quotas.google?.weeklyResetTime, weeklyBoundaryReset)
+  // The 5h row is NOT rewritten from the weekly reading any more.
+  assert.equal(quotas.google?.remainingFraction, 1, '5h placeholder stays on the 5h row')
+  assert.equal(quotas.google?.resetTime, summary5hReset)
+  // The account is still treated as dry 鈥?the weekly row is what excludes it.
+  const refreshed = pool.getAccount(acc.id)!
+  assert.equal(refreshed.quotas.google?.weeklyFraction, REAL_REMAINING)
+  assert.equal(pool.isAccountEligible(refreshed, 'google', now), false, 'a 4% weekly account is not usable')
 })
 
 test('primary account on Windows resolves email from durable store (.primary-credential.json) and rejects sibling logs', async () => {
@@ -850,6 +933,19 @@ test('normalizeLegacyPrimary self-heals primary account email from .primary-cred
   if (process.platform === 'win32') {
     assert.equal(primary.email, 'g98@example.com', 'primary email self-heals from durable store on Windows')
   }
+})
+
+test('sameQuotaWindow matches reset instants, not their textual form', () => {
+  const a = '2026-10-24T18:19:18Z'
+  const shifted = '2026-10-24T18:19:20Z' // 2s drift (server recomputes on every poll)
+  const different = '2026-10-22T19:43:34Z'
+  assert.equal(sameQuotaWindow(a, a), true)
+  assert.equal(sameQuotaWindow(a, shifted), true, 'small drift still names the same window')
+  assert.equal(sameQuotaWindow(a, different), false, 'a different instant names a different window')
+  assert.equal(sameQuotaWindow(a, undefined), false)
+  assert.equal(sameQuotaWindow('not-a-date', a), false)
+  // A ~12h-apart pair must never be folded together.
+  assert.equal(sameQuotaWindow('2026-10-24T18:00:00Z', '2026-10-25T06:00:00Z'), false)
 })
 
 test('isStale5hBucket correctly identifies unmetered placeholder 5h buckets', () => {
@@ -1048,7 +1144,7 @@ test('agyUserAgent emits the CLI product string the backend needs for Argon', ()
   // Regression: the UA used to be `antigravity/<version> <os>/<arch>`, which the
   // backend classifies as a non-CLI product, so `retrieveUserQuotaSummary`
   // answered with only the Gemini/3P groups and the Pro-plan Argon group was
-  // never present — the UI silently showed no Argon quota at all.
+  // never present 鈥?the UI silently showed no Argon quota at all.
   const fallback = agyUserAgent()
   assert.match(fallback, /^antigravity\/cli\/\d+\.\d+\.\d+ \(aidev_client; os_type=/)
   assert.ok(fallback.includes('auth_method=consumer'), 'keeps the CLI identity markers')
@@ -1073,7 +1169,7 @@ test('QuotaService accepts an agy version provider without touching the network'
 })
 
 test('pickFamilyQuota drops a dead last-known-good row when the summary is authoritative', () => {
-  // Real incident: an account upgraded Pro → Ultra. The backend then stopped
+  // Real incident: an account upgraded Pro 鈫?Ultra. The backend then stopped
   // returning the separate `Gemini 4 Argon` group (its quota is folded into the
   // Gemini bucket) while `fetchAvailableModels` kept listing the argon models
   // with a fresh 100%. Keeping last-known-good froze the previous tier's window
@@ -1091,10 +1187,10 @@ test('pickFamilyQuota drops a dead last-known-good row when the summary is autho
     updatedAt: 2_000,
   }
 
-  // Authoritative summary: the family is genuinely gone → adopt the live value.
+  // Authoritative summary: the family is genuinely gone 鈫?adopt the live value.
   assert.equal(pickFamilyQuota(staleArgon, freshArgon, true), freshArgon)
 
-  // Failed/empty summary: nothing authoritative arrived → keep last-known-good,
+  // Failed/empty summary: nothing authoritative arrived 鈫?keep last-known-good,
   // which is exactly what mergeFallbackFamilyQuota already guarantees.
   assert.equal(pickFamilyQuota(staleArgon, freshArgon, false), staleArgon)
 
@@ -1128,7 +1224,7 @@ test('summaryHasArgonGroup detects the dedicated Argon bucket across group shape
 
 test('shouldReleaseOrphanedCooldown never fires for an account that never had an Argon bucket', () => {
   // Reviewer-reported regression: the first draft cleared the argon cooldown on
-  // every authoritative poll that lacked the group — true for free-tier and every
+  // every authoritative poll that lacked the group 鈥?true for free-tier and every
   // non-Pro account, whose argon cooldowns come from real 429s. Clearing those
   // every 60s silently disabled the cooldown mechanism for that family.
   assert.equal(shouldReleaseOrphanedCooldown({

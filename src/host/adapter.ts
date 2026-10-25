@@ -19,7 +19,7 @@ import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
 import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin, stripNulBytes } from './runner.ts'
 import { detectSystemProxy } from './wincred.ts'
-import { AbortedWaitError, WaitTimeoutError, acquireCredentialSlot, credentialSlotMutex, SlotUnavailableError } from './credential-slot.ts'
+import { AbortedWaitError, WaitTimeoutError, acquireCredentialSlot, credentialSlotMutex, SlotUnavailableError, armSlotHandoff, type SlotHandoff } from './credential-slot.ts'
 import { agyHomeDirFor, readAgyRunLogText, snapshotAgyLogs } from './agy-log.ts'
 import { stateDir } from '../common/config.ts'
 import { SENT_IMAGE_IDS_MAX, type SessionStore } from './sessions.ts'
@@ -422,6 +422,117 @@ class ChunkQueue {
 function brief(s: string): string {
   const flat = s.trim().replace(/\s+/g, ' ')
   return flat.length > 300 ? flat.slice(0, 300) + '...' : flat
+}
+
+/**
+ * Reserved block index for pre-spawn status notices.
+ *
+ * Negative on purpose: the mapper's own blocks count up from 0, so a negative
+ * index can never be closed by a mapper `block-end` later in the run (the
+ * assembler ignores deltas for a closed index). Deltas alone are enough — the
+ * assembler explicitly tolerates delta-only protocols — so the notices land as
+ * one growing reasoning block at the top of the turn.
+ */
+export const STATUS_NOTICE_BLOCK_INDEX = -1
+
+/**
+ * Await `work` while periodically yielding a SESSION-VISIBLE notice.
+ *
+ * Why this exists: Windows has ONE machine-global credential slot, so every
+ * session's agy run is serialized behind whichever session got there first.
+ * A healthy long run (a 15-minute build, a 240-minute long tool) made the
+ * OTHER sessions sit with a completely empty transcript for up to
+ * `dispatchTimeoutMinutes` — indistinguishable from a freeze. The console
+ * heartbeat was invisible to the user, so the only honest signal was "nothing
+ * is happening" (2026-10-22: two sessions looked hung for 15 minutes while
+ * another project's agy run held the slot).
+ *
+ * Resolves with `work`'s value; rejects with `work`'s rejection untouched, so
+ * the caller's existing error classification is unchanged.
+ */
+export async function* awaitWithNotices<T>(
+  work: Promise<T>,
+  opts: {
+    /** Delay before the FIRST notice (and the base for later ones). */
+    intervalMs: number
+    /** Growth factor between notices (default 1 = constant cadence). */
+    escalate?: number
+    /** Upper bound for the cadence after escalation. */
+    maxIntervalMs?: number
+    /** Text for the current wait duration in milliseconds. */
+    notice: (elapsedMs: number) => string
+  },
+): AsyncGenerator<StreamChunk, T, void> {
+  const baseInterval = opts.intervalMs > 0 ? opts.intervalMs : 30_000
+  const escalate = opts.escalate !== undefined && opts.escalate > 1 ? opts.escalate : 1
+  const maxInterval = opts.maxIntervalMs !== undefined && opts.maxIntervalMs > baseInterval ? opts.maxIntervalMs : baseInterval * 100
+  let intervalMs = baseInterval
+  const startedAt = Date.now()
+  type Settled = { ok: true; value: T } | { ok: false; error: unknown }
+  let settled: Settled | null = null
+  let wake: (() => void) | null = null
+  const ping = (): void => {
+    const resume = wake
+    wake = null
+    resume?.()
+  }
+  void work.then(
+    (value) => {
+      if (settled === null) {
+        settled = { ok: true, value }
+        ping()
+      }
+    },
+    (error) => {
+      if (settled === null) {
+        settled = { ok: false, error }
+        ping()
+      }
+    },
+  )
+  let pendingNotices = 0
+  let timer: NodeJS.Timeout | null = null
+  const arm = (): void => {
+    if (timer !== null || settled !== null) return
+    timer = setTimeout(() => {
+      timer = null
+      pendingNotices++
+      intervalMs = Math.min(Math.round(intervalMs * escalate), maxInterval)
+      ping()
+    }, intervalMs)
+    timer.unref?.()
+  }
+  try {
+    arm()
+    for (;;) {
+      if (settled !== null) break
+      if (pendingNotices > 0) {
+        pendingNotices--
+        yield {
+          type: 'reasoning-delta',
+          index: STATUS_NOTICE_BLOCK_INDEX,
+          text: opts.notice(Date.now() - startedAt) + '\n',
+        }
+        // Re-arm AFTER resuming: a generator suspended at the yield must not
+        // swallow the next tick (that bug produced exactly one notice and then
+        // silence for the rest of the wait).
+        arm()
+        continue
+      }
+      await new Promise<void>((resolve) => {
+        wake = resolve
+      })
+    }
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
+  }
+  const done = settled as Settled | null
+  if (done === null) throw new Error('awaitWithNotices lost its completion signal')
+  if (done.ok) return done.value
+  throw done.error
 }
 
 function sawAuthFailure(parser: StreamJsonParser, outcome: { stderrTail: string }): boolean {
@@ -1564,6 +1675,8 @@ export class AgyAdapter extends LlmAdapter {
     const dispatchHardCapMs = cfg.dispatchTimeoutMinutes > 0 ? cfg.dispatchTimeoutMinutes * 60_000 : 0
     const dispatchStartedAt = Date.now()
     const DISPATCH_HEARTBEAT_MS = 2 * 60_000
+    /** First session-visible "waiting for the slot" notice (then ×3 each time). */
+    const DISPATCH_NOTICE_MS = 20_000
     let dispatchHeartbeat: NodeJS.Timeout | null = null
     const stopDispatchHeartbeat = (): void => {
       if (dispatchHeartbeat !== null) {
@@ -1604,10 +1717,42 @@ export class AgyAdapter extends LlmAdapter {
     let granted = false
     let dispatchBackoffMs = 2_000
     const maxDispatchAttempts = 1 + Math.max(0, cfg.dispatchRetries)
+    // Set when the CALLER abandons this generator (Stop / stream closed) while
+    // the wait below is suspended. A grant that lands after that point has
+    // nobody left to release it, so it is handed straight back — otherwise one
+    // semaphore slot leaks per abandoned wait and the pool dead-locks.
+    let abandonedDuringDispatch = false
+    let dispatchSettled = false
     try {
       for (let attempt = 1; attempt <= maxDispatchAttempts && !granted; attempt++) {
         try {
-          release = await this.deps.acquire(options.signal)
+          const pendingConcurrencySlot = this.deps.acquire(options.signal)
+          void pendingConcurrencySlot.then(
+            (late) => {
+              if (abandonedDuringDispatch) {
+                try {
+                  late()
+                } catch {
+                  // best-effort
+                }
+              }
+            },
+            () => {},
+          )
+          release = yield* awaitWithNotices(pendingConcurrencySlot, {
+            // Fast dispatches never emit anything: the notice only exists for
+            // waits the user would otherwise read as a freeze. The cadence
+            // escalates (20s → 60s → 3m → 9m) so a 15-minute queue leaves a
+            // handful of lines instead of a wall of them.
+            intervalMs: DISPATCH_NOTICE_MS,
+            escalate: 3,
+            maxIntervalMs: 9 * 60_000,
+            notice: (waitedMs) =>
+              '[agy] 正在等待 agy 凭据槽：另一个会话正在运行（已等待 ' + Math.max(1, Math.round(waitedMs / 60_000)) +
+              ' 分钟）。同一台机器同一时刻只能有一个 agy 身份占用系统凭据槽；稍候会自动开始，按 Stop 可取消。\n' +
+              '[agy] waiting for the agy credential slot: another session is running (' +
+              Math.max(1, Math.round(waitedMs / 60_000)) + 'm elapsed).',
+          })
           startDispatchHeartbeat()
           // Windows has ONE process-global credential slot that every agy
           // process reads. Ownership is serialized for the whole run and only
@@ -1647,6 +1792,16 @@ export class AgyAdapter extends LlmAdapter {
                 cfg.dispatchTimeoutMinutes + 'm waiting for the credential slot — releasing and retrying in ' +
                 Math.round(dispatchBackoffMs / 1000) + 's',
               )
+              // Console-only logs are invisible in the session; say it in the
+              // transcript too, or the turn looks hung for another full cap.
+              yield {
+                type: 'reasoning-delta',
+                index: STATUS_NOTICE_BLOCK_INDEX,
+                text: '[agy] 等待 agy 凭据槽已超过 ' + cfg.dispatchTimeoutMinutes + ' 分钟，正在重新排队（' +
+                  Math.round(dispatchBackoffMs / 1000) + ' 秒后重试 ' + (attempt + 1) + '/' + maxDispatchAttempts +
+                  '）。\n[agy] credential-slot wait exceeded ' + cfg.dispatchTimeoutMinutes + 'm — re-queueing (attempt ' +
+                  (attempt + 1) + '/' + maxDispatchAttempts + ').\n',
+              }
               stopDispatchHeartbeat()
               await dispatchSleep(dispatchBackoffMs)
               dispatchBackoffMs = Math.min(dispatchBackoffMs * 2, 15_000)
@@ -1662,20 +1817,41 @@ export class AgyAdapter extends LlmAdapter {
           throw new LlmError(detail, Err.AGY_ERROR)
         }
       }
+      dispatchSettled = true
     } catch (e) {
+      dispatchSettled = true
       stopDispatchHeartbeat()
       this.clearInFlightPrompt(sessionKey, prompt)
       throw e
+    } finally {
+      // Reached with dispatchSettled still false ONLY when the caller
+      // abandoned this generator mid-wait (Stop / stream closed): flag it so a
+      // grant that lands afterwards is handed back instead of leaking.
+      if (!dispatchSettled) abandonedDuringDispatch = true
     }
     stopDispatchHeartbeat()
-    const releaseOnce = (): void => {
-      if (released) return
-      released = true
+    // The machine-wide credential slot only has to stay ours until the child
+    // has READ it: measured on agy 1.4.3, print mode resolves its credential
+    // once at startup ("silent auth succeeded", +3.2s) and performs ZERO
+    // further token/auth work for the rest of a 14-minute run. Releasing the
+    // lease on the first event is what turns "one run per machine" into
+    // "one STARTUP per machine" — different accounts then run concurrently.
+    let slotHandoff: SlotHandoff | null = null
+    const releaseSlotLease = (): void => {
+      if (slotHandoff !== null) {
+        slotHandoff.dispose()
+        return
+      }
       try {
         slotLease?.release()
       } catch {
         // best-effort
       }
+    }
+    const releaseOnce = (): void => {
+      if (released) return
+      released = true
+      releaseSlotLease()
       release?.()
       release = null
     }
@@ -1751,6 +1927,21 @@ export class AgyAdapter extends LlmAdapter {
         }
         this.lastAccountSpawnTime.set(account.id, Date.now())
       }
+      // Arm the narrow hand-off BEFORE the spawn: stdout can deliver the first
+      // line before startAgyProcess() even returns, and that first line is the
+      // proof that agy is past its credential read.
+      if (slotLease !== undefined) {
+        slotHandoff = armSlotHandoff({
+          release: () => {
+            try {
+              slotLease?.release()
+            } catch {
+              // best-effort
+            }
+          },
+          log: (msg) => this.deps.log?.(msg),
+        })
+      }
       proc = startAgyProcess({
       bin,
       args,
@@ -1766,6 +1957,9 @@ export class AgyAdapter extends LlmAdapter {
       stderrKeepalive: true,
       onLine: (line) => {
         sawAnyEvent = true
+        // First output = agy resolved its credential; give the machine-wide
+        // slot back so other accounts' sessions can run concurrently.
+        slotHandoff?.onFirstEvent()
         lastOutputAt = Date.now()
         startToolHeartbeat()
         applyToolIdleBudget()

@@ -110,7 +110,14 @@ function runWinCredPs(target: string, user: string, action: string, payload = ''
   return execFileSync(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `& { ${WIN_CRED_SCRIPT} }`, target, user, action, payload],
-    { encoding: 'utf8', timeout: 8000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
+    // A cold start compiles the C# P/Invoke shim via Add-Type: ~1-2s idle, and
+    // many seconds while agy runs and builds compete for CPU. The old 8s
+    // ceiling made a WRITE time out and return `false` WITHOUT touching the
+    // slot (reproduced 2026-10-23: delete + write reported false and left the
+    // slot empty); callers used to ignore that and would spawn agy against the
+    // previously installed account. Writes get a generous ceiling; reads stay
+    // tighter because they sit on the poll path.
+    { encoding: 'utf8', timeout: action === 'write' ? 30_000 : 8000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
   ).trim()
 }
 

@@ -21,6 +21,19 @@ Deliberate v1 boundaries and upstream-behavior notes.
     persists a rotated access token and restores the primary. Only identity
     SWITCHES serialize — a switcher registers its claim BEFORE queueing, and
     new same-identity joins are refused while a different identity waits.
+  - **The slot is held only until agy has READ it (v0.4.68).** Measured on agy
+    1.4.3 with a live 14-minute run: print mode resolves its credential once at
+    startup (`printmode.go:403 "not authenticated, trying silent auth"` →
+    `:405 "silent auth succeeded"` at +3.2s) and performs zero further
+    token/auth work for the rest of the run. The adapter therefore arms
+    `armSlotHandoff` before the spawn and releases the lease on the child's
+    FIRST output line (45s ceiling for a slow startup) instead of holding the
+    machine-wide slot for the whole run. Different accounts now overlap: the
+    2026-10-22 design parked two sessions for 15 minutes behind another
+    project's 14-minute run; the exclusive window is now a few seconds.
+    Residual exposure (unchanged in kind, now diagnosable): a mid-run 401 that
+    forces a re-auth would read whatever identity is installed at that moment —
+    the hand-off logs when it fires so that case is visible instead of silent.
   - `SlotUnavailableError` aborts a run instead of letting it silently spend
     the wrong account when the primary cannot be verified.
   - Remaining boundary: the mutex is **per process**, so two DSH hosts (web +
@@ -34,15 +47,37 @@ injection (each account's HOME carries its own credential, no global slot, no
 mutex, identical on macOS/Linux/Windows). It is NOT available in the current
 agy build — measured, not assumed:
 
-- **The per-HOME token file is a BACKUP, not the source.** A fresh isolated
-  HOME containing a deliberately bogus
+- **The per-HOME token file is a FALLBACK, not the source (re-measured
+  2026-10-23).** With an entry in the keyring the file is ignored: a fresh
+  isolated HOME containing a deliberately bogus
   `.gemini/antigravity-cli/antigravity-oauth-token` still authenticated from the
   machine keyring and completed a prompt (exit 0, `OK`), and the bogus file was
-  left untouched. With the keyring present, writing per-account token files
-  does not isolate identities. (`fileTokenStorage` exists but is only a
-  fallback when keyring save/load times out or is unavailable.)
+  left untouched.
+  - **But with the keyring entry ABSENT, agy DOES read the per-HOME file.**
+    Probe: delete `gemini:antigravity`, isolate a HOME whose token file holds
+    `ya29.BOGUS_FROM_HOME_FILE`, run a prompt → `Eligibility check failed:
+    UNAUTHENTICATED (code 401)`. The bogus file was the only credential in play,
+    so the load path really did come from the file.
+  - That is *not* enough for a lock-free design, because the keyring is
+    keyring-first on the SAVE side too (`Failed to save token to keyring,
+    falling back to file` — the file is only written when the keyring write
+    fails). Any successful run therefore repopulates the single global entry,
+    and the next spawn on a different account would inherit it. (Inferred from
+    the binary's strings; not yet reproduced with a live token save.)
+  - Net: per-account credential isolation is read-path only. The machine-wide
+    entry still needs an owner, so identity SWITCHES stay serialized — but only
+    until the child has read the credential (see above), not for the whole run.
 - **No credential CLI flag**: `agy --help` exposes no `--api-key` /
   `--credential*` / `--token*` option.
+- **`JETSKI_OAUTH_TOKEN` exists in the binary but is IGNORED (re-measured
+  2026-10-22).** `agy.exe` contains the string pair
+  `JETSKI_OAUTH_TOKEN` + `Using OAuth token from environment variable`, so it
+  looked like the per-process injection route. Probing it directly: a brand-new
+  isolated HOME with `JETSKI_OAUTH_TOKEN=bogus-token-should-fail` still
+  completed a prompt (`exit 0`, `PROBE_OK`) — the variable is not consulted on
+  this build (1.4.3), and with no per-HOME token file either, the credential
+  could only have come from the machine keyring. The string belongs to another
+  auth product in the same binary.
 - **Documented env routes are different auth products**: `AGY_ADC_AUTH`
   (Application Default Credentials / Agent Platform), and
   `GEMINI_API_KEY` + `"modelProvider": "gemini"` in `settings.json` (the Gemini

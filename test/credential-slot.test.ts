@@ -15,6 +15,7 @@ import {
   WaitTimeoutError,
   acquireCredentialSlot,
   acquireCrossProcessSlotLock,
+  armSlotHandoff,
   credentialFingerprint,
   credentialSlotMutex,
   fastPathRunCount,
@@ -1089,3 +1090,88 @@ test('acquireCredentialSlot releases cross-process file lock immediately after s
 })
 
 
+
+// ---- narrow exclusive window: hand the slot back after the startup read ----
+
+test('armSlotHandoff releases the lease on the first event', () => {
+  let released = 0
+  const handoff = armSlotHandoff({ release: () => { released += 1 } })
+  assert.equal(handoff.released(), false)
+  handoff.onFirstEvent()
+  assert.equal(released, 1, 'first output means agy already read the credential')
+  assert.equal(handoff.released(), true)
+  // Idempotent: later events / run end must not release again.
+  handoff.onFirstEvent()
+  handoff.dispose()
+  assert.equal(released, 1)
+})
+
+test('armSlotHandoff hands the slot back on timeout when no event arrives', async () => {
+  let released = 0
+  const handoff = armSlotHandoff({ release: () => { released += 1 }, timeoutMs: 10 })
+  assert.equal(handoff.timedOut(), false)
+  await new Promise<void>((resolve) => setTimeout(resolve, 40))
+  assert.equal(released, 1, 'a wedged startup must not hold the machine-wide slot')
+  assert.equal(handoff.timedOut(), true)
+  handoff.onFirstEvent()
+  assert.equal(released, 1, 'no double release after the timeout fired')
+})
+
+test('armSlotHandoff releases on run end when the child produced nothing', () => {
+  let released = 0
+  const handoff = armSlotHandoff({ release: () => { released += 1 }, timeoutMs: 60_000 })
+  handoff.dispose()
+  assert.equal(released, 1, 'a run that ended before its first event still returns the slot')
+  assert.equal(handoff.timedOut(), false)
+})
+
+test('armSlotHandoff survives a throwing release and still marks itself done', () => {
+  const handoff = armSlotHandoff({
+    release: () => {
+      throw new Error('lease exploded')
+    },
+    timeoutMs: 60_000,
+  })
+  assert.doesNotThrow(() => handoff.onFirstEvent())
+  assert.equal(handoff.released(), true)
+})
+
+// ---- install failures must refuse the run, never fall through --------------
+
+test('a rejected slot write refuses the run instead of spending the installed account', async () => {
+  const baseDir = tmp('agy-writefail-')
+  const homeDir = tmp('agy-writefail-home-')
+  try {
+    writePrimaryCredential({ raw: tokenDoc('PRIMARY'), email: 'me@example.com', savedAt: 1 }, baseDir)
+    const accDir = tmp('agy-writefail-acc-')
+    writeAccountToken(accDir, tokenDoc('SECONDARY'))
+
+    // Windows CredWrite can time out on a loaded machine and report false
+    // WITHOUT changing the slot (reproduced 2026-10-23). The old code ignored
+    // that boolean, spawned agy and billed whichever account was installed.
+    let writeAttempts = 0
+    const io = memoryIo(tokenDoc('PRIMARY'), {
+      writeSlot: (): boolean => {
+        writeAttempts += 1
+        return false
+      },
+    })
+    const pool = fakePool([account('acc_primary', undefined, { systemHome: true, email: 'me@example.com' })])
+
+    await assert.rejects(
+      () =>
+        acquireCredentialSlot(account('sec', accDir, { email: 'sec@example.com' }), pool, {
+          baseDir,
+          homeDir,
+          io,
+          log: () => {},
+        }),
+      (err: unknown) => err instanceof SlotUnavailableError && /could not install/.test(String(err)),
+    )
+    assert.ok(writeAttempts >= 2, 'a rejected write is retried once before giving up (got ' + writeAttempts + ')')
+    assert.equal(credentialFingerprint(io.current), 'r:PRIMARY', 'the slot must be left as it was')
+    assert.equal(credentialSlotMutex.pending, 0, 'a refused install must not leak the mutex')
+  } finally {
+    for (const d of [baseDir, homeDir]) rmSync(d, { recursive: true, force: true })
+  }
+})

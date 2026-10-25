@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.4.70 (2026-10-25)
+
+### English
+
+- **Fix: the 5-hour quota row showed the weekly numbers (2026-10-22 report).**
+  - `fetchAvailableModels` returns a per-model `quotaInfo` with NO window label. For some accounts it carries the 5-hour bucket, for others the WEEKLY bucket: live `daoxzeex@gmail.com` reported `0.1736 / reset 2026-10-24T18:19:18Z` on every Gemini model, which is exactly the weekly bucket of `retrieveUserQuotaSummary`.
+  - The merge took "the lowest remaining across all sources" and filed it into the family 5-hour slot, so the GUI painted `5-hour quota 19% / Weekly 19%` with the SAME weekly reset on both rows (the filed screenshot) while the account actually had 82% of its 5-hour quota left.
+  - The reset instant now decides the window (`sameQuotaWindow`, 5-minute tolerance): a reading that matches the summary weekly reset tightens ONLY the weekly row; one that matches the 5-hour reset tightens the 5-hour row; an unmatchable reading keeps the old conservative behaviour. Eligibility is unchanged — the weekly row still drives the 5% drain check.
+- **Fix: a queued turn no longer looks frozen for 15 minutes.**
+  - Windows has ONE machine-global agy credential slot, so sessions serialize: a healthy long run in one workspace made two other sessions sit with a completely empty transcript for `dispatchTimeoutMinutes` (15m) and then silently re-queue for another cap — indistinguishable from a hang (2026-10-22: the promo-tcn sessions, while a 15-minute run in another project held the slot).
+  - The wait now streams a session-visible `[agy] waiting for the agy credential slot …` line into the transcript, with an escalating cadence (20s → 60s → 3m → 9m) so even a 15-minute queue leaves a handful of lines. Re-queues after a cap are announced too.
+  - A generator abandoned while waiting (Stop / stream closed) now hands a late grant back instead of leaking a concurrency slot.
+- **Fix: the machine-wide credential slot is held only until agy has READ it — different accounts now run concurrently.**
+  - Measured on agy 1.4.3 with a live 14-minute run: print mode resolves its credential ONCE at startup (`printmode.go:403 "not authenticated, trying silent auth"` → `:405 "silent auth succeeded"` at +3.2s) and performs zero further token/auth work for the rest of the run. Holding the Windows slot for the whole run was pure serialization, and it is what parked the 2026-10-22 promo-tcn sessions for 15 minutes behind another project's run.
+  - `armSlotHandoff` releases the lease on the child's FIRST output line (45s ceiling for a slow startup, run-end fallback, idempotent), while the identity is still installed under the mutex immediately before each spawn — so a later switcher cannot change what an already-started run read.
+  - `JETSKI_OAUTH_TOKEN` (the only env-based credential route in the binary) was probed with a bogus token: the run still authenticated from the keyring, so true per-process injection remains unavailable upstream. Recorded in KNOWN-GAPS with the measurement.
+- **Fix: a rejected credential-slot write now refuses the run instead of billing the account that happens to be installed.**
+  - The Windows write is a PowerShell cold start that compiles a C# P/Invoke shim; its old 8-second ceiling made it time out and return `false` **without touching the slot** on a loaded machine (reproduced 2026-10-23: delete then write reported false and left the slot empty). All four install sites ignored that boolean, so the next spawn authenticated as the PREVIOUS account — silent cross-account quota spend, the exact corruption class the module exists to prevent.
+  - Install sites now verify the write (one retry, then `SlotUnavailableError` → the turn fails visibly); teardown/restore paths log loudly instead of failing a finished turn. Writes get a 30s ceiling; reads stay at 8s because they sit on the poll path.
+  - New test: a write that always reports false refuses the run, leaves the slot untouched and does not leak the mutex.
+
+### 中文
+
+- **修复：5 小时额度行显示成了周额度（2026-10-22 反馈）。**
+  - `fetchAvailableModels` 的 per-model `quotaInfo` 不带窗口标签：有的账号返回 5 小时桶，有的账号返回**周**桶（实测 `daoxzeex@gmail.com` 每个 Gemini 模型都返回 `0.1736 / reset 2026-10-24T18:19:18Z`，正是 `retrieveUserQuotaSummary` 里的周桶）。
+  - 旧合并逻辑「取所有来源里最低的余量」把它塞进了 5 小时行，界面于是显示 `5 小时额度 19% · 周额度 19%`、两行 reset 完全相同（反馈截图），而该账号 5 小时其实还剩 82%。
+  - 现在由 reset 时刻判定窗口归属（`sameQuotaWindow`，5 分钟容差）：命中周 reset 的读数只收紧周行；命中 5 小时 reset 的收紧 5 小时行；无法判定的读数保持原有保守行为。可用性判定不变——周行依旧参与 5% 耗尽检查。
+- **修复：排队中的回合不再看起来卡死 15 分钟。**
+  - Windows 只有一个全局 agy 凭据槽，会话之间必须串行：另一个工作区一次正常的长任务就能让其它会话的转录区**整整 15 分钟一片空白**（`dispatchTimeoutMinutes`），随后再静默重排一轮——和卡死无法区分（2026-10-22 的 promo-tcn 两个会话就是被另一个项目 15 分钟的运行挡住）。
+  - 等待期间现在会向会话流里写入可见的 `[agy] 正在等待 agy 凭据槽 …` 提示，节奏递增（20s → 60s → 3m → 9m），15 分钟排队也只留几行；超时重排同样会写明。
+  - 等待中被 Stop / 关流放弃的请求，现在会把迟到的许可归还，而不是漏掉一个并发槽。
+- **修复：全局凭据槽只占用到 agy 读完凭据为止——不同账号现在可以真正并发。**
+  - 实测 agy 1.4.3 一次 14 分钟的运行：print 模式只在启动瞬间解析一次凭据（`printmode.go:403` 未认证 → `:405` silent auth 成功，+3.2 秒），之后 14 分钟**再无任何 token/auth 操作**。把 Windows 全局槽占满整个 run 纯属多余串行——2026-10-22 的 promo-tcn 两个会话正是被另一个项目那 14 分钟的运行堵了 15 分钟。
+  - 新增 `armSlotHandoff`：在子进程输出**第一行**时立刻交还租约（启动慢则 45 秒上限、run 结束兜底、幂等），而身份安装依旧在每次 spawn 前、在互斥锁内完成，因此后来的切换不可能改变已启动 run 读到的凭据。
+  - 二进制里唯一的进程级凭据入口 `JETSKI_OAUTH_TOKEN` 已用假 token 实测：仍然从系统 keyring 认证成功，说明上游还不支持真正的进程级注入；该结论连同测法已写入 KNOWN-GAPS。
+  - 补充实测：**把全局凭据条目删掉后，agy 确实会改读家目录凭据文件**（假 token → `UNAUTHENTICATED 401`）。但 keyring 在写入侧同样优先（`Failed to save token to keyring, falling back to file`），任何一次成功运行都会把全局条目写回来，所以"永久空槽 + 纯文件隔离"仍不成立；凭据隔离目前只是读取侧能力。
+- **修复：凭据槽写入被拒绝时，拒绝启动，而不是用"当前碰巧装着"的账号去计费。**
+  - Windows 侧写入是一次 PowerShell 冷启动（Add-Type 编译 C# P/Invoke），旧实现的 8 秒上限在机器繁忙时会**超时并返回 false，而槽位根本没被改动**（2026-10-23 实测：删除后再写入返回 false，槽位保持空）。四个安装点都没检查这个布尔值，于是紧接着的 spawn 会以**上一个账号**的身份认证 —— 静默跨账号扣额度，正是本模块要防的那类污染。
+  - 现在安装点会校验写入（失败重试一次，仍失败则抛 `SlotUnavailableError`，让这一轮可见地失败）；收尾/恢复路径改为大声告警而不毁掉已完成的轮次。写入超时提到 30 秒，读取保持 8 秒（在轮询路径上）。
+  - 新增测试：写入恒返回 false 时必须拒绝运行、槽位保持原状、互斥锁不泄漏。
+
 ## 0.4.69 (2026-10-23)
 
 ### English
