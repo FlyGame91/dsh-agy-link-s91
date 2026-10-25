@@ -19,7 +19,10 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = join(fileURLToPath(import.meta.url), '..', '..')
-const src = readFileSync(join(root, 'src/client/index.ts'), 'utf8')
+// Normalize CRLF -> LF: Windows checkouts under core.autocrlf=true hand us
+// `\r\n`, while every marker this test slices on is written as `\n`. Without
+// normalization the `'\n}\n'` function-closing search silently misses.
+const src = readFileSync(join(root, 'src/client/index.ts'), 'utf8').replace(/\r\n/g, '\n')
 
 function installerBody(): string {
 	const start = src.indexOf('function installSettingsNavIcon')
